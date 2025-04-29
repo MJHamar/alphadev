@@ -42,7 +42,7 @@ import ml_collections
 import numpy
 import optax
 
-from .tinyfive.machine import machine as riscv_machine
+from tinyfive.machine import machine as riscv_machine
 
 ############################
 ###### 1. Environment ######
@@ -141,6 +141,14 @@ class TaskSpec(NamedTuple):
     latency_reward_weight: float
     latency_quantile: float
 
+class CPUState(NamedTuple):
+    registers: jnp.ndarray
+    memory: jnp.ndarray
+    register_mask: jnp.ndarray
+    memory_mask: jnp.ndarray
+    program: jnp.ndarray
+    program_length: int
+
 class AssemblyGame(object):
     """The environment AlphaDev is interacting with."""
 
@@ -201,7 +209,18 @@ class AssemblyGame(object):
             op_str = idx_to_op[instruction.opcode]
             op_fn = getattr(self, op_str)
             op_fn(*instruction.oprands) # NOTE: we need to ensure that `operands` is correct.
-            return self
+            return self.get_state()
+
+        def get_state(self) -> CPUState:
+            """Get the current state of the simulator."""
+            return CPUState(
+                registers=self.registers,
+                memory=self.memory,
+                register_mask=self.register_mask,
+                memory_mask=self.memory_mask,
+                program=self.program,
+                program_length=len(self.program)
+            )
 
         def measure_latency(self, program) -> float:
             crnt_state = self.copy()
@@ -329,6 +348,57 @@ class Action(object):
     def __gt__(self, other):
         return self.index > other.index
 
+class RiscvAction(Action):
+    """Action representation for RISC-V instructions.
+    Fields:
+        opcode: int
+        operands: list of int
+    """
+    def __init__(self, index: int, opcode: int, operands: list):
+        super().__init__(index)
+        self.opcode = opcode
+        self.operands = operands
+    
+    def __repr__(self):
+        return f"RiscvAction({idx_to_op[self.opcode]}, {','.join(self.operands)})"
+
+class ActionSpace(object):
+    """Action space, which is a set of actions."""
+    def __init__(self, actions: Sequence[Action]):
+        self._actions = actions
+
+    @property
+    def actions(self): return self._actions
+
+    def __iter__(self):
+        return iter(self.actions)
+
+    def __len__(self):
+        return len(self.actions)
+
+    def __getitem__(self, index):
+        return self.actions[index]
+
+    def __contains__(self, item):
+        return item in self.actions
+
+    def __repr__(self):
+        return f'ActionSpace({len(self.actions)})'
+
+    def __copy__(self):
+        # not a deep copy, we don't need that. Action spaces are immutable
+        return ActionSpace(self.actions.copy())
+
+class ActionSpaceStorage(object):
+    """Storage for action spaces."""
+
+    def __init__(self):
+        self.action_spaces = {}
+    
+    def get(self,
+            state: CPUState,
+            history: ActionHistory) -> ActionSpace:
+        pass
 
 class NetworkOutput(NamedTuple):
     value: float
