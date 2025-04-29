@@ -30,8 +30,9 @@
 import collections
 import functools
 import math
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union
 
+import time
 import chex
 import haiku as hk
 import jax
@@ -41,10 +42,93 @@ import ml_collections
 import numpy
 import optax
 
+from .tinyfive.machine import machine as riscv_machine
 
 ############################
 ###### 1. Environment ######
 
+op_list = [
+    'LUI',
+    'AUIPC',
+    'JAL',
+    'JALR',
+    'BEQ',
+    'BNE',
+    'BLT',
+    'BGE',
+    'BLTU',
+    'BGEU',
+    'LB',
+    'LH',
+    'LW',
+    'LBU',
+    'LHU',
+    'SB',
+    'SH',
+    'SW',
+    'ADDI',
+    'SLTI',
+    'SLTIU',
+    'XORI',
+    'ORI',
+    'ANDI',
+    'SLLI',
+    'SRLI',
+    'SRAI',
+    'ADD',
+    'SUB',
+    'SLL',
+    'SLT',
+    'SLTU',
+    'XOR',
+    'SRL',
+    'SRA',
+    'OR',
+    'AND',
+    # M-extension
+    'MUL',
+    'MULH',
+    'MULHSU',
+    'MULHU',
+    'DIV',
+    'DIVU',
+    'REM',
+    'REMU',
+    # F-extension
+    'FLW_S',
+    'FSW_S',
+    'FMADD_S',
+    'FMSUB_S',
+    'FNMSUB_S',
+    'FNMADD_S',
+    'FADD_S',
+    'FSUB_S',
+    'FMUL_S',
+    'FDIV_S',
+    'FSGNJ_S',
+    'FSGNJN_S',
+    'FSGNJX_S',
+    'FMIN_S',
+    'FMAX_S',
+    'FEQ_S',
+    'FLT_S',
+    'FLE_S',
+    'FSQRT_S',
+    'FCVT_W_S',
+    'FCVT_WU_S',
+    'FMV_X_W',
+    'FCLASS_S',
+    'FCVT_S_W',
+    'FCVT_S_WU',
+    'FMV_W_X',
+]
+
+idx_to_op = {idx: op for idx, op in enumerate(op_list)}
+op_to_idx = {op: idx for idx, op in enumerate(op_list)}
+
+class IOExample(NamedTuple):
+    inputs: jnp.ndarray
+    outputs: jnp.ndarray
 
 class TaskSpec(NamedTuple):
     max_program_size: int
@@ -57,31 +141,106 @@ class TaskSpec(NamedTuple):
     latency_reward_weight: float
     latency_quantile: float
 
-
 class AssemblyGame(object):
     """The environment AlphaDev is interacting with."""
 
     class AssemblyInstruction(object):
-        pass
+        def __init__(self, action: 'Action'):
+            """Represent an action as an assembly instruction.
+            """
+            self.opcode = action.opcode # int
+            self.operands = action.operands # list
 
-    class AssemblySimulator(object):
+    class AssemblySimulator(riscv_machine):
+        
+        def __init__(self, task_spec, example:IOExample=None):
+            """Initialize the simulator with the task specification."""
+            super().__init__(mem_size=task_spec.num_memory_locs + task_spec.max_program_size)
+            self.task_spec = task_spec
+            self.example = example
+            self.reset()
+        
+        def reset(self):
+            """Reset the simulator to an initial state."""
+            self.clear_cpu(); self.clear_mem()
+            # initialise write heads and program counter.
+            self.mem_write_head = 0
+            self.pc = self.task_spec.num_memory_locs
+            if self.example is not None:
+                self._populate_memory(self.example.inputs)
+
+        def _populate_memory(self, inputs: Union[jnp.ndarray, int, float]):
+            # overflow checks
+            if (self.mem_write_head >= self.task_spec.num_memory_locs or
+                # isinstance(inputs, (int, float)) and 
+                (isinstance(inputs, jnp.ndarray) and
+                    self.mem_write_head + inputs.size >= self.task_spec.num_memory_locs
+                )):
+                raise ValueError("Memory overflow: cannot write to memory.")
+            if isinstance(inputs, int):
+                self.write_i32(inputs, self.mem_write_head)
+                self.mem_write_head += 4 # increment
+            elif isinstance(inputs, float):
+                self.write_f32(inputs, self.mem_write_head)
+                self.mem_write_head += 4
+            elif isinstance(inputs, jnp.ndarray):
+                if inputs.dtype == jnp.int32:
+                    self.write_i32_vec(inputs, self.mem_write_head)
+                    self.mem_write_head += inputs.size * 4
+                elif inputs.dtype == jnp.float32:
+                    self.write_f32_vec(inputs, self.mem_write_head)
+                    self.mem_write_head += inputs.size * 4
+                else:
+                    raise ValueError(f"Unsupported data type: {inputs.dtype}")
 
         # pylint: disable-next=unused-argument
         def apply(self, instruction):
-            return {}
+            """Apply an assembly instruction to the simulator."""
+            # NOTE: to avoid the overhead of encoding and then decoding the instruction (O(n) time),
+            # we use the uppercase methods of the machine class directly.
+            op_str = idx_to_op[instruction.opcode]
+            op_fn = getattr(self, op_str)
+            op_fn(*instruction.oprands) # NOTE: we need to ensure that `operands` is correct.
+            return self
 
         def measure_latency(self, program) -> float:
-            pass
+            crnt_state = self.copy()
+            self.reset()
+            start_time = time.time()
+            for instruction in program:
+                op_str = idx_to_op[instruction.opcode]
+                op_fn = getattr(self, op_str)
+                op_fn(*instruction.operands)
+            end_time = time.time()
+            latency = end_time - start_time
+            self.reset()
+            # restore state
+            self = crnt_state
+            return float(latency)
+
+        @property
+        def registers(self): return jnp.concat([self.x.astype(self.dtype), self.f.astype(self.dtype)], axis=0)
+        @property
+        def memory(self): return jnp.array(self.mem[:self.task_spec.num_memory_locs], dtype=self.dtype)
+        
+        @property
+        def register_mask(self): return jnp.concat(self.x_usage != 0, self.f_usage != 0, axis=0)
+        @property
+        def memory_mask(self): return jnp.array(self.mem[:self.task_spec.num_memory_locs] != 0)
+        
+        def invalid(self) -> bool:
+            # FIXME: need to check if the program can be invalid at any point in time.
+            return False
 
     def __init__(self, task_spec):
         self.task_spec = task_spec
-        self.program = []
+        self.program = [] # program here is an array, which suggests that there are only append actions
         self.simulator = self.AssemblySimulator(task_spec)
         self.previous_correct_items = 0
 
     def step(self, action):
         instruction = self.AssemblyInstruction(action)
-        self.program.append(instruction)
+        self.program.append(instruction) # append the action (no swap moves)
         self.execution_state = self.simulator.apply(instruction)
         return self.observation(), self.correctness_reward()
 
@@ -91,11 +250,18 @@ class AssemblyGame(object):
             'program_length': len(self.program),
             'memory': self.execution_state.memory,
             'registers': self.execution_state.registers,
+            'register_mask': self.execution_state.register_mask,
+            'memory_mask': self.execution_state.memory_mask,
         }
+
+    def make_expected_outputs(self):
+        return jnp.array(
+            self.example.outputs
+        )
 
     def correctness_reward(self) -> float:
         """Computes a reward based on the correctness of the output."""
-        make_expected_outputs = lambda: []
+        make_expected_outputs = jnp.array()
         expected_outputs = make_expected_outputs()
         state = self.execution_state
 
@@ -111,16 +277,14 @@ class AssemblyGame(object):
         self.previous_correct_items = correct_items
 
         # Bonus for fully correct programs
-        all_correct = all(
-            output == expected
-            for output, expected in zip(state.memory, expected_outputs)
-        )
+        all_correct = jnp.all(state.memory == expected_outputs)
         reward += self.task_spec.correct_reward * all_correct
 
         return reward
 
     def latency_reward(self) -> float:
         latency_samples = [
+            # NOTE: measure latency n times
             self.simulator.measure_latency(self.program)
             for _ in range(self.task_spec.num_latency_simulation)
         ]
@@ -132,6 +296,14 @@ class AssemblyGame(object):
     def clone(self):
         pass
 
+    def terminal(self) -> bool: # TODO: ? when else
+        return self.simulator.invalid() or self.correct()
+
+    def correct(self) -> bool:
+        expected_outputs = self.make_expected_outputs()
+        state = self.execution_state
+        # Check if the output is correct
+        return jnp.all(state.memory == expected_outputs)
 
 ######## End Environment ########
 #################################
@@ -185,7 +357,9 @@ class Network(object):
         }
 
     def inference(self, params: Any, observation: jnp.array) -> NetworkOutput:
+        # NOTE: observation here is an array, not a dict like in AssemblyGame. Where do we convert
         # representation + prediction function
+        # NOTE: the representation net actually expects a dict, so only the type annotation is wrong.
         embedding = self.representation.apply(params['representation'], observation)
         return self.prediction.apply(params['prediction'], embedding)
 
@@ -203,6 +377,7 @@ class Network(object):
 
 
 class UniformNetwork(object):
+    # NOTE: what does this do?
     """Network representation that returns uniform output."""
 
     # pylint: disable-next=unused-argument
@@ -282,6 +457,7 @@ class RepresentationNet(hk.Module):
         self._hparams = hparams
         self._task_spec = task_spec
         self._embedding_dim = embedding_dim
+        #NOTE: no init here, haiku takes care of it.
 
     def __call__(self, inputs):
         batch_size = inputs['program'].shape[0]
@@ -696,6 +872,8 @@ class MinMaxStats(object):
 
 
 class Player(object):
+    # NOTE: single player game, so we don't care about this.
+    # probably included to fit the AlphaZero framework.
     pass
 
 
@@ -779,7 +957,7 @@ class Game(object):
         # Game specific termination rules.
         # For sorting, a game is terminal if we sort all sequences correctly or
         # we reached the end of the buffer.
-        pass
+        return self.environment.terminal()
 
     def is_correct(self) -> bool:
         # Whether the current algorithm solves the game.
@@ -787,6 +965,8 @@ class Game(object):
 
     def legal_actions(self) -> Sequence[Action]:
         # Game specific calculation of legal actions.
+        # NOTE: implement as an enumeration of the allowed actions,
+        # instead of filtering the pre-defined action space.
         return []
 
     def apply(self, action: Action):
@@ -797,7 +977,14 @@ class Game(object):
             self.latency_reward = self.environment.latency_reward()
 
     def store_search_statistics(self, root: Node):
+        # NOTE: this function is used to store statistics about the observed trajectory (outside of MCTS)
         sum_visits = sum(child.visit_count for child in root.children.values())
+        # NOTE: this is a problem. MCTS assumes a fixed action space, 
+        # which i don't know how to enumerate.
+        # fair point tho that we CAN compute this on the fly,
+        # and store the available actions in expanded nodes.
+        # TODO: add a shared action storage to cache the action spaces based on
+        # active register and memory locations.
         action_space = (Action(index) for index in range(self.action_space_size))
         self.child_visits.append(
             [
@@ -810,8 +997,12 @@ class Game(object):
         self.root_values.append(root.value())
 
     def make_observation(self, state_index: int):
+        # NOTE: returns the observation corresponding to the last action
         if state_index == -1:
             return self.environment.observation()
+        # NOTE: re-play the game from the initial state.
+        # FIXME: initial state depends on the current task we are solving
+        # unlike in AlphaDev, where the initial state is always the same.
         env = AssemblyGame(self.task_spec)
         for action in self.history[:state_index]:
             observation, _ = env.step(action)
@@ -835,9 +1026,10 @@ class Game(object):
         else:
             bootstrap_discount = 0
 
+        # NOTE: this is a TD(n) target
         return Target(
             value,
-            self.latency_reward,
+            self.latency_reward, # =0 unless the game is finished
             self.child_visits[state_index],
             bootstrap_discount,
         )
@@ -868,7 +1060,7 @@ class ReplayBuffer(object):
         # pylint: disable=g-complex-comprehension
         return [
             Sample(
-                observation=g.make_observation(i),
+                observation=g.make_observation(i), # NOTE: this re-computes the game from scratch each time.
                 bootstrap_observation=g.make_observation(i + td_steps),
                 target=g.make_target(i, td_steps, g.to_play()),
             )
@@ -916,9 +1108,12 @@ def alphadev(config: AlphaDevConfig):
     storage = SharedStorage()
     replay_buffer = ReplayBuffer(config)
 
+    # TODO: this should handled by a multiprocessing pool
+    # or a job queue.
     for _ in range(config.num_actors):
         launch_job(run_selfplay, config, storage, replay_buffer)
 
+    # it's fine to keep this in the main thread
     train_network(config, storage, replay_buffer)
 
     return storage.latest_network()
@@ -931,6 +1126,8 @@ def alphadev(config: AlphaDevConfig):
 # Each self-play job is independent of all others; it takes the latest network
 # snapshot, produces a game and makes it available to the training job by
 # writing it to a shared replay buffer.
+# NOTE: runs in parallel with the training job.
+# TODO: we should make sure that training and self-play somewhat synchronized
 def run_selfplay(
     config: AlphaDevConfig, storage: SharedStorage, replay_buffer: ReplayBuffer
 ):
@@ -941,7 +1138,8 @@ def run_selfplay(
 
 
 def play_game(config: AlphaDevConfig, network: Network) -> Game:
-    """Plays an AlphaDev game.
+    """Plays an AlphaDev game. 
+    NOTE: i.e. an episode
 
     Each game is produced by starting at the initial empty program, then
     repeatedly executing a Monte Carlo Tree Search to generate moves until the end
@@ -964,13 +1162,13 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
         root = Node(0)
         current_observation = game.make_observation(-1)
         network_output = network.inference(current_observation)
-        _expand_node(
+        _expand_node( # expand root
             root, game.to_play(), game.legal_actions(), network_output, reward=0
         )
         _backpropagate(
-            [root],
-            network_output.value,
-            game.to_play(),
+            [root], # only the root
+            network_output.value, # predicted value at the root
+            game.to_play(), # dummy player
             config.discount,
             min_max_stats,
         )
@@ -985,8 +1183,9 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
             min_max_stats,
             game.environment,
         )
+        # NOTE: make a move after the MCTS policy improvement step
         action = _select_action(config, len(game.history), root, network)
-        game.apply(action)
+        game.apply(action) # step the environment
         game.store_search_statistics(root)
     return game
 
@@ -1018,18 +1217,19 @@ def run_mcts(
         history = action_history.clone()
         node = root
         search_path = [node]
-        sim_env = env.clone()
+        sim_env = env.clone() # start from the current state of the environment
+        # Traverse the tree until we reach a leaf node.
 
         while node.expanded():
-            action, node = _select_child(config, node, min_max_stats)
-            sim_env.step(action)
-            history.add_action(action)
-            search_path.append(node)
+            action, node = _select_child(config, node, min_max_stats) # based on UCB
+            sim_env.step(action) # step the environment
+            history.add_action(action) # update histroy 
+            search_path.append(node) # append to the current trajectory
 
         # Inside the search tree we use the environment to obtain the next
         # observation and reward given an action.
-        observation, reward = sim_env.step(action)
-        network_output = network.inference(observation)
+        observation, reward = sim_env.step(action) # step the environment
+        network_output = network.inference(observation) # get the priors
         _expand_node(
             node, history.to_play(), history.action_space(), network_output, reward
         )
@@ -1041,6 +1241,9 @@ def run_mcts(
             config.discount,
             min_max_stats,
         )
+        # NOTE: excuse me but how is this supposed to reach a leaf node? 
+        # it seems like we are expanding exactly one node in each iteration.
+        # there should be an exit condition upon terminations of the game.
 
 
 def _select_action(
@@ -1144,16 +1347,16 @@ def train_network(
     config: AlphaDevConfig, storage: SharedStorage, replay_buffer: ReplayBuffer
 ):
     """Trains the network on data stored in the replay buffer."""
-    network = Network(config.hparams, config.task_spec)
-    target_network = Network(config.hparams, config.task_spec)
+    network = Network(config.hparams, config.task_spec) # the one we train
+    target_network = Network(config.hparams, config.task_spec) # target network is updated periodically (bootstrap)
     optimizer = optax.sgd(config.lr_init, config.momentum)
     optimizer_state = optimizer.init(network.get_params())
 
-    for i in range(config.training_steps):
+    for i in range(config.training_steps): # insertion point for training pipeline
         if i % config.checkpoint_interval == 0:
-            storage.save_network(i, network)
+            storage.save_network(i, network) # save the current network
         if i % config.target_network_interval == 0:
-            target_network = network.copy()
+            target_network = network.copy() # update the bootstrap network
         batch = replay_buffer.sample_batch(config.num_unroll_steps, config.td_steps)
         optimizer_state = _update_weights(
             optimizer, optimizer_state, network, target_network, batch)
@@ -1162,7 +1365,6 @@ def train_network(
 def scale_gradient(tensor: Any, scale):
     """Scales the gradient for the backward pass."""
     return tensor * scale + jax.lax.stop_gradient(tensor) * (1 - scale)
-
 
 def _loss_fn(
     network_params: jnp.array,
@@ -1173,7 +1375,9 @@ def _loss_fn(
 ) -> float:
     """Computes loss."""
     loss = 0
-    for observation, bootstrap_obs, target in batch:
+    for observation, bootstrap_obs, target in batch: # processes batches
+        # NOTE: re-compute the priors instead of using the cached ones
+        # which is fine, we want the updated network to be used for each batch.
         predictions = network.inference(network_params, observation)
         bootstrap_predictions = target_network.inference(
             target_network_params, bootstrap_obs)
@@ -1239,6 +1443,7 @@ def softmax_sample(distribution, temperature: float):
 
 
 def launch_job(f, *args):
+    # NOTE: a simple wrapper to launch a job in a separate thread.
     f(*args)
 
 
