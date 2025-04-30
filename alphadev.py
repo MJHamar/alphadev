@@ -148,15 +148,19 @@ class CPUState(NamedTuple):
     memory_mask: jnp.ndarray
     program: jnp.ndarray
     program_length: int
+    
+    def __hash__(self):
+        return hash(self.register_mask.tobytes() + self.memory_mask.tobytes())
 
 class AssemblyGame(object):
     """The environment AlphaDev is interacting with."""
 
     class AssemblyInstruction(object):
-        def __init__(self, action: 'Action'):
-            """Represent an action as an assembly instruction.
+        def __init__(self, action: RiscvAction):
             """
-            self.opcode = action.opcode # int
+            Represent an action as an assembly instruction.
+            """
+            self.opcode = action.opcode # str
             self.operands = action.operands # list
 
     class AssemblySimulator(riscv_machine):
@@ -251,16 +255,25 @@ class AssemblyGame(object):
             # FIXME: need to check if the program can be invalid at any point in time.
             return False
 
-    def __init__(self, task_spec):
+    def __init__(self, task_spec, example: IOExample, action_space_storage: ActionSpaceStorage):
         self.task_spec = task_spec
+        self.example = example
+        self.storage = action_space_storage
         self.program = [] # program here is an array, which suggests that there are only append actions
-        self.simulator = self.AssemblySimulator(task_spec)
+        self.simulator = self.AssemblySimulator(task_spec, example)
         self.previous_correct_items = 0
+        self.expected_outputs = self.make_expected_outputs()
 
     def step(self, action):
-        instruction = self.AssemblyInstruction(action)
-        self.program.append(instruction) # append the action (no swap moves)
-        self.execution_state = self.simulator.apply(instruction)
+        action_space = self.storage.get_space(self.simulator.get_state())
+        instructions = action_space.get(action) # lookup x86 instructions and convert to riscv
+        # there might be multiple instructions in a single action
+        if not isinstance(instructions, list):
+            instructions = [instructions]
+        for riscv_action in instructions:
+            insn = self.AssemblyInstruction(riscv_action, self.storage)
+            self.program.append(insn) # append the action (no swap moves)
+            self.execution_state = self.simulator.apply(insn)
         return self.observation(), self.correctness_reward()
 
     def observation(self):
@@ -274,19 +287,18 @@ class AssemblyGame(object):
         }
 
     def make_expected_outputs(self):
+        # TODO: this might need refining.
         return jnp.array(
             self.example.outputs
         )
 
     def correctness_reward(self) -> float:
         """Computes a reward based on the correctness of the output."""
-        make_expected_outputs = jnp.array()
-        expected_outputs = make_expected_outputs()
         state = self.execution_state
 
         # Weighted sum of correctly placed items
         correct_items = 0
-        for output, expected in zip(state.memory, expected_outputs):
+        for output, expected in zip(state.memory, self.expected_outputs):
             correct_items += output.weight * sum(
                 output[i] == expected[i] for i in range(len(output))
             )
@@ -296,7 +308,7 @@ class AssemblyGame(object):
         self.previous_correct_items = correct_items
 
         # Bonus for fully correct programs
-        all_correct = jnp.all(state.memory == expected_outputs)
+        all_correct = jnp.all(state.memory == self.expected_outputs)
         reward += self.task_spec.correct_reward * all_correct
 
         return reward
@@ -319,10 +331,8 @@ class AssemblyGame(object):
         return self.simulator.invalid() or self.correct()
 
     def correct(self) -> bool:
-        expected_outputs = self.make_expected_outputs()
         state = self.execution_state
-        # Check if the output is correct
-        return jnp.all(state.memory == expected_outputs)
+        return jnp.all(state.memory == self.expected_outputs)
 
 ######## End Environment ########
 #################################
@@ -347,58 +357,6 @@ class Action(object):
 
     def __gt__(self, other):
         return self.index > other.index
-
-class RiscvAction(Action):
-    """Action representation for RISC-V instructions.
-    Fields:
-        opcode: int
-        operands: list of int
-    """
-    def __init__(self, index: int, opcode: int, operands: list):
-        super().__init__(index)
-        self.opcode = opcode
-        self.operands = operands
-    
-    def __repr__(self):
-        return f"RiscvAction({idx_to_op[self.opcode]}, {','.join(self.operands)})"
-
-class ActionSpace(object):
-    """Action space, which is a set of actions."""
-    def __init__(self, actions: Sequence[Action]):
-        self._actions = actions
-
-    @property
-    def actions(self): return self._actions
-
-    def __iter__(self):
-        return iter(self.actions)
-
-    def __len__(self):
-        return len(self.actions)
-
-    def __getitem__(self, index):
-        return self.actions[index]
-
-    def __contains__(self, item):
-        return item in self.actions
-
-    def __repr__(self):
-        return f'ActionSpace({len(self.actions)})'
-
-    def __copy__(self):
-        # not a deep copy, we don't need that. Action spaces are immutable
-        return ActionSpace(self.actions.copy())
-
-class ActionSpaceStorage(object):
-    """Storage for action spaces."""
-
-    def __init__(self):
-        self.action_spaces = {}
-    
-    def get(self,
-            state: CPUState,
-            history: ActionHistory) -> ActionSpace:
-        pass
 
 class NetworkOutput(NamedTuple):
     value: float
@@ -987,9 +945,6 @@ class ActionHistory(object):
     def last_action(self) -> Action:
         return self.history[-1]
 
-    def action_space(self) -> Sequence[Action]:
-        return [Action(i) for i in range(self.action_space_size)]
-
     def to_play(self) -> Player:
         return Player()
 
@@ -1014,6 +969,7 @@ class Game(object):
         self, action_space_size: int, discount: float, task_spec: TaskSpec
     ):
         self.task_spec = task_spec
+        # TODO: also pass io example and action space storage
         self.environment = AssemblyGame(task_spec)
         self.history = []
         self.rewards = []
@@ -1073,6 +1029,7 @@ class Game(object):
         # NOTE: re-play the game from the initial state.
         # FIXME: initial state depends on the current task we are solving
         # unlike in AlphaDev, where the initial state is always the same.
+        # TODO: also pass the action space storage to the game.
         env = AssemblyGame(self.task_spec)
         for action in self.history[:state_index]:
             observation, _ = env.step(action)
