@@ -274,10 +274,10 @@ class IOExample(NamedTuple):
 
 class TaskSpec(NamedTuple):
     max_program_size: int
-    num_inputs: int
-    num_funcs: int
-    num_locations: int
-    num_actions: int
+    num_inputs: int # TODO: ??? wtf is this
+    num_funcs: int # number of x86 instructions to consider
+    num_locations: int # memory + register locations to consider
+    num_actions: int # number of actions in the action space
     correct_reward: float
     correctness_reward_weight: float
     latency_reward_weight: float
@@ -362,7 +362,7 @@ class AssemblyGame(object):
             self.reset()
             start_time = time.time()
             for instruction in program:
-                op_str = idx_to_op[instruction.opcode]
+                op_str = instruction.opcode
                 op_fn = getattr(self, op_str)
                 op_fn(*instruction.operands)
             end_time = time.time()
@@ -619,6 +619,7 @@ class RepresentationNet(hk.Module):
         #NOTE: no init here, haiku takes care of it.
 
     def __call__(self, inputs):
+        # inputs is the observation dict
         batch_size = inputs['program'].shape[0]
 
         program_encoding = None
@@ -626,7 +627,7 @@ class RepresentationNet(hk.Module):
             program_encoding = self._encode_program(inputs, batch_size)
 
         if (
-            self._hparams.representation.use_locations
+            self._hparams.representation.use_locations # i.e. CPU state
             and self._hparams.representation.use_locations_binary
         ):
             raise ValueError(
@@ -642,6 +643,7 @@ class RepresentationNet(hk.Module):
                 inputs, batch_size
             )
 
+        # NOTE: this is not used.
         permutation_embedding = None
         if self._hparams.representation.use_permutation_embedding:
             permutation_embedding = self.make_permutation_embedding(batch_size)
@@ -737,9 +739,9 @@ class RepresentationNet(hk.Module):
         return joint_encoding
 
     def make_program_onehot(self, program, batch_size, max_program_size):
-        func = program[:, :, 0]
-        arg1 = program[:, :, 1]
-        arg2 = program[:, :, 2]
+        func = program[:, :, 0] # the opcode -- int
+        arg1 = program[:, :, 1] # the first operand -- int 
+        arg2 = program[:, :, 2] # the second operand -- int
         func_onehot = jax.nn.one_hot(func, self._task_spec.num_funcs)
         arg1_onehot = jax.nn.one_hot(arg1, self._task_spec.num_locations)
         arg2_onehot = jax.nn.one_hot(arg2, self._task_spec.num_locations)
@@ -1097,11 +1099,12 @@ class Game(object):
     """A single episode of interaction with the environment."""
 
     def __init__(
-        self, action_space_size: int, discount: float, task_spec: TaskSpec
+        self, action_space_size: int, discount: float, task_spec: TaskSpec, example: IOExample = None
     ):
         self.task_spec = task_spec
         # TODO: also pass io example and action space storage
-        self.environment = AssemblyGame(task_spec)
+        self.action_space_storage = ActionSpaceStorage(max_reg=task_spec.num_funcs, max_mem=task_spec.)
+        self.environment = AssemblyGame(task_spec, example, action_space_storage)
         self.history = []
         self.rewards = []
         self.latency_reward = 0
