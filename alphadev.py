@@ -30,7 +30,7 @@
 import collections
 import functools
 import math
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List
 
 import time
 import chex
@@ -47,84 +47,226 @@ from tinyfive.machine import machine as riscv_machine
 ############################
 ###### 1. Environment ######
 
-op_list = [
-    'LUI',
-    'AUIPC',
-    'JAL',
-    'JALR',
-    'BEQ',
-    'BNE',
-    'BLT',
-    'BGE',
-    'BLTU',
-    'BGEU',
-    'LB',
-    'LH',
-    'LW',
-    'LBU',
-    'LHU',
-    'SB',
-    'SH',
-    'SW',
-    'ADDI',
-    'SLTI',
-    'SLTIU',
-    'XORI',
-    'ORI',
-    'ANDI',
-    'SLLI',
-    'SRLI',
-    'SRAI',
-    'ADD',
-    'SUB',
-    'SLL',
-    'SLT',
-    'SLTU',
-    'XOR',
-    'SRL',
-    'SRA',
-    'OR',
-    'AND',
-    # M-extension
-    'MUL',
-    'MULH',
-    'MULHSU',
-    'MULHU',
-    'DIV',
-    'DIVU',
-    'REM',
-    'REMU',
-    # F-extension
-    'FLW_S',
-    'FSW_S',
-    'FMADD_S',
-    'FMSUB_S',
-    'FNMSUB_S',
-    'FNMADD_S',
-    'FADD_S',
-    'FSUB_S',
-    'FMUL_S',
-    'FDIV_S',
-    'FSGNJ_S',
-    'FSGNJN_S',
-    'FSGNJX_S',
-    'FMIN_S',
-    'FMAX_S',
-    'FEQ_S',
-    'FLT_S',
-    'FLE_S',
-    'FSQRT_S',
-    'FCVT_W_S',
-    'FCVT_WU_S',
-    'FMV_X_W',
-    'FCLASS_S',
-    'FCVT_S_W',
-    'FCVT_S_WU',
-    'FMV_W_X',
-]
 
-idx_to_op = {idx: op for idx, op in enumerate(op_list)}
-op_to_idx = {op: idx for idx, op in enumerate(op_list)}
+class CPUState(NamedTuple):
+    registers: jnp.ndarray
+    memory: jnp.ndarray
+    register_mask: jnp.ndarray
+    memory_mask: jnp.ndarray
+    program: jnp.ndarray
+    program_length: int
+    
+    def __hash__(self):
+        return hash(self.register_mask.tobytes() + self.memory_mask.tobytes())
+
+X0 = 0
+X1 = 1 # reserved for comparison
+REG_T = 10
+MEM_T = 11
+
+riscv_valid_registers = [X0] + list(range(2, 32)) # x0 is hard-coded zero register
+
+# define the x86 instruction set used in AlphaDev fixed sort programs
+# NOTE: we use risc-like move instructions to more easily distinguish between different modes
+x86_signatures = {
+    "mv" : (REG_T, REG_T), # move <reg1>, <reg2> 
+    "lw" : (MEM_T, REG_T), # move <mem>, <reg1>
+    "sw" : (REG_T, MEM_T), # move <reg1>, <mem>
+    # no load immediates are used in AlphaDev fixed-sort programs
+    "cmp" : (REG_T, REG_T),
+    "cmovg" : (REG_T, REG_T),
+    "cmovle" : (REG_T, REG_T),
+    # skip jump instructions, they are not used in the published sort algorithms
+    }
+
+class RiscvAction(NamedTuple):
+    opcode: str
+    operands: Tuple[int, ...]
+
+    def __repr__(self):
+        return f"RiscvAction(opcode={self.opcode}, operands={self.operands}"
+
+    def __str__(self):
+        return f"{self.opcode} {', '.join(map(str, self.operands))}"
+
+def x86_to_riscv(x86_opcode, x86_operands, state):
+    """
+    Convert x86 opcode and operands to RISC-V opcode and operands.
+    Args:
+        x86_opcode (str): The x86 opcode.
+        x86_operands (list): The x86 operands.
+    Returns:
+        list: A list of RISC-V instructions. Using the conversion described above
+    """
+    if x86_opcode == "mv": # move between registers
+        return [RiscvAction("ADD", (x86_operands[0], X0, x86_operands[1]))]
+    elif x86_opcode == "lw": # load word from memory to register
+        return [RiscvAction("SW", (x86_operands[1], x86_operands[0]))]
+    elif x86_opcode == "sw": # store word from register to memory
+        return [RiscvAction("LW", (x86_operands[0], x86_operands[1]))]
+    elif x86_opcode == "cmp": # compare two registers
+        return [RiscvAction("SUB", (X1, x86_operands[0], x86_operands[1]))]
+    elif x86_opcode == "cmovg": # conditional move if greater than
+        return [
+            RiscvAction("BLE", (X1, 0, state.pc+8)),  # skip next instruction if A < B
+            RiscvAction("ADD", (x86_operands[1], X0, x86_operands[0]))  # copy C to D
+        ]
+    elif x86_opcode == "cmovle": # conditional move if less than or equal
+        return [
+            RiscvAction("BGT", (X1, 0, state.pc+8)),  # skip next instruction if A > B
+            RiscvAction("ADD", (x86_operands[1], X0, x86_operands[0]))  # copy E to F
+        ]
+    else:
+        raise ValueError(f"Unknown opcode: {x86_opcode}")
+
+def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[int, int]]]:
+    def apply_opcode(opcode: str, operands: Tuple[int, int, int]) -> List[Tuple[str, Tuple[int, int]]]:
+        # operands is a triple (reg1, reg2, mem)
+        signature = x86_signatures[opcode]
+        if signature == (REG_T, REG_T):
+            return [(opcode, (operands[0], operands[1]))]
+        elif signature == (MEM_T, REG_T):
+            return [(opcode, (operands[2], operands[0]))]
+        elif signature == (REG_T, MEM_T):
+            return [(opcode, (operands[0], operands[2]))]
+    def enum_actions(r1: int, r2: int, m: int) -> List[Tuple[str, Tuple[int, int]]]:
+        if r1 == 1 and r2 == 1 and m == 1:
+            return [apply_opcode(opcode, (r1, r2, m)) for opcode in x86_signatures.keys()]
+        actions = []
+        if r1 > 1:
+            actions.extend(enum_actions(r1 - 1, r2, m))
+        if r2 > 1:
+            actions.extend(enum_actions(r1, r2 - 1, m))
+        if m > 1:
+            actions.extend(enum_actions(r1, r2, m - 1))
+        actions.extend([apply_opcode(opcode, (r1, r2, m)) for opcode in x86_signatures.keys()])
+        return actions
+    actions = enum_actions(max_reg, max_reg, max_mem)
+    return actions
+
+# the emulator should call ActionSpace.get(action) to get the action
+# the action space can use the emulator to get the action
+# the action space also needs to define a masking function that masks invalid actions based on the emulator state
+class ActionSpace(object):
+    # placeholder for now.
+    pass
+
+class x86ActionSpace(ActionSpace):
+    def __init__(self,
+            actions: List[Callable[[Any],Tuple[str, Tuple[int, int]]]],
+            state: 'CPUState'):
+        self.actions = actions
+        self.state = state
+        
+    def get(self, action_id: int) -> List[RiscvAction]:
+        return x86_to_riscv(*self.actions[action_id], self.state) # convert to RISC-V
+
+class ActionSpaceStorage(object):
+    # placeholder for now.
+    pass
+
+class x86ActionSpaceStorage(ActionSpaceStorage):
+    def __init__(self, max_reg: int, max_mem: int):
+        self.max_reg = max_reg
+        self.max_mem = max_mem
+        self.actions = x86_enumerate_actions(max_reg, max_mem)
+        # there is a single action space for the given task
+        self.action_space = x86ActionSpace # these are still x86 instructions
+        # TODO: make sure we don't flood the memory with this
+        self.masks = {}
+        # build mask lookup tables
+        self.reg_masks = None
+        self.mem_masks = None
+        self._build_masks()
+        # for pruning the action space (one read and one write per memory location)
+        self._history_cache = None
+        self._mems_read = set()
+        self._mems_written = set()
+        
+    def _build_masks(self):
+        """
+        Build masks over the action space for each register and memory location.
+        At runtime, we can dynamically take the union of a subset of these masks
+        to efficiently mask the action space. 
+        """
+        # we create a max_reg x action_space_size and 
+        # max_mem x action_space_size masks
+        action_space_size = len(self.actions)
+        reg_masks = jnp.zeros((self.max_reg, action_space_size), dtype=jnp.bool)
+        mem_masks = jnp.zeros((self.max_mem, action_space_size), dtype=jnp.bool)
+        for i, action in enumerate(self.actions):
+            # iterate over the x86 instructions currently under consideration
+            x86_opcode, x86_operands = action
+            signature = x86_signatures[x86_opcode]
+            if signature == (REG_T, REG_T):
+                # move between registers
+                reg_masks[x86_operands[0], i] = True
+                reg_masks[x86_operands[1], i] = True
+            elif signature == (MEM_T, REG_T):
+                # load word from memory to register
+                mem_masks[x86_operands[0], i] = True
+                reg_masks[x86_operands[1], i] = True
+            elif signature == (REG_T, MEM_T):
+                # store word from register to memory
+                reg_masks[x86_operands[0], i] = True
+                mem_masks[x86_operands[1], i] = True
+            else:
+                assert False, f"No signature of type {signature} should be used. fix this."
+        
+        self.reg_masks = reg_masks
+        self.mem_masks = mem_masks
+
+    def get_masks(self, state, history=None) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        def update_history(action):
+            # update the history with the action
+            if action.opcode == "lw": # (MEM_T, _)
+                self._mems_read.add(action.operands[0])
+            elif action.opcode == "sw": # (_, MEM_T)
+                self._mems_written.add(action.operands[1])
+        
+        if state not in self.masks:
+            active_registers = state.register_mask
+            active_memory = state.memory_mask
+            # increment the active registers and memory by 1 to allow accessing locations
+            # find the last non-zero index
+            last_reg = jnp.argmax(active_registers[::-1])
+            last_mem = jnp.argmax(active_memory[::-1])
+            reg_mask = jnp.any(self.reg_masks[active_registers, last_reg], axis=0)
+            mem_mask = jnp.any(self.mem_masks[active_memory, last_mem], axis=0)
+            self.masks[state] = (reg_mask, mem_mask)
+        # now we need to make sure that only one read and one write is allowed for each memory location
+        # this should be computed on the fly, as the program keeps changing in crazy ways.
+        # BUT, we can cache the histor so we don't have to iterate over it every time
+        # since we only use this in MCTS which is depth-first
+
+        reg_mask, mem_mask = self.masks[state]
+        reg_mask = reg_mask.copy()
+        mem_mask = mem_mask.copy()
+
+        # check if the history seems to be a continuation of the current state
+        if history is not None:
+            if self.history_cache is not None and\
+                len(self._history_cache) + 1 == len(history) and \
+                self._history_cache[-1] == history[-2]: # check only the last action to save time
+                # we can use the cached history
+                update_history(history[-1])
+            else:
+                # we need to recompute the history
+                self._mems_read = set()
+                self._mems_written = set()
+                # iterate over the history
+                for action in history:
+                    update_history(action)
+            # update the history cache
+            self._history_cache = history
+            # update the masks
+            mem_mask |= jnp.any(self.mem_masks[self._mems_read], axis=0)
+            mem_mask |= jnp.any(self.mem_masks[self._mems_written], axis=0)
+
+        return reg_mask, mem_mask
+
+    def get_space(self, state) -> x86ActionSpace:
+        return self.action_space(self.actions, state)
 
 class IOExample(NamedTuple):
     inputs: jnp.ndarray
@@ -140,17 +282,6 @@ class TaskSpec(NamedTuple):
     correctness_reward_weight: float
     latency_reward_weight: float
     latency_quantile: float
-
-class CPUState(NamedTuple):
-    registers: jnp.ndarray
-    memory: jnp.ndarray
-    register_mask: jnp.ndarray
-    memory_mask: jnp.ndarray
-    program: jnp.ndarray
-    program_length: int
-    
-    def __hash__(self):
-        return hash(self.register_mask.tobytes() + self.memory_mask.tobytes())
 
 class AssemblyGame(object):
     """The environment AlphaDev is interacting with."""
@@ -210,7 +341,7 @@ class AssemblyGame(object):
             """Apply an assembly instruction to the simulator."""
             # NOTE: to avoid the overhead of encoding and then decoding the instruction (O(n) time),
             # we use the uppercase methods of the machine class directly.
-            op_str = idx_to_op[instruction.opcode]
+            op_str = instruction.opcode
             op_fn = getattr(self, op_str)
             op_fn(*instruction.oprands) # NOTE: we need to ensure that `operands` is correct.
             return self.get_state()
@@ -264,9 +395,9 @@ class AssemblyGame(object):
         self.previous_correct_items = 0
         self.expected_outputs = self.make_expected_outputs()
 
-    def step(self, action):
+    def step(self, action:'Action'):
         action_space = self.storage.get_space(self.simulator.get_state())
-        instructions = action_space.get(action) # lookup x86 instructions and convert to riscv
+        instructions = action_space.get(action.index) # lookup x86 instructions and convert to riscv
         # there might be multiple instructions in a single action
         if not isinstance(instructions, list):
             instructions = [instructions]
@@ -1276,7 +1407,7 @@ def run_mcts(
 def _select_action(
     # pylint: disable-next=unused-argument
     config: AlphaDevConfig, num_moves: int, node: Node, network: Network
-):
+) -> Action:
     visit_counts = [
         (child.visit_count, action) for action, child in node.children.items()
     ]
@@ -1466,6 +1597,7 @@ def scalar_loss(prediction, target, network) -> float:
 # Stubs to make the typechecker happy.
 # pylint: disable-next=unused-argument
 def softmax_sample(distribution, temperature: float):
+    # TODO
     return 0, 0
 
 
@@ -1476,3 +1608,82 @@ def launch_job(f, *args):
 
 def make_uniform_network():
     return UniformNetwork()
+
+#definitions for RISC-V dynamic action spaces, not used rn
+# op_list = [
+#     'LUI',
+#     'AUIPC',
+#     'JAL',
+#     'JALR',
+#     'BEQ',
+#     'BNE',
+#     'BLT',
+#     'BGE',
+#     'BLTU',
+#     'BGEU',
+#     'LB',
+#     'LH',
+#     'LW',
+#     'LBU',
+#     'LHU',
+#     'SB',
+#     'SH',
+#     'SW',
+#     'ADDI',
+#     'SLTI',
+#     'SLTIU',
+#     'XORI',
+#     'ORI',
+#     'ANDI',
+#     'SLLI',
+#     'SRLI',
+#     'SRAI',
+#     'ADD',
+#     'SUB',
+#     'SLL',
+#     'SLT',
+#     'SLTU',
+#     'XOR',
+#     'SRL',
+#     'SRA',
+#     'OR',
+#     'AND',
+#     # M-extension
+#     'MUL',
+#     'MULH',
+#     'MULHSU',
+#     'MULHU',
+#     'DIV',
+#     'DIVU',
+#     'REM',
+#     'REMU',
+#     # F-extension
+#     'FLW_S',
+#     'FSW_S',
+#     'FMADD_S',
+#     'FMSUB_S',
+#     'FNMSUB_S',
+#     'FNMADD_S',
+#     'FADD_S',
+#     'FSUB_S',
+#     'FMUL_S',
+#     'FDIV_S',
+#     'FSGNJ_S',
+#     'FSGNJN_S',
+#     'FSGNJX_S',
+#     'FMIN_S',
+#     'FMAX_S',
+#     'FEQ_S',
+#     'FLT_S',
+#     'FLE_S',
+#     'FSQRT_S',
+#     'FCVT_W_S',
+#     'FCVT_WU_S',
+#     'FMV_X_W',
+#     'FCLASS_S',
+#     'FCVT_S_W',
+#     'FCVT_S_WU',
+#     'FMV_W_X',
+# ]
+# idx_to_op = {idx: op for idx, op in enumerate(op_list)}
+# op_to_idx = {op: idx for idx, op in enumerate(op_list)}
