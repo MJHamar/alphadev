@@ -175,8 +175,8 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # TODO: make sure we don't flood the memory with this
         self.masks = {}
         # build mask lookup tables
-        self.reg_masks = None
-        self.mem_masks = None
+        self.reg_mask_lookup = None
+        self.mem_mask_lookup = None
         self._build_masks()
         # for pruning the action space (one read and one write per memory location)
         self._history_cache = None
@@ -213,8 +213,8 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             else:
                 assert False, f"No signature of type {signature} should be used. fix this."
         
-        self.reg_masks = reg_masks
-        self.mem_masks = mem_masks
+        self.reg_mask_lookup = reg_masks
+        self.mem_mask_lookup = mem_masks
 
     def get_masks(self, state, history=None) -> Tuple[jnp.ndarray, jnp.ndarray]:
         def update_history(action):
@@ -231,8 +231,8 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # find the last non-zero index
             last_reg = jnp.argmax(active_registers[::-1])
             last_mem = jnp.argmax(active_memory[::-1])
-            reg_mask = jnp.any(self.reg_masks[active_registers, last_reg], axis=0)
-            mem_mask = jnp.any(self.mem_masks[active_memory, last_mem], axis=0)
+            reg_mask = jnp.any(self.reg_mask_lookup[active_registers, last_reg], axis=0)
+            mem_mask = jnp.any(self.mem_mask_lookup[active_memory, last_mem], axis=0)
             self.masks[state] = (reg_mask, mem_mask)
         # now we need to make sure that only one read and one write is allowed for each memory location
         # this should be computed on the fly, as the program keeps changing in crazy ways.
@@ -260,10 +260,10 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # update the history cache
             self._history_cache = history
             # update the masks
-            mem_mask |= jnp.any(self.mem_masks[self._mems_read], axis=0)
-            mem_mask |= jnp.any(self.mem_masks[self._mems_written], axis=0)
+            mem_mask |= jnp.any(self.mem_mask_lookup[self._mems_read], axis=0)
+            mem_mask |= jnp.any(self.mem_mask_lookup[self._mems_written], axis=0)
 
-        return reg_mask, mem_mask
+        return reg_mask | mem_mask # take the union of the two masks
 
     def get_space(self, state) -> x86ActionSpace:
         return self.action_space(self.actions, state)
@@ -406,6 +406,9 @@ class AssemblyGame(object):
             self.program.append(insn) # append the action (no swap moves)
             self.execution_state = self.simulator.apply(insn)
         return self.observation(), self.correctness_reward()
+
+    def state(self):
+        return self.simulator.get_state()
 
     def observation(self):
         return {
@@ -1081,7 +1084,11 @@ class ActionHistory(object):
     def to_play(self) -> Player:
         return Player()
 
-    # FIXME: action_space() is missing...
+    def action_space(self) -> Sequence[Action]:
+        # NOTE: this is the original implementation.
+        # used during MCTS, we return the entire action space (no pruning).
+        # TODO: we might want to apply pruning here. See implementation of `Game.legal_actions`.
+        return [Action(i) for i in range(self.action_space_size)]
 
 
 class Target(NamedTuple):
@@ -1104,9 +1111,10 @@ class Game(object):
         self, action_space_size: int, discount: float, task_spec: TaskSpec, example: IOExample = None
     ):
         self.task_spec = task_spec
-        # TODO: also pass io example and action space storage
-        self.action_space_storage = ActionSpaceStorage(max_reg=task_spec.num_funcs, max_mem=task_spec.)
-        self.environment = AssemblyGame(task_spec, example, action_space_storage)
+        # TODO: figure out how to split num_locations to registers and memory.
+        # FIXME: this is hard-coded for the 3-sort task for now.
+        self.action_space_storage = x86ActionSpaceStorage(max_reg=5, max_mem=task_spec.num_locations-5)
+        self.environment = AssemblyGame(task_spec, example, self.action_space_storage)
         self.history = []
         self.rewards = []
         self.latency_reward = 0
@@ -1127,9 +1135,13 @@ class Game(object):
 
     def legal_actions(self) -> Sequence[Action]:
         # Game specific calculation of legal actions.
-        # NOTE: implement as an enumeration of the allowed actions,
-        # instead of filtering the pre-defined action space.
-        return []
+        # TODO: implement as an enumeration of the allowed actions,
+        # instead of filtering the pre-defined action space. (for the next iteration of this codebase)
+        state = self.environment.state()
+        actions_mask = self.action_space_storage.get_masks(state, self.history)
+        actions = self.action_space_storage.get_space(state).actions
+        pruned_actions = actions * ~actions_mask # invert
+        return pruned_actions
 
     def apply(self, action: Action):
         _, reward = self.environment.step(action)
@@ -1401,15 +1413,15 @@ def run_mcts(
         # always the last step in a trajectory.
         network_output = network.inference(observation) # get the priors
         _expand_node( # expand the leaf node
-            # History.action_space() is not defined. Previously, we used game.legal_actions()
             # here, game is not available. I suppose we do not perform action pruning here
             # instead, the history should be initialized either 
-            #   with the game's current legal actions.
+            #   with the game's current legal actions. -- UPDATE: this is stupid. The game will never find a solution
             #   or with the action space of the environment.
             # using current legal actions is bad, since as used memory grows we need to allocate new locations
             # using the action space of the environment is also not great because it would allow many illegal actions.
             # pruning the action space during MCTS might entail a big overhead.
             # we need to experiment with this.
+            # NOTE: for now, we go with AlphaDev's implementation of returning all actions.
             node, history.to_play(), history.action_space(), network_output, reward
         ) # TODO: this is where we should pass the environment so that it can prune actions
         _backpropagate(
