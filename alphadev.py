@@ -977,7 +977,7 @@ class AlphaDevConfig(object):
             num_inputs=17,
             num_funcs=14,
             num_locations=19,
-            num_actions=271,
+            num_actions=271, # TODO: revisit this once we know how many actions the action space storage generates
             correct_reward=1.0,
             correctness_reward_weight=2.0,
             latency_reward_weight=0.5,
@@ -1120,6 +1120,9 @@ class Game(object):
         self.latency_reward = 0
         self.child_visits = []
         self.root_values = []
+        # TODO: action space size is redundant and prone to be wrong.
+        # action space size should not really be stored, especially when we use dynamic action spaces.
+        # leaving this for now to the same of consistency with the original code.
         self.action_space_size = action_space_size
         self.discount = discount
 
@@ -1127,11 +1130,14 @@ class Game(object):
         # Game specific termination rules.
         # For sorting, a game is terminal if we sort all sequences correctly or
         # we reached the end of the buffer.
-        return self.environment.terminal()
+        toolong = len(self.history) >= self.task_spec.max_program_size
+        iscorrect = self.is_correct()
+        return toolong or iscorrect
 
     def is_correct(self) -> bool:
         # Whether the current algorithm solves the game.
-        pass
+        # for all inputs, right?
+        pass # TODO: implement this
 
     def legal_actions(self) -> Sequence[Action]:
         # Game specific calculation of legal actions.
