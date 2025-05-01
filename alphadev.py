@@ -384,7 +384,6 @@ class AssemblyGame(object):
         return dict(self.state())
 
     def make_expected_outputs(self):
-        # TODO: this might need refining.
         return jnp.stack(
             [example.outputs for example in self.inputs]
         )
@@ -437,7 +436,7 @@ class AssemblyGame(object):
         ret.program = self.program.copy()
         return ret
 
-    def terminal(self) -> bool: # TODO: ? when else
+    def terminal(self) -> bool:
         return self.simulator.invalid() or self.correct()
 
     def correct(self) -> bool:
@@ -953,7 +952,7 @@ class AlphaDevConfig(object):
             num_inputs=17,
             num_funcs=14,
             num_locations=19,
-            num_actions=271, # TODO: revisit this once we know how many actions the action space storage generates
+            num_actions=271,
             correct_reward=1.0,
             correctness_reward_weight=2.0,
             latency_reward_weight=0.5,
@@ -990,6 +989,8 @@ class AlphaDevConfig(object):
         self.momentum = 0.9
         
         self.inputs = generate_sort_inputs(3, self.task_spec.num_inputs)
+        assert self.task_spec.num_inputs == len(self.inputs),\
+            f"Expected {self.task_spec.num_inputs} inputs, got {len(self.inputs)}"
 
     def new_game(self):
         return Game(self.task_spec.num_actions, self.discount, self.task_spec, self.inputs)
@@ -1103,6 +1104,8 @@ class Game(object):
         # action space size should not really be stored, especially when we use dynamic action spaces.
         # leaving this for now to the same of consistency with the original code.
         self.action_space_size = action_space_size
+        assert action_space_size == len(self.action_space_storage.actions), \
+            f"Expected {action_space_size} actions, got {len(self.action_space_storage.actions)}"
         self.discount = discount
 
     def terminal(self) -> bool:
@@ -1138,13 +1141,8 @@ class Game(object):
     def store_search_statistics(self, root: Node):
         # NOTE: this function is used to store statistics about the observed trajectory (outside of MCTS)
         sum_visits = sum(child.visit_count for child in root.children.values())
-        # NOTE: this is a problem. MCTS assumes a fixed action space, 
-        # which i don't know how to enumerate.
-        # fair point tho that we CAN compute this on the fly,
-        # and store the available actions in expanded nodes.
-        # TODO: add a shared action storage to cache the action spaces based on
-        # active register and memory locations.
-        action_space = (Action(index) for index in range(self.action_space_size))
+        # FIXME: in the next iteration with dynamic action spaces, this no longer works.
+        action_space = self.action_space_storage.actions
         self.child_visits.append(
             [
                 root.children[a].visit_count / sum_visits
@@ -1160,10 +1158,7 @@ class Game(object):
         if state_index == -1:
             return self.environment.observation()
         # NOTE: re-play the game from the initial state.
-        # FIXME: initial state depends on the current task we are solving
-        # unlike in AlphaDev, where the initial state is always the same.
-        # TODO: also pass the action space storage to the game.
-        env = AssemblyGame(self.task_spec)
+        env = AssemblyGame(self.task_spec, self.inputs, self.action_space_storage)
         for action in self.history[:state_index]:
             observation, _ = env.step(action)
         return observation
@@ -1198,7 +1193,6 @@ class Game(object):
         return Player()
 
     def action_history(self) -> ActionHistory:
-        # TODO: pass the environment (?)
         return ActionHistory(self.history, self.action_space_size)
 
 
@@ -1408,7 +1402,7 @@ def run_mcts(
             # we need to experiment with this.
             # NOTE: for now, we go with AlphaDev's implementation of returning all actions.
             node, history.to_play(), history.action_space(), network_output, reward
-        ) # TODO: this is where we should pass the environment so that it can prune actions
+        )
         _backpropagate(
             search_path,
             network_output.value,
@@ -1434,6 +1428,7 @@ def _select_action(
         training_steps=network.training_steps()
     )
     _, action = softmax_sample(visit_counts, t)
+    # i.e. posterior probability based on the visit counts
     return action
 
 
@@ -1474,7 +1469,7 @@ def _ucb_score(
 def _expand_node(
     node: Node,
     to_play: Player,
-    actions: Sequence[Action], # TODO: pass actions as a mask
+    actions: Sequence[Action],
     network_output: NetworkOutput,
     reward: float,
 ):
@@ -1618,8 +1613,9 @@ def scalar_loss(prediction, target, network) -> float:
 # Stubs to make the typechecker happy.
 # pylint: disable-next=unused-argument
 def softmax_sample(distribution, temperature: float):
-    # TODO
-    return 0, 0
+    scaled = distribution / temperature
+    action = jax.random.categorical(jax.random.PRNGKey(0), scaled)
+    return scaled[action], action
 
 
 def launch_job(f, *args):
