@@ -274,7 +274,7 @@ class IOExample(NamedTuple):
 
 class TaskSpec(NamedTuple):
     max_program_size: int
-    num_inputs: int # TODO: ??? wtf is this
+    num_inputs: int # number of input examples
     num_funcs: int # number of x86 instructions to consider
     num_locations: int # memory + register locations to consider
     num_actions: int # number of actions in the action space
@@ -1081,6 +1081,8 @@ class ActionHistory(object):
     def to_play(self) -> Player:
         return Player()
 
+    # FIXME: action_space() is missing...
+
 
 class Target(NamedTuple):
     correctness_value: float
@@ -1199,6 +1201,7 @@ class Game(object):
         return Player()
 
     def action_history(self) -> ActionHistory:
+        # TODO: pass the environment (?)
         return ActionHistory(self.history, self.action_space_size)
 
 
@@ -1323,23 +1326,27 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
         root = Node(0)
         current_observation = game.make_observation(-1)
         network_output = network.inference(current_observation)
-        _expand_node( # expand root
+        _expand_node( # expand current root
             root, game.to_play(), game.legal_actions(), network_output, reward=0
         )
         _backpropagate(
             [root], # only the root
-            network_output.value, # predicted value at the root
+            network_output.value, # predicted value at the current root
             game.to_play(), # dummy player
             config.discount,
             min_max_stats,
         )
         _add_exploration_noise(config, root)
+        
+        # NOTE: above, we expanded the current root (after some n moves), effectively initializing the search tree.
+        # we used game.legal_actions() to get the action space at the root.
+        # 
 
         # We then run a Monte Carlo Tree Search using the environment.
         run_mcts(
             config,
             root,
-            game.action_history(),
+            game.action_history(), # newly initialized action history at the current root
             network,
             min_max_stats,
             game.environment,
@@ -1374,27 +1381,37 @@ def run_mcts(
         env: an instance of the AssemblyGame.
     """
 
-    for _ in range(config.num_simulations):
+    for _ in range(config.num_simulations): # rollouts
         history = action_history.clone()
-        node = root
-        search_path = [node]
+        node = root # start from the current root
+        search_path = [node] # initialise new trajectory from the current root
         sim_env = env.clone() # start from the current state of the environment
         # Traverse the tree until we reach a leaf node.
 
         while node.expanded():
             action, node = _select_child(config, node, min_max_stats) # based on UCB
             sim_env.step(action) # step the environment
-            history.add_action(action) # update histroy 
+            history.add_action(action) # update history 
             search_path.append(node) # append to the current trajectory
 
         # Inside the search tree we use the environment to obtain the next
         # observation and reward given an action.
         observation, reward = sim_env.step(action) # step the environment
+        # NOTE: not updating the history here, it doesn't make a difference since this is 
+        # always the last step in a trajectory.
         network_output = network.inference(observation) # get the priors
-        _expand_node(
+        _expand_node( # expand the leaf node
+            # History.action_space() is not defined. Previously, we used game.legal_actions()
+            # here, game is not available. I suppose we do not perform action pruning here
+            # instead, the history should be initialized either 
+            #   with the game's current legal actions.
+            #   or with the action space of the environment.
+            # using current legal actions is bad, since as used memory grows we need to allocate new locations
+            # using the action space of the environment is also not great because it would allow many illegal actions.
+            # pruning the action space during MCTS might entail a big overhead.
+            # we need to experiment with this.
             node, history.to_play(), history.action_space(), network_output, reward
-        )
-
+        ) # TODO: this is where we should pass the environment so that it can prune actions
         _backpropagate(
             search_path,
             network_output.value,
@@ -1405,6 +1422,8 @@ def run_mcts(
         # NOTE: excuse me but how is this supposed to reach a leaf node? 
         # it seems like we are expanding exactly one node in each iteration.
         # there should be an exit condition upon terminations of the game.
+        # UPDATE: I guess not, num_simulations here refers to the number of unvisited
+        # nodes to expand.
 
 
 def _select_action(
@@ -1458,7 +1477,7 @@ def _ucb_score(
 def _expand_node(
     node: Node,
     to_play: Player,
-    actions: Sequence[Action],
+    actions: Sequence[Action], # TODO: pass actions as a mask
     network_output: NetworkOutput,
     reward: float,
 ):
@@ -1466,7 +1485,9 @@ def _expand_node(
     node.to_play = to_play
     node.hidden_state = network_output.hidden_state
     node.reward = reward
-    policy = {a: math.exp(network_output.policy_logits[a]) for a in actions}
+    # Masked softmax. actions() are the legal actions and network output is the prior
+    # TODO: use a more efficient softmax instead of the lines below.
+    policy = {a: math.exp(network_output.policy_logits[a]) for a in actions} # softmax
     policy_sum = sum(policy.values())
     for action, p in policy.items():
         node.children[action] = Node(p / policy_sum)
