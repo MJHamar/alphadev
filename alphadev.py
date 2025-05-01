@@ -241,29 +241,34 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # BUT, we can cache the histor so we don't have to iterate over it every time
         # since we only use this in MCTS which is depth-first
 
+
         reg_mask, mem_mask = self.masks[state]
         reg_mask = reg_mask.copy()
         mem_mask = mem_mask.copy()
 
         # check if the history seems to be a continuation of the current state
         if history is not None:
+            crnt_space = self.get_space(state)
             if self.history_cache is not None and\
                 len(self._history_cache) + 1 == len(history) and \
                 self._history_cache[-1] == history[-2]: # check only the last action to save time
                 # we can use the cached history
-                update_history(history[-1])
+                update_history(crnt_space.get(history[-1]))
             else:
                 # we need to recompute the history
                 self._mems_read = set()
                 self._mems_written = set()
                 # iterate over the history
                 for action in history:
-                    update_history(action)
+                    update_history(crnt_space.get(action))
             # update the history cache
             self._history_cache = history
             # update the masks
-            mem_mask |= jnp.any(self.mem_mask_lookup[self._mems_read], axis=0)
-            mem_mask |= jnp.any(self.mem_mask_lookup[self._mems_written], axis=0)
+            both = jnp.all(
+                jnp.any(self.mem_mask_lookup[self._mems_read], axis=0),
+                jnp.any(self.mem_mask_lookup[self._mems_written], axis=0)
+            )
+            mem_mask |= both
 
         return reg_mask | mem_mask # take the union of the two masks
 
