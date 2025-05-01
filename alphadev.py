@@ -101,9 +101,9 @@ def x86_to_riscv(x86_opcode, x86_operands, state):
     if x86_opcode == "mv": # move between registers
         return [RiscvAction("ADD", (x86_operands[0], X0, x86_operands[1]))]
     elif x86_opcode == "lw": # load word from memory to register
-        return [RiscvAction("SW", (x86_operands[1], x86_operands[0]))]
+        return [RiscvAction("LW", (x86_operands[1], x86_operands[0], X0))] # rd,imm,rs -- rd, rs(imm)
     elif x86_opcode == "sw": # store word from register to memory
-        return [RiscvAction("LW", (x86_operands[0], x86_operands[1]))]
+        return [RiscvAction("SW", (x86_operands[0], x86_operands[1], X0))] # rs1,imm,rs2 -- rs1, rs2(imm)
     elif x86_opcode == "cmp": # compare two registers
         return [RiscvAction("SUB", (X1, x86_operands[0], x86_operands[1]))]
     elif x86_opcode == "cmovg": # conditional move if greater than
@@ -269,8 +269,8 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         return self.action_space(self.actions, state)
 
 class IOExample(NamedTuple):
-    inputs: jnp.ndarray
-    outputs: jnp.ndarray
+    inputs: jnp.ndarray # num_inputs x <sequence_length>
+    outputs: jnp.ndarray # num_inputs x <sequence_length>
 
 class TaskSpec(NamedTuple):
     max_program_size: int
