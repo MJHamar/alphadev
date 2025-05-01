@@ -30,7 +30,7 @@
 import collections
 import functools
 import math
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List, Set
 
 import time
 import chex
@@ -42,7 +42,8 @@ import ml_collections
 import numpy
 import optax
 
-from tinyfive.machine import machine as riscv_machine
+from .tinyfive.multi_machine import multi_machine
+
 
 ############################
 ###### 1. Environment ######
@@ -129,19 +130,20 @@ def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[i
             return [(opcode, (operands[2], operands[0]))]
         elif signature == (REG_T, MEM_T):
             return [(opcode, (operands[0], operands[2]))]
-    def enum_actions(r1: int, r2: int, m: int) -> List[Tuple[str, Tuple[int, int]]]:
+    def enum_actions(r1: int, r2: int, m: int) -> Set[Tuple[str, Tuple[int, int]]]:
+        # FIXME: this is super redundant.
         if r1 == 1 and r2 == 1 and m == 1:
-            return [apply_opcode(opcode, (r1, r2, m)) for opcode in x86_signatures.keys()]
-        actions = []
+            return set([apply_opcode(opcode, (r1, r2, m)) for opcode in x86_signatures.keys()])
+        actions = set()
         if r1 > 1:
-            actions.extend(enum_actions(r1 - 1, r2, m))
+            actions.union(enum_actions(r1 - 1, r2, m))
         if r2 > 1:
-            actions.extend(enum_actions(r1, r2 - 1, m))
+            actions.union(enum_actions(r1, r2 - 1, m))
         if m > 1:
-            actions.extend(enum_actions(r1, r2, m - 1))
-        actions.extend([apply_opcode(opcode, (r1, r2, m)) for opcode in x86_signatures.keys()])
+            actions.union(enum_actions(r1, r2, m - 1))
+        actions.union([apply_opcode(opcode, (r1, r2, m)) for opcode in x86_signatures.keys()])
         return actions
-    actions = enum_actions(max_reg, max_reg, max_mem)
+    actions = list(enum_actions(max_reg, max_reg, max_mem))
     return actions
 
 # the emulator should call ActionSpace.get(action) to get the action
@@ -294,47 +296,22 @@ class AssemblyGame(object):
             self.opcode = action.opcode # str
             self.operands = action.operands # list
 
-    class AssemblySimulator(riscv_machine):
+    class AssemblySimulator(object):
         
-        def __init__(self, task_spec, example:IOExample=None):
+        def __init__(self, task_spec, inputs:List[IOExample]=None):
             """Initialize the simulator with the task specification."""
-            super().__init__(mem_size=task_spec.num_memory_locs + task_spec.max_program_size)
             self.task_spec = task_spec
-            self.example = example
+            self.inputs = inputs
+            self.emulator = multi_machine(task_spec.num_locations, task_spec.num_inputs)
             self.reset()
         
         def reset(self):
             """Reset the simulator to an initial state."""
-            self.clear_cpu(); self.clear_mem()
-            # initialise write heads and program counter.
-            self.mem_write_head = 0
-            self.pc = self.task_spec.num_memory_locs
-            if self.example is not None:
-                self._populate_memory(self.example.inputs)
-
-        def _populate_memory(self, inputs: Union[jnp.ndarray, int, float]):
-            # overflow checks
-            if (self.mem_write_head >= self.task_spec.num_memory_locs or
-                # isinstance(inputs, (int, float)) and 
-                (isinstance(inputs, jnp.ndarray) and
-                    self.mem_write_head + inputs.size >= self.task_spec.num_memory_locs
-                )):
-                raise ValueError("Memory overflow: cannot write to memory.")
-            if isinstance(inputs, int):
-                self.write_i32(inputs, self.mem_write_head)
-                self.mem_write_head += 4 # increment
-            elif isinstance(inputs, float):
-                self.write_f32(inputs, self.mem_write_head)
-                self.mem_write_head += 4
-            elif isinstance(inputs, jnp.ndarray):
-                if inputs.dtype == jnp.int32:
-                    self.write_i32_vec(inputs, self.mem_write_head)
-                    self.mem_write_head += inputs.size * 4
-                elif inputs.dtype == jnp.float32:
-                    self.write_f32_vec(inputs, self.mem_write_head)
-                    self.mem_write_head += inputs.size * 4
-                else:
-                    raise ValueError(f"Unsupported data type: {inputs.dtype}")
+            self.emulator.reset_state()
+            
+            if self.inputs is not None:
+                for i, example in self.inputs:
+                    self.emulator.set_memory(i, example.inputs)
 
         # pylint: disable-next=unused-argument
         def apply(self, instruction):
