@@ -29,6 +29,7 @@
 
 import collections
 import functools
+import itertools
 import math
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List, Set
 
@@ -184,7 +185,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self._history_cache = None
         self._mems_read = set()
         self._mems_written = set()
-        
+    
     def _build_masks(self):
         """
         Build masks over the action space for each register and memory location.
@@ -987,9 +988,11 @@ class AlphaDevConfig(object):
         self.td_steps = 5
         self.lr_init = 2e-4
         self.momentum = 0.9
+        
+        self.inputs = generate_sort_inputs(3, self.task_spec.num_inputs)
 
     def new_game(self):
-        return Game(self.task_spec.num_actions, self.discount, self.task_spec)
+        return Game(self.task_spec.num_actions, self.discount, self.task_spec, self.inputs)
 
 
 class MinMaxStats(object):
@@ -1626,6 +1629,66 @@ def launch_job(f, *args):
 
 def make_uniform_network():
     return UniformNetwork()
+
+def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=42) -> List[IOExample]:
+    """
+    This is equivalent to the C++ code sort_functioons_test.cc:
+    TestCases GenerateSortTestCases(int items_to_sort) {
+        TestCases test_cases;
+        auto add_all_permutations = [&test_cases](const std::vector<int>& initial) {
+            std::vector<int> perm(initial);
+            do {
+            std::vector<int> expected = perm;
+            std::sort(expected.begin(), expected.end());
+            test_cases.push_back({perm, expected});
+            } while (std::next_permutation(perm.begin(), perm.end()));
+        };
+        // Loop over all possible configurations of binary relations on sorted items.
+        // Between each two consecutive items we can insert either '==' or '<'. Then,
+        // for each configuration we generate all possible permutations.
+        for (int i = 0; i < 1 << (items_to_sort - 1); ++i) {
+            std::vector<int> relation = {1};
+            for (int mask = i, j = 0; j < items_to_sort - 1; mask /= 2, ++j) {
+            relation.push_back(mask % 2 == 0 ? relation.back() : relation.back() + 1);
+            }
+            add_all_permutations(relation);
+        }
+        return test_cases;
+        }
+    """
+    # generate all weak orderings
+    def generate_testcases(items_to_sort: int) -> List[Tuple[List[int], List[int]]]:
+        test_cases = []
+        def add_all_permutations(initial: List[int]) -> List[Tuple[List[int], List[int]]]:
+            for perm in itertools.permutations(initial, len(initial)):
+                expected = numpy.array(sorted(perm))
+                test_cases.append((numpy.array(perm), expected))
+            return test_cases
+        for i in range(1, items_to_sort+1):
+            relation = [1]
+            mask = i; j=0
+            while j < items_to_sort - 1: # no idea how to express this more pythonic
+                j += 1
+                relation.append(relation[-1] if mask % 2 == 0 else relation[-1] + 1)
+                mask //= 2
+                test_cases.extend(add_all_permutations(relation))
+        return test_cases
+
+    io_list = generate_testcases(items_to_sort)
+    # shuffle the permutations. if num_samples > len(permutations), we set
+    # inputs = permutations + num_samples - len(permutations) random samples from permutations
+    # otherwise, we set inputs = random.sample(permutations, num_samples)
+    io_list = io_list[jax.random.permutation(jax.random.PRNGKey(rnd_key), len(io_list))]
+    if num_samples is None:
+        io_list = perm
+    elif num_samples > len(io_list):
+        io_list = jnp.concatenate([io_list, io_list[:num_samples - len(io_list)]])
+    else:
+        io_list = io_list[:num_samples]
+    # convert to list of IOExample
+    return [
+        IOExample(*io) for io in io_list
+    ]
 
 #definitions for RISC-V dynamic action spaces, not used rn
 # op_list = [
