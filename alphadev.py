@@ -493,10 +493,7 @@ class Network(object):
             'prediction': self.prediction.init(pred_key),
         }
 
-    def inference(self, params: Any, observation: jnp.array) -> NetworkOutput:
-        # NOTE: observation here is an array, not a dict like in AssemblyGame. Where do we convert
-        # representation + prediction function
-        # NOTE: the representation net actually expects a dict, so only the type annotation is wrong.
+    def inference(self, params: Any, observation: Dict) -> NetworkOutput:
         embedding = self.representation.apply(params['representation'], observation)
         return self.prediction.apply(params['prediction'], embedding)
 
@@ -611,6 +608,7 @@ class RepresentationNet(hk.Module):
             raise ValueError(
                 'only one of `use_locations` and `use_locations_binary` may be used.'
             )
+        # encode the locations (registers and memory) in the CPU state
         locations_encoding = None
         if self._hparams.representation.use_locations:
             locations_encoding = self._make_locations_encoding_onehot(
@@ -626,6 +624,7 @@ class RepresentationNet(hk.Module):
         if self._hparams.representation.use_permutation_embedding:
             permutation_embedding = self.make_permutation_embedding(batch_size)
 
+        # aggregate the locations and the program to produce a single output vector
         return self.aggregate_locations_program(
             locations_encoding, permutation_embedding, program_encoding, batch_size
         )
@@ -650,8 +649,11 @@ class RepresentationNet(hk.Module):
         program_encoding,
         batch_size,
     ):
+        # note that Haiku passes the parameters to the entire class
+        # when apply() is called on it. So don't look for parameters here.
         locations_embedder = hk.Sequential(
             [
+                # input is embedding_dim size, because we already encoded in either one-hot or binary
                 hk.Linear(self._embedding_dim),
                 hk.LayerNorm(axis=-1),
                 jax.nn.relu,
@@ -666,11 +668,13 @@ class RepresentationNet(hk.Module):
             locations_embedder, in_axes=1, out_axes=1, split_rng=False
         )(locations_encoding)
 
+        # broadcast the program encoding for each example.
+        # this way, it matches the size of the observations.
         program_encoded_repeat = self.repeat_program_encoding(
             program_encoding, batch_size
         )
 
-        grouped_representation = jnp.concatenate(
+        grouped_representation = jnp.concatenate( # concat the CPU state and the program.
             [locations_embedding, program_encoded_repeat], axis=-1
         )
 
@@ -821,7 +825,6 @@ class RepresentationNet(hk.Module):
         locations = locations.reshape([batch_size, self._task_spec.num_inputs, -1])
 
         return locations
-
 
 ######## 2.3 Prediction Network ########
 
@@ -1157,7 +1160,9 @@ class Game(object):
         # NOTE: returns the observation corresponding to the last action
         if state_index == -1:
             return self.environment.observation()
-        # NOTE: re-play the game from the initial state.
+        # re-play the game from the initial state.
+        if state_index > len(self.history):
+            state_index = len(self.history) # for safety
         env = AssemblyGame(self.task_spec, self.inputs, self.action_space_storage)
         for action in self.history[:state_index]:
             observation, _ = env.step(action)
@@ -1171,10 +1176,13 @@ class Game(object):
         # The value target is the discounted sum of all rewards until N steps
         # into the future, to which we will add the discounted boostrapped future
         # value.
-        bootstrap_index = state_index + td_steps
-
+        # make sure we don't go out of bounds
+        bootstrap_index = min(state_index + td_steps, len(self.history))
+        # use an offset to account for cases when the td_target is further than the last action.
+        # TODO: this might be a mistake and hard to check.
+        offset = max(0, (state_index + td_steps) - len(self.history))
         for i, reward in enumerate(self.rewards[state_index:bootstrap_index]):
-            value += reward * self.discount**i  # pytype: disable=unsupported-operands
+            value += reward * self.discount**(i+offset)  # pytype: disable=unsupported-operands
 
         if bootstrap_index < len(self.root_values):
             bootstrap_discount = self.discount**td_steps
@@ -1208,6 +1216,8 @@ class ReplayBuffer(object):
         if len(self.buffer) > self.window_size:
             self.buffer.pop(0)
         self.buffer.append(game)
+        assert len(self.buffer) <= self.window_size+10, \
+            f"Replay buffer size growing uncontrollably: {len(self.buffer)} > {self.window_size}"
 
     def sample_batch(self, td_steps: int) -> Sequence[Sample]:
         games = [self.sample_game() for _ in range(self.batch_size)]
@@ -1224,13 +1234,15 @@ class ReplayBuffer(object):
         # pylint: enable=g-complex-comprehension
 
     def sample_game(self) -> Game:
-        # Sample game from buffer either uniformly or according to some priority.
-        return self.buffer[0]
+        # sample an index uniformly
+        idx = numpy.random.randint(len(self.buffer))
+        return self.buffer[idx]
 
     # pylint: disable-next=unused-argument
-    def sample_position(self, game) -> int:
+    def sample_position(self, game:Game) -> int:
         # Sample position from game either uniformly or according to some priority.
-        return -1
+        idx = numpy.random.randint(len(game.history))
+        return idx
 
 
 class SharedStorage(object):
@@ -1523,6 +1535,7 @@ def train_network(
     """Trains the network on data stored in the replay buffer."""
     network = Network(config.hparams, config.task_spec) # the one we train
     target_network = Network(config.hparams, config.task_spec) # target network is updated periodically (bootstrap)
+    # init optimizer
     optimizer = optax.sgd(config.lr_init, config.momentum)
     optimizer_state = optimizer.init(network.get_params())
 
