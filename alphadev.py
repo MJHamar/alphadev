@@ -298,7 +298,7 @@ class AssemblyGame(object):
 
     class AssemblySimulator(object):
         
-        def __init__(self, task_spec, inputs:List[IOExample]=None):
+        def __init__(self, task_spec, inputs:List[IOExample]):
             """Initialize the simulator with the task specification."""
             self.task_spec = task_spec
             self.inputs = inputs
@@ -308,46 +308,33 @@ class AssemblyGame(object):
         def reset(self):
             """Reset the simulator to an initial state."""
             self.emulator.reset_state()
-            
-            if self.inputs is not None:
-                for i, example in self.inputs:
-                    self.emulator.set_memory(i, example.inputs)
+            for i, example in self.inputs:
+                self.emulator.set_memory(i, example.inputs)
 
         # pylint: disable-next=unused-argument
         def apply(self, instruction):
             """Apply an assembly instruction to the simulator."""
-            # NOTE: to avoid the overhead of encoding and then decoding the instruction (O(n) time),
-            # we use the uppercase methods of the machine class directly.
-            op_str = instruction.opcode
-            op_fn = getattr(self, op_str)
-            op_fn(*instruction.oprands) # NOTE: we need to ensure that `operands` is correct.
+            self.emulator.append_instruction(instruction.opcode, instruction.operands)
+            # reset the state of the simulator
+            self.reset()
+            # execute the program
+            self.emulator.exe()
             return self.get_state()
 
         def get_state(self) -> CPUState:
             """Get the current state of the simulator."""
             return CPUState(
-                registers=self.registers,
-                memory=self.memory,
-                register_mask=self.register_mask,
-                memory_mask=self.memory_mask,
+                registers=self.emulator.registers,
+                memory=self.emulator.memory,
+                register_mask=self.emulator.register_mask,
+                memory_mask=self.emulator.memory_mask,
                 program=self.program,
                 program_length=len(self.program)
             )
 
-        def measure_latency(self, program) -> float:
-            crnt_state = self.copy()
-            self.reset()
-            start_time = time.time()
-            for instruction in program:
-                op_str = instruction.opcode
-                op_fn = getattr(self, op_str)
-                op_fn(*instruction.operands)
-            end_time = time.time()
-            latency = end_time - start_time
-            self.reset()
-            # restore state
-            self = crnt_state
-            return float(latency)
+        def measure_latency(self) -> float:
+            """Measure the latency of a program."""
+            self.emulator.measure_latency()
 
         @property
         def registers(self): return jnp.concat([self.x.astype(self.dtype), self.f.astype(self.dtype)], axis=0)
@@ -363,12 +350,12 @@ class AssemblyGame(object):
             # FIXME: need to check if the program can be invalid at any point in time.
             return False
 
-    def __init__(self, task_spec, example: IOExample, action_space_storage: ActionSpaceStorage):
+    def __init__(self, task_spec, inputs: List[IOExample], action_space_storage: ActionSpaceStorage):
         self.task_spec = task_spec
-        self.example = example
+        self.inputs = inputs
         self.storage = action_space_storage
         self.program = [] # program here is an array, which suggests that there are only append actions
-        self.simulator = self.AssemblySimulator(task_spec, example)
+        self.simulator = self.AssemblySimulator(task_spec, inputs)
         self.previous_correct_items = 0
         self.expected_outputs = self.make_expected_outputs()
 
@@ -381,34 +368,28 @@ class AssemblyGame(object):
         for riscv_action in instructions:
             insn = self.AssemblyInstruction(riscv_action, self.storage)
             self.program.append(insn) # append the action (no swap moves)
-            self.execution_state = self.simulator.apply(insn)
+            self.simulator.apply(insn)
         return self.observation(), self.correctness_reward()
 
-    def state(self):
+    def state(self) -> CPUState:
         return self.simulator.get_state()
 
     def observation(self):
-        return {
-            'program': self.program,
-            'program_length': len(self.program),
-            'memory': self.execution_state.memory,
-            'registers': self.execution_state.registers,
-            'register_mask': self.execution_state.register_mask,
-            'memory_mask': self.execution_state.memory_mask,
-        }
+        return dict(self.state())
 
     def make_expected_outputs(self):
         # TODO: this might need refining.
-        return jnp.array(
-            self.example.outputs
+        return jnp.stack(
+            [example.outputs for example in self.inputs]
         )
 
     def correctness_reward(self) -> float:
         """Computes a reward based on the correctness of the output."""
-        state = self.execution_state
+        state = self.simulator.get_state()
 
         # Weighted sum of correctly placed items
         correct_items = 0
+        # NOTE: this assumes that the expected outputs are always written from index 0
         for output, expected in zip(state.memory, self.expected_outputs):
             correct_items += output.weight * sum(
                 output[i] == expected[i] for i in range(len(output))
@@ -427,7 +408,7 @@ class AssemblyGame(object):
     def latency_reward(self) -> float:
         latency_samples = [
             # NOTE: measure latency n times
-            self.simulator.measure_latency(self.program)
+            self.simulator.measure_latency()
             for _ in range(self.task_spec.num_latency_simulation)
         ]
         return (
@@ -436,13 +417,25 @@ class AssemblyGame(object):
         )
 
     def clone(self):
-        pass
+        # reinitialises the program, simulator (which makes a new emulator)
+        ret = AssemblyGame(
+            task_spec=self.task_spec,
+            inputs=self.inputs,
+            action_space_storage=self.storage,
+        ) 
+        # only mutable thing left is the program inside the simulator and in this class
+        # also note that since "program" is independent of the machine instance,
+        # we can simply shallow copy the array
+        del ret.simulator.emulator # make sure we don't allocate too much space
+        ret.simulator.emulator = self.simulator.emulator.clone()
+        ret.program = self.program.copy()
+        return ret
 
     def terminal(self) -> bool: # TODO: ? when else
         return self.simulator.invalid() or self.correct()
 
     def correct(self) -> bool:
-        state = self.execution_state
+        state = self.state()
         return jnp.all(state.memory == self.expected_outputs)
 
 ######## End Environment ########
@@ -1085,13 +1078,14 @@ class Game(object):
     """A single episode of interaction with the environment."""
 
     def __init__(
-        self, action_space_size: int, discount: float, task_spec: TaskSpec, example: IOExample = None
+        self, action_space_size: int, discount: float, task_spec: TaskSpec, inputs: List[IOExample]
     ):
         self.task_spec = task_spec
+        self.inputs = inputs
         # TODO: figure out how to split num_locations to registers and memory.
         # FIXME: this is hard-coded for the 3-sort task for now.
         self.action_space_storage = x86ActionSpaceStorage(max_reg=5, max_mem=task_spec.num_locations-5)
-        self.environment = AssemblyGame(task_spec, example, self.action_space_storage)
+        self.environment = AssemblyGame(task_spec, inputs, self.action_space_storage)
         self.history = []
         self.rewards = []
         self.latency_reward = 0
@@ -1114,7 +1108,7 @@ class Game(object):
     def is_correct(self) -> bool:
         # Whether the current algorithm solves the game.
         # for all inputs, right?
-        pass # TODO: implement this
+        self.environment.correct()
 
     def legal_actions(self) -> Sequence[Action]:
         # Game specific calculation of legal actions.
