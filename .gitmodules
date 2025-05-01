@@ -1,0 +1,3 @@
+[submodule "tinyfive"]
+	path = tinyfive
+	url = git@github.com:OpenMachine-ai/tinyfive.git
