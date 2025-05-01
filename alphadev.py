@@ -1314,7 +1314,7 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
         min_max_stats = MinMaxStats(config.known_bounds)
 
         # Initialisation of the root node and addition of exploration noise
-        root = Node(0)
+        root = Node(0) # NOTE: a dummy root
         current_observation = game.make_observation(-1)
         network_output = network.inference(current_observation)
         _expand_node( # expand current root
@@ -1621,7 +1621,6 @@ def softmax_sample(distribution, temperature: float):
 def launch_job(f, *args):
     # NOTE: a simple wrapper to launch a job in a separate thread.
     f(*args)
-
 
 def make_uniform_network():
     return UniformNetwork()
