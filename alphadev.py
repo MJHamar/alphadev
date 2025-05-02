@@ -849,10 +849,20 @@ class DistributionSupport(object):
         self.num_bins = num_bins
 
     def mean(self, logits: jnp.ndarray) -> float:
-        pass
+        return jnp.sum(logits) / self.num_bins
 
     def scalar_to_two_hot(self, scalar: float) -> jnp.ndarray:
-        pass
+        """
+        Converts a scalar to a two-hot encoding.
+        Finds the two closest bins to the scalar (lower and upper) and
+        sets these indices to 1. All other indices are set to 0.
+        """
+        toohot = jnp.zeros(self.num_bins, dtype=jnp.float32)
+        lower_bin = jnp.floor(max(scalar, 0)).astype(jnp.int32)
+        upper_bin = jnp.ceil(min(scalar,self.num_bins-1)).astype(jnp.int32)
+        toohot[lower_bin] = 1.0
+        toohot[upper_bin] = 1.0
+        return toohot
 
 
 class CategoricalHead(hk.Module):
@@ -892,6 +902,8 @@ class PredictionNet(hk.Module):
     ):
         super().__init__(name=name)
         self.task_spec = task_spec
+        self.value_max = value_max
+        self.value_num_bins = value_num_bins
         self.support = DistributionSupport(self.value_max, self.value_num_bins)
         self.embedding_dim = embedding_dim
 
