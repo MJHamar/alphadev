@@ -857,12 +857,30 @@ class DistributionSupport(object):
         Finds the two closest bins to the scalar (lower and upper) and
         sets these indices to 1. All other indices are set to 0.
         """
+        # TODO: this is overly simplistic. 
+        # Bins are -probably- a linear interpolation between 0 and value_max
+        # and we need to assign non-zero values to the two closest bins
+        # based on proximity to the scalar.
+        
         toohot = jnp.zeros(self.num_bins, dtype=jnp.float32)
-        lower_bin = jnp.floor(max(scalar, 0)).astype(jnp.int32)
-        upper_bin = jnp.ceil(min(scalar,self.num_bins-1)).astype(jnp.int32)
-        toohot[lower_bin] = 1.0
-        toohot[upper_bin] = 1.0
+        # bin indices correspond to scalar values uniformly
+        # distributed on the range [0,value_max]
+        # val(bin_i) = i * (value_max / num_bins)
+        # i = val(bin_i) * (value_max / num_bins)^-1
+        step = self.value_max / self.num_bins 
+        index = scalar / step
+        low_bin = math.floor(index)
+        high_bin = math.ceil(index)
+        # find proximity to low and high bins
+        low_prox = index - low_bin 
+        high_prox = step - low_prox
+        # is low_prox + high_prox == step?
+        # index - low_bin + step - index + low_bin = 
+        # step QED
+        toohot[[low_bin, high_bin]] = low_prox, high_prox
+        assert jnp.sum(toohot) == jnp.array([1]), f"two-hot representation is computed incorrectly. Should sum to 1 but sum is {jnp.sum(toohot)}"
         return toohot
+
 
 
 class CategoricalHead(hk.Module):
