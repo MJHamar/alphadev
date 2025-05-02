@@ -31,7 +31,7 @@ import collections
 import functools
 import itertools
 import math
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List, Set
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List, Set, Mapping
 
 import time
 import chex
@@ -624,8 +624,85 @@ class MultiQueryAttentionBlock(hk.Module):
         return pe
 
 
-class ResBlockV2:
-    """Layer-normed variant of the block from https://arxiv.org/abs/1603.05027."""
+class ResBlockV2(hk.Module):
+    """Layer-normed variant of the block from https://arxiv.org/abs/1603.05027.
+    Implementation based on dm-haiku's ResNetBlockV2.
+    """
+    def __init__(
+        self,
+        channels: int,
+        stride: int | Sequence[int] = 1,
+        use_projection: bool = False,
+        ln_config: Mapping[str, Any] = {},
+        bottleneck: bool = False,
+        name: str | None = None,
+    ):
+        super().__init__(name=name)
+        self.use_projection = use_projection
+
+        ln_config = dict(ln_config)
+        ln_config.setdefault("axis", -1)
+        ln_config.setdefault("create_scale", True)
+        ln_config.setdefault("create_offset", True)
+        
+        if self.use_projection:
+            self.proj_conv = hk.Conv1D(
+                output_channels=channels,
+                kernel_shape=1,
+                stride=stride,
+                with_bias=False,
+                padding="SAME",
+                name="shortcut_conv")
+
+        channel_div = 4 if bottleneck else 1
+        conv_0 = hk.Conv1D(
+            output_channels=channels // channel_div,
+            kernel_shape=1 if bottleneck else 3,
+            stride=1 if bottleneck else stride,
+            with_bias=False,
+            padding="SAME",
+            name="conv_0")
+
+        ln_0 = hk.LayerNorm(name="LayerNorm_0", **ln_config)
+
+        conv_1 = hk.Conv1D(
+            output_channels=channels // channel_div,
+            kernel_shape=3,
+            stride=stride if bottleneck else 1,
+            with_bias=False,
+            padding="SAME",
+            name="conv_1")
+
+        ln_1 = hk.LayerNorm(name="LayerNorm_1", **ln_config)
+        layers = ((conv_0, ln_0), (conv_1, ln_1))
+
+        if bottleneck:
+            conv_2 = hk.Conv1D(
+                output_channels=channels,
+                kernel_shape=1,
+                stride=1,
+                with_bias=False,
+                padding="SAME",
+                name="conv_2")
+
+        # NOTE: Some implementations of ResNet50 v2 suggest initializing
+        # gamma/scale here to zeros.
+        ln_2 = hk.LayerNorm(name="LayerNorm_2", **ln_config)
+        layers = layers + ((conv_2, ln_2),)
+
+        self.layers = layers
+
+    def __call__(self, inputs, is_training, test_local_stats):
+        x = shortcut = inputs
+
+        for i, (conv_i, ln_i) in enumerate(self.layers):
+            x = ln_i(x, is_training, test_local_stats)
+            x = jax.nn.relu(x)
+        if i == 0 and self.use_projection:
+            shortcut = self.proj_conv(x)
+        x = conv_i(x)
+
+        return x + shortcut
 
 
 def int2bin(integers_array: jnp.array) -> jnp.array:
@@ -794,8 +871,9 @@ class RepresentationNet(hk.Module):
         chex.assert_shape(
             grouped_representation, (batch_size, self._task_spec.num_inputs, None)
         )
+        # apply MLP to the combined program and locations embedding
         permutations_encoded = all_locations_net(grouped_representation)
-        # Combine all permutations into a single vector.
+        # Combine all permutations into a single vector using a ResNetV2
         joint_encoding = joint_locations_net(jnp.mean(permutations_encoded, axis=1))
         for net in joint_resnet:
             joint_encoding = net(joint_encoding)
