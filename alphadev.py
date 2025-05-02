@@ -749,7 +749,6 @@ class RepresentationNet(hk.Module):
         self._hparams = hparams
         self._task_spec = task_spec
         self._embedding_dim = embedding_dim
-        #NOTE: no init here, haiku takes care of it.
 
     def __call__(self, inputs):
         # inputs is the observation dict
