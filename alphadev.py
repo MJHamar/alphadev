@@ -849,7 +849,15 @@ class DistributionSupport(object):
         self.num_bins = num_bins
 
     def mean(self, logits: jnp.ndarray) -> float:
-        return jnp.sum(logits) / self.num_bins
+        twohot_logits = jnp.stack([
+            self.scalar_to_two_hot(i) for i in logits
+        ])
+        sum_twohots = jnp.sum(twohot_logits, axis=1)
+        assert logits.shape == sum_twohots.shape, f"Logits shape {logits.shape} and sum_twohots shape {sum_twohots.shape} do not match."
+        mean = jnp.sum(
+            jnp.arange(self.num_bins) * sum_twohots, axis=1
+        ) / jnp.sum(sum_twohots, axis=1)
+        return mean
 
     def scalar_to_two_hot(self, scalar: float) -> jnp.ndarray:
         """
@@ -857,11 +865,9 @@ class DistributionSupport(object):
         Finds the two closest bins to the scalar (lower and upper) and
         sets these indices to 1. All other indices are set to 0.
         """
-        # TODO: this is overly simplistic. 
         # Bins are -probably- a linear interpolation between 0 and value_max
         # and we need to assign non-zero values to the two closest bins
         # based on proximity to the scalar.
-        
         toohot = jnp.zeros(self.num_bins, dtype=jnp.float32)
         # bin indices correspond to scalar values uniformly
         # distributed on the range [0,value_max]
@@ -880,8 +886,6 @@ class DistributionSupport(object):
         toohot[[low_bin, high_bin]] = low_prox, high_prox
         assert jnp.sum(toohot) == jnp.array([1]), f"two-hot representation is computed incorrectly. Should sum to 1 but sum is {jnp.sum(toohot)}"
         return toohot
-
-
 
 class CategoricalHead(hk.Module):
     """A head that represents continuous values by a categorical distribution."""
