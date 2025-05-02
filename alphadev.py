@@ -535,12 +535,93 @@ class UniformNetwork(object):
 ######## 2.2 Representation Network ########
 
 
-class MultiQueryAttentionBlock:
+class MultiQueryAttentionBlock(hk.Module):
     """Attention with multiple query heads and a single shared key and value head.
 
     Implementation of "Fast Transformer Decoding: One Write-Head is All You Need",
     see https://arxiv.org/abs/1911.02150.
     """
+    def __init__(self,
+            head_depth,
+            num_heads,
+            attention_dropout,
+            position_encoding,
+        ):
+        self.head_depth = head_depth
+        self.num_heads = num_heads
+        self.attention_dropout = attention_dropout
+        self.position_encoding = position_encoding
+    
+    def __call__(self, inputs, encoded_state=None):
+        """
+        Tensoflow implementatiion from the paper:
+        def MultiqueryAttentionBatched(X, M, mask , P_q, P_k, P_v, P_o) :
+            \""" Multi-Query Attention.
+            Args :
+                X: Inputs (queries    shape [ b, n, d] 
+                M: other inputs (k/v) shape [ b, m, d]
+                mask : a tensor with  shape [ b, h, n , m]
+                P_q: Query proj mat   shape [ h, d, k]
+                P_k: Key proj mat     shape [    d, k]
+                P_v: Value proj mat   shape [    d, v]
+                P_o: Output proj mat  shape [ h, d, v]
+            where 
+                'h' is the number of heads, 
+                'm' is the number of input vectors,
+                'n' is the number of inputs, for which we want to compute the attention
+                'd' is the dimension of the input vectors,
+            Returns :
+                Y: a tensor with shape [ b , n , d ]
+            \"""
+            Q = tf.einsum ( "bnd, hdk->bhnk " , X, P_q)
+            K = tf.einsum ( "bmd, dk->bmk" , M, P_k)
+            V = tf.einsum ( "bmd, dv->bmv" , M, P_v)
+            logits = tf.einsum ( " bhnk , bmk->bhnm " , Q, K)
+            weights = tf.softmax ( logits + mask )
+            O = tf.einsum ( "bhnm, bmv->bhnv " , weights , V)
+            Y = tf.einsum ( "bhnv , hdv->bnd " , O, P_o)
+            return Y
+        """
+        # P_q, P_k, P_v, P_o are parameters, which we declare here
+        Q = self._linear_projection(inputs, self.num_heads, self.head_depth, name='P_q') # B x N x H x K
+        K = self._linear_projection(inputs, 1, self.head_depth, name='P_k') # B x M x K
+        V = self._linear_projection(inputs, 1, self.head_depth, name='P_v') # B x M x V
+        
+        logits = jnp.einsum("bnhk,bmk->bhnm", Q, K) # B x N x H x M
+        weights = jax.nn.softmax(logits) # NOTE: no causal masking, this is an encoder block
+        if self.attention_dropout > 0:
+            weights = hk.dropout(hk.next_rng_key(), self.attention_dropout, weights)
+        
+        O = jnp.einsum("bhnm,bmv->bhnv", weights, V) # B x N x H x V
+        Y = self._linear_projection(O, 1, self.head_depth, name='P_o') # B x N x V
+        
+        return Y # B x N x D
+    
+    @hk.transparent
+    def _linear_projection(
+        self,
+        x: jax.Array,
+        num_heads: int, # added this one
+        head_size: int,
+        name: str | None = None,
+    ) -> jax.Array:
+        """Copy-paste from hhk.MultiHeadAttention."""
+        y = hk.Linear(num_heads * head_size, name=name)(x)
+        *leading_dims, _ = x.shape
+        new_shape = (*leading_dims, num_heads, head_size) if num_heads > 1 else (*leading_dims, head_size)
+        return y.reshape(new_shape) # [B, N, H, K] or [B, N, K]
+
+    def sinusoid_position_encoding(seq_size, feat_size):
+        """Compute sinusoid absolute position encodings, 
+        given a sequence size and feature dimensionality"""
+        # SOURCE: https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/JAX/tutorial6/Transformers_and_MHAttention.html
+        pe = jnp.zeros((seq_size, feat_size))
+        position = jnp.arange(0, seq_size, dtype=jnp.float32)[:,None]
+        div_term = jnp.exp(jnp.arange(0, feat_size, 2) * (-math.log(10000.0) / feat_size))
+        pe[:, 0::2] = jnp.sin(position * div_term)
+        pe[:, 1::2] = jnp.cos(position * div_term)
+        pe = pe[None]
+        return pe
 
 
 class ResBlockV2:
@@ -909,7 +990,6 @@ class CategoricalHead(hk.Module):
         probs = jax.nn.softmax(logits)
         mean = jax.vmap(self._value_support.mean)(probs)
         return dict(logits=logits, mean=mean)
-
 
 class PredictionNet(hk.Module):
     """MuZero prediction network."""
