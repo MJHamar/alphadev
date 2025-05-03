@@ -31,7 +31,7 @@ import collections
 import functools
 import itertools
 import math
-from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List, Set, Mapping
+from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List, Set, Mapping, Generator
 
 import time
 import chex
@@ -112,12 +112,12 @@ def x86_to_riscv(x86_opcode, x86_operands, state):
         return [RiscvAction("SUB", (X1, x86_operands[0], x86_operands[1]))]
     elif x86_opcode == "cmovg": # conditional move if greater than
         return [
-            RiscvAction("BLE", (X1, 0, state.pc+8)),  # skip next instruction if A < B
+            RiscvAction("BLE", (X1, 0, 4*len(state.program)+8)),  # skip next instruction if A < B
             RiscvAction("ADD", (x86_operands[1], X0, x86_operands[0]))  # copy C to D
         ]
     elif x86_opcode == "cmovle": # conditional move if less than or equal
         return [
-            RiscvAction("BGT", (X1, 0, state.pc+8)),  # skip next instruction if A > B
+            RiscvAction("BGT", (X1, 0, 4*len(state.program)+8)),  # skip next instruction if A > B
             RiscvAction("ADD", (x86_operands[1], X0, x86_operands[0]))  # copy E to F
         ]
     else:
@@ -133,20 +133,18 @@ def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[i
             return [(opcode, (operands[2], operands[0]))]
         elif signature == (REG_T, MEM_T):
             return [(opcode, (operands[0], operands[2]))]
-    def enum_actions(r1: int, r2: int, m: int) -> Set[Tuple[str, Tuple[int, int]]]:
-        # FIXME: this is super redundant.
-        if r1 == 1 and r2 == 1 and m == 1:
-            return set([apply_opcode(opcode, (r1, r2, m)) for opcode in x86_signatures.keys()])
-        actions = set()
-        if r1 > 1:
-            actions.union(enum_actions(r1 - 1, r2, m))
-        if r2 > 1:
-            actions.union(enum_actions(r1, r2 - 1, m))
-        if m > 1:
-            actions.union(enum_actions(r1, r2, m - 1))
-        actions.union([apply_opcode(opcode, (r1, r2, m)) for opcode in x86_signatures.keys()])
-        return actions
-    actions = list(enum_actions(max_reg, max_reg, max_mem))
+        else:
+            assert False, f"No signature of type {signature} should be used. fix this."
+    def enum_actions(r1: int, r2: int, m: int) -> Generator[Tuple[str, Tuple[int, int]], None, None]:
+        for i in range(r1):
+            for j in range(r2):
+                for k in range(m):
+                    # generate all combinations of registers and memory
+                    for opcode in x86_signatures.keys():
+                        yield from apply_opcode(opcode, (i, j, k))
+    logger.debug("Enumerating actions for max_reg=%d, max_mem=%d", max_reg, max_mem)
+    actions = list(set(enum_actions(max_reg, max_reg, max_mem)))
+    logger.debug("Enumerated %d actions", len(actions))
     return actions
 
 # the emulator should call ActionSpace.get(action) to get the action
@@ -160,11 +158,18 @@ class x86ActionSpace(ActionSpace):
     def __init__(self,
             actions: List[Callable[[Any],Tuple[str, Tuple[int, int]]]],
             state: 'CPUState'):
-        self.actions = actions
+        self._actions = actions
         self.state = state
-        
+    
+    @property
+    def actions(self):
+        return jnp.arange(len(self._actions))
+    
+    def __len__(self):
+        return len(self._actions)
+    
     def get(self, action_id: int) -> List[RiscvAction]:
-        return x86_to_riscv(*self.actions[action_id], self.state) # convert to RISC-V
+        return x86_to_riscv(*self._actions[action_id], self.state) # convert to RISC-V
 
 class ActionSpaceStorage(object):
     # placeholder for now.
@@ -193,6 +198,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         Build masks over the action space for each register and memory location.
         At runtime, we can dynamically take the union of a subset of these masks
         to efficiently mask the action space. 
+        
+        Each row in a mask is a boolean array over the action space, indicating whether
+        the action uses the register or memory location. 
         """
         # we create a max_reg x action_space_size and 
         # max_mem x action_space_size masks
@@ -205,45 +213,81 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             signature = x86_signatures[x86_opcode]
             if signature == (REG_T, REG_T):
                 # move between registers
-                reg_masks[x86_operands[0], i] = True
-                reg_masks[x86_operands[1], i] = True
+                reg_masks = reg_masks.at[x86_operands[0], i].set(True)
+                reg_masks = reg_masks.at[x86_operands[1], i].set(True)
             elif signature == (MEM_T, REG_T):
                 # load word from memory to register
-                mem_masks[x86_operands[0], i] = True
-                reg_masks[x86_operands[1], i] = True
+                mem_masks = mem_masks.at[x86_operands[0], i].set(True)
+                reg_masks = reg_masks.at[x86_operands[1], i].set(True)
             elif signature == (REG_T, MEM_T):
                 # store word from register to memory
-                reg_masks[x86_operands[0], i] = True
-                mem_masks[x86_operands[1], i] = True
+                reg_masks = reg_masks.at[x86_operands[0], i].set(True)
+                mem_masks = mem_masks.at[x86_operands[1], i].set(True)
             else:
                 assert False, f"No signature of type {signature} should be used. fix this."
+        
+        assert reg_masks.any(), "register masks are all false"
+        assert mem_masks.any(), "memory masks are all false"
         
         self.reg_mask_lookup = reg_masks
         self.mem_mask_lookup = mem_masks
 
-    def get_masks(self, state, history=None) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def get_mask(self, state, history:list=None) -> jnp.ndarray:
+        """Get the mask over the action space for the given state and history.
+        
+        Returns a boolean array over the action space, with True values indicating
+        valid actions.
+        """
         def update_history(action):
             # update the history with the action
             if action.opcode == "lw": # (MEM_T, _)
+                logger.debug("lw %s", action.operands[0])
                 self._mems_read.add(action.operands[0])
             elif action.opcode == "sw": # (_, MEM_T)
+                logger.debug("sw %s", action.operands[1])
                 self._mems_written.add(action.operands[1])
+
+        # broadcast the masks to the number of inputs
+        reg_mask_lookup = self.reg_mask_lookup
+        mem_mask_lookup = self.mem_mask_lookup
+
+        logger.debug("reg_mask_lookup shape %s", reg_mask_lookup.shape)
+        logger.debug("mem_mask_lookup shape %s", mem_mask_lookup.shape)
         
         if state not in self.masks:
-            active_registers = state.register_mask
-            active_memory = state.memory_mask
+            logger.debug("pruning: active locs")
+            active_registers: jnp.ndarray = state.register_mask
+            active_memory: jnp.ndarray = state.memory_mask
             # increment the active registers and memory by 1 to allow accessing locations
             # find the last non-zero index
-            last_reg = jnp.argmax(active_registers[::-1])
-            last_mem = jnp.argmax(active_memory[::-1])
-            reg_mask = jnp.any(self.reg_mask_lookup[active_registers, last_reg], axis=0)
-            mem_mask = jnp.any(self.mem_mask_lookup[active_memory, last_mem], axis=0)
+            last_reg = active_registers.shape[1] - jnp.argmax(active_registers[:, ::-1], axis=1)
+            last_mem = jnp.argmax(active_memory[:, ::-1], axis=1)
+            new_active_registers = active_registers.at[:,last_reg].set(1)
+            new_active_memory = active_memory.at[:,last_mem].set(1)
+            
+            # make sure the two arrays reference the same number of locations
+            # NOTE: this assumes registers are accessed sequentially. floating point regs will make this harder
+            new_active_registers = new_active_registers[:, :reg_mask_lookup.shape[0]]
+            new_active_memory = new_active_memory[:, :mem_mask_lookup.shape[0]]
+            
+            logger.debug("new active registers (shape %s) %s", new_active_registers.shape, new_active_registers[0,...])
+            logger.debug("new active memory (shape %s) %s", new_active_memory.shape, new_active_memory[0,...])
+            
+            # reg_mask_lookup shape is R x A
+            # active_register shape is E x R
+            # des. reg_mask   shape is E x A
+            # with R: number of registers, A: number of actions, E: number of examples
+            selected_reg_masks = jnp.einsum("er,ra->ea", new_active_registers, reg_mask_lookup)
+            selected_mem_masks = jnp.einsum("em,ma->ea", new_active_memory, mem_mask_lookup)
+            logger.debug("selected_reg_masks shape %s", selected_reg_masks.shape)
+            logger.debug("selected_mem_masks shape %s", selected_mem_masks.shape)
+            reg_mask = jnp.any(selected_reg_masks, axis=0) # E x A
+            mem_mask = jnp.any(selected_mem_masks, axis=0) # E x A
             self.masks[state] = (reg_mask, mem_mask)
         # now we need to make sure that only one read and one write is allowed for each memory location
         # this should be computed on the fly, as the program keeps changing in crazy ways.
         # BUT, we can cache the histor so we don't have to iterate over it every time
         # since we only use this in MCTS which is depth-first
-
 
         reg_mask, mem_mask = self.masks[state]
         reg_mask = reg_mask.copy()
@@ -251,13 +295,16 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
 
         # check if the history seems to be a continuation of the current state
         if history is not None:
-            crnt_space = self.get_space(state)
-            if self.history_cache is not None and\
+            logger.debug("pruning: history")
+            crnt_space = self.get_space(state) # the action space. almost constant lookup time
+            if self._history_cache is not None and\
                 len(self._history_cache) + 1 == len(history) and \
                 self._history_cache[-1] == history[-2]: # check only the last action to save time
+                logger.debug("pruning: using cached history")
                 # we can use the cached history
                 update_history(crnt_space.get(history[-1]))
             else:
+                logger.debug("pruning: recomputing history")
                 # we need to recompute the history
                 self._mems_read = set()
                 self._mems_written = set()
@@ -267,11 +314,18 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # update the history cache
             self._history_cache = history
             # update the masks
-            both = jnp.all(
-                jnp.any(self.mem_mask_lookup[self._mems_read], axis=0),
-                jnp.any(self.mem_mask_lookup[self._mems_written], axis=0)
+            logger.debug("mems_read %s", self._mems_read)
+            logger.debug("mems_written %s", self._mems_written)
+            # mem mask lookup is of shape (M, A)
+            # mems_read and mems_written are sets of indices m \in M
+            # we need to take the union of the masks for the read and write locations
+            # if a memory location is both read and written, we need to exclude it from the mask
+            both = jnp.all(jnp.stack([
+                jnp.any(mem_mask_lookup[list(self._mems_read),:], axis=0),
+                jnp.any(mem_mask_lookup[list(self._mems_written),:], axis=0)])
             )
-            mem_mask |= both
+            # both indicates the indices of actions, where both read and write are used
+            mem_mask = mem_mask.at[both].set(False)
 
         return reg_mask | mem_mask # take the union of the two masks
 
@@ -286,6 +340,8 @@ class TaskSpec(NamedTuple):
     max_program_size: int
     num_inputs: int # number of input examples
     num_funcs: int # number of x86 instructions to consider
+    num_regs: int # number of registers to consider
+    num_mem: int # number of memory locations to consider. num_mem+num_regs = num_locations
     num_locations: int # memory + register locations to consider
     num_actions: int # number of actions in the action space
     correct_reward: float
@@ -310,13 +366,13 @@ class AssemblyGame(object):
             """Initialize the simulator with the task specification."""
             self.task_spec = task_spec
             self.inputs = inputs
-            self.emulator = multi_machine(task_spec.num_locations, task_spec.num_inputs)
+            self.emulator = multi_machine(task_spec.num_mem, task_spec.num_inputs)
             self.reset()
         
         def reset(self):
             """Reset the simulator to an initial state."""
             self.emulator.reset_state()
-            for i, example in self.inputs:
+            for i, example in enumerate(self.inputs):
                 self.emulator.set_memory(i, example.inputs)
 
         # pylint: disable-next=unused-argument
@@ -329,31 +385,19 @@ class AssemblyGame(object):
             self.emulator.exe()
             return self.get_state()
 
-        def get_state(self) -> CPUState:
-            """Get the current state of the simulator."""
-            return CPUState(
-                registers=self.emulator.registers,
-                memory=self.emulator.memory,
-                register_mask=self.emulator.register_mask,
-                memory_mask=self.emulator.memory_mask,
-                program=self.program,
-                program_length=len(self.program)
-            )
+        @property
+        def registers(self): return self.emulator.registers
+        @property
+        def memory(self): return self.emulator.memory
+        @property
+        def register_mask(self): return self.emulator.register_mask
+        @property
+        def memory_mask(self): return self.emulator.memory_mask
 
         def measure_latency(self) -> float:
             """Measure the latency of a program."""
             self.emulator.measure_latency()
 
-        @property
-        def registers(self): return jnp.concat([self.x.astype(self.dtype), self.f.astype(self.dtype)], axis=0)
-        @property
-        def memory(self): return jnp.array(self.mem[:self.task_spec.num_memory_locs], dtype=self.dtype)
-        
-        @property
-        def register_mask(self): return jnp.concat(self.x_usage != 0, self.f_usage != 0, axis=0)
-        @property
-        def memory_mask(self): return jnp.array(self.mem[:self.task_spec.num_memory_locs] != 0)
-        
         def invalid(self) -> bool:
             # FIXME: need to check if the program can be invalid at any point in time.
             return False
@@ -380,10 +424,18 @@ class AssemblyGame(object):
         return self.observation(), self.correctness_reward()
 
     def state(self) -> CPUState:
-        return self.simulator.get_state()
+        # convert from numpy to jax.numpy arrays
+        return CPUState(
+            registers=jnp.array(self.simulator.registers),
+            memory=jnp.array(self.simulator.memory),
+            register_mask=jnp.array(self.simulator.register_mask),
+            memory_mask=jnp.array(self.simulator.memory_mask),
+            program=self.program,
+            program_length=len(self.program),
+        )
 
     def observation(self):
-        return dict(self.state())
+        return self.state()._asdict()
 
     def make_expected_outputs(self):
         return jnp.stack(
@@ -443,7 +495,7 @@ class AssemblyGame(object):
 
     def correct(self) -> bool:
         state = self.state()
-        return jnp.all(state.memory == self.expected_outputs)
+        return jnp.all(state.memory[:, :self.expected_outputs.shape[1]] == self.expected_outputs)
 
 ######## End Environment ########
 #################################
@@ -1148,12 +1200,17 @@ class AlphaDevConfig(object):
             num_inputs=17,
             num_funcs=14,
             num_locations=19,
-            num_actions=271,
+            num_regs=5,
+            num_mem=14,
+            num_actions=240, # original value was 271
             correct_reward=1.0,
             correctness_reward_weight=2.0,
             latency_reward_weight=0.5,
             latency_quantile=0,
         )
+        # TODO: this assert is stupid.
+        assert self.task_spec.num_locations == self.task_spec.num_regs + self.task_spec.num_mem, \
+            f"number of registers {self.task_spec.num_regs} and memory {self.task_spec.num_mem} do not add up to the number of locations {self.task_spec.num_locations}"
 
         ### Network architecture
         self.hparams = ml_collections.ConfigDict()
@@ -1185,6 +1242,7 @@ class AlphaDevConfig(object):
         self.momentum = 0.9
         
         self.inputs = generate_sort_inputs(3, self.task_spec.num_inputs)
+        logger.debug("Inputs: %s", self.inputs)
         assert self.task_spec.num_inputs == len(self.inputs),\
             f"Expected {self.task_spec.num_inputs} inputs, got {len(self.inputs)}"
 
@@ -1225,7 +1283,7 @@ class Node(object):
         self.prior = prior
         self.value_sum = 0
         self.children = {}
-        self.hidden_state = None
+        # self.hidden_state = None # TODO: what is this?
         self.reward = 0
 
     def expanded(self) -> bool:
@@ -1289,7 +1347,7 @@ class Game(object):
         self.inputs = inputs
         # TODO: figure out how to split num_locations to registers and memory.
         # FIXME: this is hard-coded for the 3-sort task for now.
-        self.action_space_storage = x86ActionSpaceStorage(max_reg=5, max_mem=task_spec.num_locations-5)
+        self.action_space_storage = x86ActionSpaceStorage(max_reg=task_spec.num_regs, max_mem=task_spec.num_mem)
         self.environment = AssemblyGame(task_spec, inputs, self.action_space_storage)
         self.history = []
         self.rewards = []
@@ -1322,9 +1380,19 @@ class Game(object):
         # TODO: implement as an enumeration of the allowed actions,
         # instead of filtering the pre-defined action space. (for the next iteration of this codebase)
         state = self.environment.state()
-        actions_mask = self.action_space_storage.get_masks(state, self.history)
+        # get a mask over the action space, which indicates which actions are valid in the current state.
+        actions_mask = self.action_space_storage.get_mask(state, self.history)
         actions = self.action_space_storage.get_space(state).actions
-        pruned_actions = actions * ~actions_mask # invert
+        # pruned_actions = actions[actions_mask]
+        pruned_actions = actions # FIXME: this is a hotfix, since pruning is broken rn.
+        logger.debug("Pruned actions: (len %s/%s)", pruned_actions.shape, actions.shape)
+        # if logger.level == logging.DEBUG:
+        #     space = self.action_space_storage.get_space(state)
+        #     logger.debug("Legal actions:")
+        #     for i, action in enumerate(actions):
+        #         if actions_mask[i]:
+        #             logger.debug("  %s", space.get(action))
+        
         return pruned_actions
 
     def apply(self, action: Action):
@@ -1680,7 +1748,7 @@ def _expand_node(
 ):
     """Expands the node using value, reward and policy predictions from the NN."""
     node.to_play = to_play
-    node.hidden_state = network_output.hidden_state
+    # node.hidden_state = network_output.hidden_state
     node.reward = reward
     # Masked softmax. actions() are the legal actions and network output is the prior
     # TODO: use a more efficient softmax instead of the lines below.
@@ -1874,6 +1942,17 @@ def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=
                 mask //= 2
             add_all_permutations(relation)
 
+    def remap_input(inp: numpy.ndarray, out: numpy.ndarray) -> Tuple[numpy.ndarray, numpy.ndarray]:
+        mapping = {}
+        prev = 0
+        for o in out.tolist():
+            if o not in mapping:
+                mapping[o] = numpy.random.randint(prev+1, prev+3) # don't blow it up. 
+                prev = mapping[o]
+        out = numpy.array([mapping[o] for o in out.tolist()])
+        inp = numpy.array([mapping[i] for i in inp.tolist()])
+        return inp, out
+
     generate_testcases(items_to_sort)
     i_list = numpy.stack([i for i, _ in io_list])
     o_list = numpy.stack([o for _, o in io_list])
@@ -1895,7 +1974,7 @@ def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=
         io_list = io_list[:num_samples]
     # convert to list of IOExample
     return [
-        IOExample(*io) for io in io_list
+        IOExample(*remap_input(*io)) for io in io_list
     ]
 
 #definitions for RISC-V dynamic action spaces, not used rn
@@ -1982,3 +2061,8 @@ if __name__ == '__main__':
     logger.setLevel(logging.DEBUG)
     config = AlphaDevConfig()
     alphadev(config)
+
+    # # test enum actions
+    # actions = x86_enumerate_actions(3,3)
+    # for action in actions:
+    #     print(action)
