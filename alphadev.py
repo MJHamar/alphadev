@@ -43,8 +43,10 @@ import ml_collections
 import numpy
 import optax
 
-from .tinyfive.multi_machine import multi_machine
+from tinyfive.multi_machine import multi_machine
 
+import logging
+logger = logging.getLogger(__name__)
 
 ############################
 ###### 1. Environment ######
@@ -1856,28 +1858,35 @@ def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=
         }
     """
     # generate all weak orderings
+    io_list = []
     def generate_testcases(items_to_sort: int) -> List[Tuple[List[int], List[int]]]:
-        test_cases = []
+        logger.debug("Generating test cases for %d items to sort", items_to_sort)
         def add_all_permutations(initial: List[int]) -> List[Tuple[List[int], List[int]]]:
             for perm in itertools.permutations(initial, len(initial)):
                 expected = numpy.array(sorted(perm))
-                test_cases.append((numpy.array(perm), expected))
-            return test_cases
-        for i in range(1, items_to_sort+1):
+                io_list.append((numpy.array(perm), expected))
+        for i in range(0, items_to_sort+1):
             relation = [1]
             mask = i; j=0
             while j < items_to_sort - 1: # no idea how to express this more pythonic
                 j += 1
                 relation.append(relation[-1] if mask % 2 == 0 else relation[-1] + 1)
                 mask //= 2
-                test_cases.extend(add_all_permutations(relation))
-        return test_cases
+            add_all_permutations(relation)
 
-    io_list = generate_testcases(items_to_sort)
+    generate_testcases(items_to_sort)
+    i_list = numpy.stack([i for i, _ in io_list])
+    o_list = numpy.stack([o for _, o in io_list])
+    io_list = numpy.stack([i_list, o_list], axis=1)
+    _, uidx = numpy.unique(io_list, axis=0, return_index=True) # remove duplicates
+    io_list = io_list[uidx, :]
+    
+    logger.debug("Generated %d test cases", len(io_list))
     # shuffle the permutations. if num_samples > len(permutations), we set
     # inputs = permutations + num_samples - len(permutations) random samples from permutations
     # otherwise, we set inputs = random.sample(permutations, num_samples)
-    io_list = io_list[jax.random.permutation(jax.random.PRNGKey(rnd_key), len(io_list))]
+    new_indices = numpy.random.permutation(len(io_list))
+    perm = io_list[new_indices]
     if num_samples is None:
         io_list = perm
     elif num_samples > len(io_list):
@@ -1967,3 +1976,9 @@ def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=
 # ]
 # idx_to_op = {idx: op for idx, op in enumerate(op_list)}
 # op_to_idx = {op: idx for idx, op in enumerate(op_list)}
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    logger.setLevel(logging.DEBUG)
+    config = AlphaDevConfig()
+    alphadev(config)
