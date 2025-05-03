@@ -30,6 +30,7 @@
 import collections
 import functools
 import itertools
+import json
 import math
 from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Union, Tuple, List, Set, Mapping, Generator
 
@@ -463,11 +464,10 @@ class AssemblyGame(object):
         self.previous_correct_items = 0
         self.expected_outputs = self.make_expected_outputs()
 
-    def step(self, action:int):
+    def step(self, action:'Action'):
         action_space = self.storage.get_space(self.state())
-        logger.debug("action %s", action)
-        instructions = action_space.get(action) # lookup x86 instructions and convert to riscv
-        logger.debug("instructions %s", instructions)
+        instructions = action_space.get(action.index) # lookup x86 instructions and convert to riscv
+        logger.debug("step: act %s, instruction %s", instructions)
         # there might be multiple instructions in a single action
         if not isinstance(instructions, list):
             instructions = [instructions]
@@ -498,13 +498,13 @@ class AssemblyGame(object):
 
     def correctness_reward(self) -> float:
         """Computes a reward based on the correctness of the output."""
-        state = self.simulator.get_state()
+        state = self.state()
 
         # Weighted sum of correctly placed items
         correct_items = 0
         # NOTE: this assumes that the expected outputs are always written from index 0
         for output, expected in zip(state.memory, self.expected_outputs):
-            correct_items += output.weight * sum(
+            correct_items += sum(
                 output[i] == expected[i] for i in range(len(output))
             )
             reward = self.task_spec.correctness_reward_weight * (
@@ -574,6 +574,9 @@ class Action(object):
 
     def __gt__(self, other):
         return self.index > other.index
+
+    def __repr__(self):
+        return f"A({self.index})"
 
 class NetworkOutput(NamedTuple):
     value: float
@@ -1450,7 +1453,7 @@ class Game(object):
         #         if actions_mask[i]:
         #             logger.debug("  %s", space.get(action))
         
-        return pruned_actions
+        return [Action(a) for a in pruned_actions.tolist()]
 
     def apply(self, action: Action):
         _, reward = self.environment.step(action)
@@ -1809,11 +1812,7 @@ def _expand_node(
     node.reward = reward
     # Masked softmax. actions() are the legal actions and network output is the prior
     # TODO: use a more efficient softmax instead of the lines below.
-    import json
-    logger.debug("Network output (json): %s", json.dumps(network_output._asdict(), indent=2))
-    logger.debug("Actions (shape %s): %s", actions.shape, actions)
-    logger.debug("Network output (keys %s): %s", network_output.policy_logits.keys(), network_output.policy_logits)
-    policy = {a: math.exp(network_output.policy_logits[a]) for a in actions.tolist()} # softmax
+    policy = {a: math.exp(network_output.policy_logits[a]) for a in actions} # softmax
     policy_sum = sum(policy.values())
     for action, p in policy.items():
         node.children[action] = Node(p / policy_sum)
