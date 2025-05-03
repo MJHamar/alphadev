@@ -146,9 +146,9 @@ def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[i
                     # generate all combinations of registers and memory
                     for opcode in x86_signatures.keys():
                         yield from apply_opcode(opcode, (i, j, k))
-    logger.debug("Enumerating actions for max_reg=%d, max_mem=%d", max_reg, max_mem)
+    #   logger.debug("Enumerating actions for max_reg=%d, max_mem=%d", max_reg, max_mem)
     actions = list(set(enum_actions(max_reg, max_reg, max_mem)))
-    logger.debug("Enumerated %d actions", len(actions))
+    #   logger.debug("Enumerated %d actions", len(actions))
     return actions
 
 # the emulator should call ActionSpace.get(action) to get the action
@@ -259,24 +259,24 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # update the history with the action
             for act in action:
                 if act.opcode.startswith("L"): # (MEM_T, _)
-                    logger.debug("load %s", act.operands[0])
+                    #   logger.debug("load %s", act.operands[0])
                     self._mems_read.add(act.operands[0])
                 elif act.opcode.startswith("S"): # (_, MEM_T)
-                    logger.debug("store %s", act.operands[1])
+                    #   logger.debug("store %s", act.operands[1])
                     self._mems_written.add(act.operands[1])
                 
         # check if the history seems to be a continuation of the current state
         if history is not None: # update history
-            logger.debug("pruning: history")
+            #   logger.debug("pruning: history")
             crnt_space = self.get_space(state) # the action space. almost constant lookup time
             if self._history_cache is not None and\
                 len(self._history_cache) + 1 == len(history) and \
                 self._history_cache[-1] == history[-2]: # check only the last action to save time
-                logger.debug("pruning: using cached history")
+                #   logger.debug("pruning: using cached history")
                 # we can use the cached history
                 update_history(crnt_space.get(history[-1].index))
             else:
-                logger.debug("pruning: recomputing history")
+                #   logger.debug("pruning: recomputing history")
                 # we need to recompute the history
                 self._mems_read = set()
                 self._mems_written = set()
@@ -286,8 +286,8 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # update the history cache
             self._history_cache = history
             # update the masks
-            logger.debug("mems_read %s", self._mems_read)
-            logger.debug("mems_written %s", self._mems_written)
+            #   logger.debug("mems_read %s", self._mems_read)
+            #   logger.debug("mems_written %s", self._mems_written)
 
         act_loc_table = self.act_loc_table
         reg_locs = self.reg_locs
@@ -311,31 +311,31 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         assert active_memory.shape[0] == self.max_mem, \
             "active memory and max_mem do not match."
 
-        logger.debug("active registers (shape %s) %s", active_registers.shape, active_registers)
-        logger.debug("active memory (shape %s) %s", active_memory.shape, active_memory)
+        #   logger.debug("active registers (shape %s) %s", active_registers.shape, active_registers)
+        #   logger.debug("active memory (shape %s) %s", active_memory.shape, active_memory)
 
         # find windows of locations that are valid
         reg_window = jnp.zeros_like(reg_locs, dtype=jnp.bool)
         last_reg = - jnp.argmax(active_registers[::-1])
-        logger.debug("last_reg %d", last_reg)
+        #   logger.debug("last_reg %d", last_reg)
         active_registers = active_registers.at[last_reg].set(True)
         reg_window = reg_window.at[:self.max_reg].set(active_registers)
         # same for the memory locations
         mem_window = jnp.zeros_like(mem_locs, dtype=jnp.bool)
         last_mem = - jnp.argmax(active_memory[::-1])
-        logger.debug("last_mem %d", last_mem)
+        #   logger.debug("last_mem %d", last_mem)
         active_memory = active_memory.at[last_mem].set(True)
         mem_window = mem_window.at[self.max_reg:].set(active_memory)
         
-        logger.debug("register window (shape %s) %s", reg_window.shape, reg_window)
-        logger.debug("memory window (shape %s) %s", mem_window.shape, mem_window)
+        #   logger.debug("register window (shape %s) %s", reg_window.shape, reg_window)
+        #   logger.debug("memory window (shape %s) %s", mem_window.shape, mem_window)
         
         # reg_window and mem_window now address the rows
         # of the act_loc_table, which should be considered.
         
         # we select all register-only actions, which operate within the register window
-        logger.debug("register-only actions shape %s", reg_only_actions.shape)
-        logger.debug("act_loc_table shape %s", act_loc_table.shape)
+        #   logger.debug("register-only actions shape %s", reg_only_actions.shape)
+        #   logger.debug("act_loc_table shape %s", act_loc_table.shape)
         
         assert reg_window.shape[0] == act_loc_table.shape[0], \
             "register window and action location table do not match."
@@ -350,7 +350,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # A register-only action is valid if it is a register-only action
         # AND it does NOT access any inactive location.
         reg_only_mask = reg_only_actions & (~accesses_inactive_loc) # Shape (N_actions,)
-        logger.debug("register-only mask shape %s", reg_only_mask.shape) # Should be (num_actions,)
+        #   logger.debug("register-only mask shape %s", reg_only_mask.shape) # Should be (num_actions,)
         
         # to enfoce that only one read and one write is allowed at each memory location,
         # we also need to look at the history of the program
@@ -473,9 +473,9 @@ class AssemblyGame(object):
 
     def step(self, action:'Action'):
         action_space = self.storage.get_space(self.state())
-        logger.debug("step: action index %s", action.index)
+        #   logger.debug("step: action index %s", action.index)
         instructions = action_space.get(action.index) # lookup x86 instructions and convert to riscv
-        logger.debug("step: act %s, instruction %s", action, instructions)
+        #   logger.debug("step: act %s, instruction %s", action, instructions)
         # there might be multiple instructions in a single action
         if not isinstance(instructions, list):
             instructions = [instructions]
@@ -1215,7 +1215,7 @@ class PredictionNet(hk.Module):
         latency_value = latency_value_head(embedding)
 
         policy = policy_head(embedding)
-        logger.debug("Policy : %s", policy)
+        #   logger.debug("Policy : %s", policy)
 
         return NetworkOutput(
             value=correctness_value['mean'] + latency_value['mean'],
@@ -1310,7 +1310,7 @@ class AlphaDevConfig(object):
         self.momentum = 0.9
         
         self.inputs = generate_sort_inputs(3, self.task_spec.num_inputs)
-        logger.debug("Inputs: %s", self.inputs)
+        #   logger.debug("Inputs: %s", self.inputs)
         assert self.task_spec.num_inputs == len(self.inputs),\
             f"Expected {self.task_spec.num_inputs} inputs, got {len(self.inputs)}"
 
@@ -1470,13 +1470,13 @@ class Game(object):
         actions = self.action_space_storage.get_space(state).actions
         pruned_actions = actions[actions_mask]
         # pruned_actions = actions # FIXME: this is a hotfix, since pruning is broken rn.
-        logger.debug("Pruned actions: (len %d/%d)", pruned_actions.shape[0], actions.shape[0])
+        #   logger.debug("Pruned actions: (len %d/%d)", pruned_actions.shape[0], actions.shape[0])
         if logger.level == logging.DEBUG:
             space = self.action_space_storage.get_space(state)
-            logger.debug("Legal actions:")
+            #   logger.debug("Legal actions:")
             for i, action in enumerate(actions):
                 if actions_mask[i]:
-                    logger.debug("  %s", space.get(action))
+                    #   logger.debug("  %s", space.get(action))
         
         return [Action(a) for a in pruned_actions.tolist()]
 
@@ -1731,14 +1731,14 @@ def run_mcts(
     """
 
     for r_ in range(config.num_simulations): # rollouts
-        logger.debug("Rollout %d", r_)
+        #   logger.debug("Rollout %d", r_)
         history = action_history.clone()
         node = root # start from the current root
         search_path = [node] # initialise new trajectory from the current root
         sim_env = env.clone() # start from the current state of the environment
         # Traverse the tree until we reach a leaf node.
 
-        logger.debug("root node expanded: %s", node.expanded())
+        #   logger.debug("root node expanded: %s", node.expanded())
 
         while node.expanded():
             action, node = _select_child(config, node, min_max_stats) # based on UCB
@@ -1746,7 +1746,7 @@ def run_mcts(
             history.add_action(action) # update history 
             search_path.append(node) # append to the current trajectory
         
-        logger.debug("mcts: at leaf. Action: %s, Node: %s", action, node)
+        #   logger.debug("mcts: at leaf. Action: %s, Node: %s", action, node)
         # Inside the search tree we use the environment to obtain the next
         # observation and reward given an action.
         observation, reward = sim_env.observation(), sim_env.correctness_reward()
@@ -1771,8 +1771,8 @@ def run_mcts(
             config.discount,
             min_max_stats,
         )
-    logger.debug("MCTS finished. Root node: %s", root)
-    logger.debug("Tree:\n")
+    #   logger.debug("MCTS finished. Root node: %s", root)
+    #   logger.debug("Tree:\n")
     root.show_tree(only_expanded=True)
 
 def _select_action(
@@ -1799,8 +1799,8 @@ def _select_child(
     unique_scores, unique_indices = numpy.unique(
         [s[0] for s in scores], return_index=True
     )
-    logger.debug("select_child: unique scores: %s", unique_scores)
-    logger.debug("select_child: unique indices: %s", unique_indices)
+    #   logger.debug("select_child: unique scores: %s", unique_scores)
+    #   logger.debug("select_child: unique indices: %s", unique_indices)
     _, action, child = max(scores)
     return action, child
 
@@ -1845,12 +1845,12 @@ def _expand_node(
     policy_sum = sum(policy.values())
     for action, p in policy.items():
         node.children[action] = Node(p / policy_sum)
-    logger.debug("Expanded node: %s", node)
+    #   logger.debug("Expanded node: %s", node)
     unique_scores, unique_indices = numpy.unique(
         [c.prior for c in node.children.values()], return_index=True
     )
-    logger.debug("expand: unique scores: %s", unique_scores)
-    logger.debug("expand: unique indices: %s", unique_indices)
+    #   logger.debug("expand: unique scores: %s", unique_scores)
+    #   logger.debug("expand: unique indices: %s", unique_indices)
 
 
 def _backpropagate(
@@ -2026,7 +2026,7 @@ def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=
     # generate all weak orderings
     io_list = []
     def generate_testcases(items_to_sort: int) -> List[Tuple[List[int], List[int]]]:
-        logger.debug("Generating test cases for %d items to sort", items_to_sort)
+        #   logger.debug("Generating test cases for %d items to sort", items_to_sort)
         def add_all_permutations(initial: List[int]) -> List[Tuple[List[int], List[int]]]:
             for perm in itertools.permutations(initial, len(initial)):
                 expected = numpy.array(sorted(perm))
@@ -2058,7 +2058,7 @@ def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=
     _, uidx = numpy.unique(io_list, axis=0, return_index=True) # remove duplicates
     io_list = io_list[uidx, :]
     
-    logger.debug("Generated %d test cases", len(io_list))
+    #   logger.debug("Generated %d test cases", len(io_list))
     # shuffle the permutations. if num_samples > len(permutations), we set
     # inputs = permutations + num_samples - len(permutations) random samples from permutations
     # otherwise, we set inputs = random.sample(permutations, num_samples)
