@@ -188,14 +188,12 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self.action_space = x86ActionSpace # these are still x86 instructions
         # TODO: make sure we don't flood the memory with this
         self.masks = {}
-        # build mask lookup tables
-        self.reg_mask_lookup = None
-        self.mem_mask_lookup = None
-        self._build_masks()
         # for pruning the action space (one read and one write per memory location)
         self._history_cache = None
         self._mems_read = set()
         self._mems_written = set()
+        # build mask lookup tables
+        self._build_masks()
     
     def _build_masks(self):
         """
@@ -259,12 +257,13 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         """
         def update_history(action):
             # update the history with the action
-            if action.opcode == "lw": # (MEM_T, _)
-                logger.debug("lw %s", action.operands[0])
-                self._mems_read.add(action.operands[0])
-            elif action.opcode == "sw": # (_, MEM_T)
-                logger.debug("sw %s", action.operands[1])
-                self._mems_written.add(action.operands[1])
+            for act in action:
+                if act.opcode.startswith("L"): # (MEM_T, _)
+                    logger.debug("load %s", act.operands[0])
+                    self._mems_read.add(act.operands[0])
+                elif act.opcode.startswith("S"): # (_, MEM_T)
+                    logger.debug("store %s", act.operands[1])
+                    self._mems_written.add(act.operands[1])
                 
         # check if the history seems to be a continuation of the current state
         if history is not None: # update history
@@ -275,7 +274,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
                 self._history_cache[-1] == history[-2]: # check only the last action to save time
                 logger.debug("pruning: using cached history")
                 # we can use the cached history
-                update_history(crnt_space.get(history[-1]))
+                update_history(crnt_space.get(history[-1].index))
             else:
                 logger.debug("pruning: recomputing history")
                 # we need to recompute the history
@@ -283,7 +282,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
                 self._mems_written = set()
                 # iterate over the history
                 for action in history:
-                    update_history(crnt_space.get(action))
+                    update_history(crnt_space.get(action.index))
             # update the history cache
             self._history_cache = history
             # update the masks
@@ -357,21 +356,29 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # we also need to look at the history of the program
         # and mask out any actions that are illegal
         read_locs = jnp.array(list(self._mems_read), dtype=jnp.int32) + self.max_reg
+        #      logger.debug("read_locs %s", read_locs)
         # create a mask of memory locations that are read
         mem_read_locs = jnp.zeros_like(mem_locs, dtype=jnp.bool).at[read_locs].set(True)
+        #      logger.debug("mem_read_locs %s", mem_read_locs)
         # subtract the read locations mask from the memory window
         mem_read_window = mem_window & ~mem_read_locs
-        # select all memory read actions, which operate withing the memory window
-        invalid_mem_read_loc = act_loc_table[~mem_read_window, :]
+        #      logger.debug("mem_read_window %s", mem_read_window)
+        # select all memory read actions, which operate within the memory window
+        invalid_mem_read_loc = act_loc_table[~(mem_read_window | reg_locs), :]
+        #      logger.debug("act_loc invalids %s", invalid_mem_read_loc.any(axis=0))
         accesses_invalid_mem = jnp.any(invalid_mem_read_loc, axis=0)
+        #      logger.debug("num invalid mem read actions: %s", jnp.sum(accesses_invalid_mem))
         mem_read_mask = mem_read_actions & (~accesses_invalid_mem)
+        #      logger.debug("mem_read_mask num selected %s", mem_read_mask.sum())
+
         # do the same for write actions
         write_locs = jnp.array(list(self._mems_written), dtype=jnp.int32) + self.max_reg
         mem_write_locs = jnp.zeros_like(mem_locs, dtype=jnp.bool).at[write_locs].set(True)
         mem_write_window = mem_window & ~mem_write_locs
-        invalid_mem_write_loc = act_loc_table[~mem_write_window, :]
+        invalid_mem_write_loc = act_loc_table[~(mem_write_window | reg_locs), :]
         accesses_invalid_mem = jnp.any(invalid_mem_write_loc, axis=0)
         mem_write_mask = mem_write_actions & (~accesses_invalid_mem)
+        #      logger.debug("mem_write_mask num selected %s", mem_read_mask.sum())
 
         assert reg_only_mask.shape[0] == len(self.actions), \
             "mask and action space size do not match."
@@ -466,8 +473,9 @@ class AssemblyGame(object):
 
     def step(self, action:'Action'):
         action_space = self.storage.get_space(self.state())
+        logger.debug("step: action index %s", action.index)
         instructions = action_space.get(action.index) # lookup x86 instructions and convert to riscv
-        logger.debug("step: act %s, instruction %s", instructions)
+        logger.debug("step: act %s, instruction %s", action, instructions)
         # there might be multiple instructions in a single action
         if not isinstance(instructions, list):
             instructions = [instructions]
@@ -1241,7 +1249,7 @@ class AlphaDevConfig(object):
             1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
         )
         self.max_moves = jnp.inf
-        self.num_simulations = 800
+        self.num_simulations = 5
         self.discount = 1.0
 
         # Root prior exploration noise.
@@ -1354,6 +1362,23 @@ class Node(object):
             return 0
         return self.value_sum / self.visit_count
 
+    def __repr__(self):
+        return f"Node(vc={self.visit_count}, prior={self.prior}, value={self.value()}, reward={self.reward})"
+
+    def show_tree(self, level: int = 0, only_expanded: bool = False):
+        """Prints the tree starting from this node."""
+        print(" " * level, self)
+        num_since_expanded = 0
+        for action, child in self.children.items():
+            if only_expanded and not child.expanded():
+                num_since_expanded += 1
+                continue
+            if num_since_expanded > 0:
+                print(" " * (level + 2), f"({num_since_expanded} not expanded)")
+                num_since_expanded = 0
+            print(" " * (level + 2), action)
+            child.show_tree(level=level + 4, only_expanded=only_expanded)
+
 
 class ActionHistory(object):
     """Simple history container used inside the search.
@@ -1446,12 +1471,12 @@ class Game(object):
         pruned_actions = actions[actions_mask]
         # pruned_actions = actions # FIXME: this is a hotfix, since pruning is broken rn.
         logger.debug("Pruned actions: (len %d/%d)", pruned_actions.shape[0], actions.shape[0])
-        # if logger.level == logging.DEBUG:
-        #     space = self.action_space_storage.get_space(state)
-        #     logger.debug("Legal actions:")
-        #     for i, action in enumerate(actions):
-        #         if actions_mask[i]:
-        #             logger.debug("  %s", space.get(action))
+        if logger.level == logging.DEBUG:
+            space = self.action_space_storage.get_space(state)
+            logger.debug("Legal actions:")
+            for i, action in enumerate(actions):
+                if actions_mask[i]:
+                    logger.debug("  %s", space.get(action))
         
         return [Action(a) for a in pruned_actions.tolist()]
 
@@ -1705,27 +1730,30 @@ def run_mcts(
         env: an instance of the AssemblyGame.
     """
 
-    for _ in range(config.num_simulations): # rollouts
+    for r_ in range(config.num_simulations): # rollouts
+        logger.debug("Rollout %d", r_)
         history = action_history.clone()
         node = root # start from the current root
         search_path = [node] # initialise new trajectory from the current root
         sim_env = env.clone() # start from the current state of the environment
         # Traverse the tree until we reach a leaf node.
 
+        logger.debug("root node expanded: %s", node.expanded())
+
         while node.expanded():
             action, node = _select_child(config, node, min_max_stats) # based on UCB
             sim_env.step(action) # step the environment
             history.add_action(action) # update history 
             search_path.append(node) # append to the current trajectory
-
+        
+        logger.debug("mcts: at leaf. Action: %s, Node: %s", action, node)
         # Inside the search tree we use the environment to obtain the next
         # observation and reward given an action.
-        observation, reward = sim_env.step(action) # step the environment
-        # NOTE: not updating the history here, it doesn't make a difference since this is 
-        # always the last step in a trajectory.
-        network_output = network.inference(observation) # get the priors
+        observation, reward = sim_env.observation(), sim_env.correctness_reward()
+        # get the priors
+        network_output = network.inference(observation)
         _expand_node( # expand the leaf node
-            # here, game is not available. I suppose we do not perform action pruning here
+            # here, game is not available. I suppose we do not perform action pruning.
             # instead, the history should be initialized either 
             #   with the game's current legal actions. -- UPDATE: this is stupid. The game will never find a solution
             #   or with the action space of the environment.
@@ -1743,36 +1771,37 @@ def run_mcts(
             config.discount,
             min_max_stats,
         )
-        # NOTE: excuse me but how is this supposed to reach a leaf node? 
-        # it seems like we are expanding exactly one node in each iteration.
-        # there should be an exit condition upon terminations of the game.
-        # UPDATE: I guess not, num_simulations here refers to the number of unvisited
-        # nodes to expand.
-
+    logger.debug("MCTS finished. Root node: %s", root)
+    logger.debug("Tree:\n")
+    root.show_tree(only_expanded=True)
 
 def _select_action(
     # pylint: disable-next=unused-argument
     config: AlphaDevConfig, num_moves: int, node: Node, network: Network
 ) -> Action:
-    visit_counts = [
-        (child.visit_count, action) for action, child in node.children.items()
-    ]
+    visit_counts = jnp.array([
+        (child.visit_count, action.index) for action, child in node.children.items()
+    ])
     t = config.visit_softmax_temperature_fn(
-        training_steps=network.training_steps()
+        steps=network.training_steps()
     )
     _, action = softmax_sample(visit_counts, t)
     # i.e. posterior probability based on the visit counts
-    return action
+    return Action(action)
 
 
 def _select_child(
     config: AlphaDevConfig, node: Node, min_max_stats: MinMaxStats
 ):
     """Selects the child with the highest UCB score."""
-    _, action, child = max(
-        (_ucb_score(config, node, child, min_max_stats), action, child)
-        for action, child in node.children.items()
+    scores = [(_ucb_score(config, node, child, min_max_stats), action, child)
+        for action, child in node.children.items()]
+    unique_scores, unique_indices = numpy.unique(
+        [s[0] for s in scores], return_index=True
     )
+    logger.debug("select_child: unique scores: %s", unique_scores)
+    logger.debug("select_child: unique indices: %s", unique_indices)
+    _, action, child = max(scores)
     return action, child
 
 
@@ -1816,6 +1845,12 @@ def _expand_node(
     policy_sum = sum(policy.values())
     for action, p in policy.items():
         node.children[action] = Node(p / policy_sum)
+    logger.debug("Expanded node: %s", node)
+    unique_scores, unique_indices = numpy.unique(
+        [c.prior for c in node.children.values()], return_index=True
+    )
+    logger.debug("expand: unique scores: %s", unique_scores)
+    logger.debug("expand: unique indices: %s", unique_indices)
 
 
 def _backpropagate(
@@ -1947,8 +1982,11 @@ def scalar_loss(prediction, target, network) -> float:
 # Stubs to make the typechecker happy.
 # pylint: disable-next=unused-argument
 def softmax_sample(distribution, temperature: float):
-    scaled = distribution / temperature
+    logger.info("softmax_sample: distribution shape: %s", distribution.shape)
+    logger.info("softmax_sample: temperature: %s", temperature)
+    scaled = distribution[:,0] / temperature
     action = jax.random.categorical(jax.random.PRNGKey(0), scaled)
+    logger.info("softmax_sample: action shape %s", action.shape)
     return scaled[action], action
 
 
