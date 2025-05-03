@@ -110,14 +110,17 @@ def x86_to_riscv(x86_opcode, x86_operands, state):
         return [RiscvAction("SW", (x86_operands[0], x86_operands[1], X0))] # rs1,imm,rs2 -- rs1, rs2(imm)
     elif x86_opcode == "cmp": # compare two registers
         return [RiscvAction("SUB", (X1, x86_operands[0], x86_operands[1]))]
+        # if A > B, then X1 > 0
+        # if A < B, then X1 < 0
+        # riscv has bge (>=) and blt (<) instructions
     elif x86_opcode == "cmovg": # conditional move if greater than
-        return [
-            RiscvAction("BLE", (X1, 0, 4*len(state.program)+8)),  # skip next instruction if A < B
+        return [ # A > B <=> B < A -- 0 < X1
+            RiscvAction("BLT", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A < B
             RiscvAction("ADD", (x86_operands[1], X0, x86_operands[0]))  # copy C to D
         ]
     elif x86_opcode == "cmovle": # conditional move if less than or equal
-        return [
-            RiscvAction("BGT", (X1, 0, 4*len(state.program)+8)),  # skip next instruction if A > B
+        return [ # A <= B <=> B >= A -- 0 >= X1
+            RiscvAction("BGE", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A > B
             RiscvAction("ADD", (x86_operands[1], X0, x86_operands[0]))  # copy E to F
         ]
     else:
@@ -379,59 +382,6 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # combine the masks by taking their union
         return reg_only_mask | mem_read_mask | mem_write_mask
 
-        # if state not in self.masks:
-        #     logger.debug("pruning: active locs")
-        #     active_registers: jnp.ndarray = state.register_mask
-        #     active_memory: jnp.ndarray = state.memory_mask
-        #     # increment the active registers and memory by 1 to allow accessing locations
-        #     # find the last non-zero index
-        #     last_reg = active_registers.shape[1] - jnp.argmax(active_registers[:, ::-1], axis=1)
-        #     last_mem = jnp.argmax(active_memory[:, ::-1], axis=1)
-        #     new_active_registers = active_registers.at[:,last_reg].set(1)
-        #     new_active_memory = active_memory.at[:,last_mem].set(1)
-            
-        #     # make sure the two arrays reference the same number of locations
-        #     # NOTE: this assumes registers are accessed sequentially. floating point regs will make this harder
-        #     new_active_registers = new_active_registers[:, :reg_mask_lookup.shape[0]]
-        #     new_active_memory = new_active_memory[:, :mem_mask_lookup.shape[0]]
-            
-        #     logger.debug("new active registers (shape %s) %s", new_active_registers.shape, new_active_registers[0,...])
-        #     logger.debug("new active memory (shape %s) %s", new_active_memory.shape, new_active_memory[0,...])
-            
-        #     # reg_mask_lookup shape is R x A
-        #     # active_register shape is E x R
-        #     # des. reg_mask   shape is E x A
-        #     # with R: number of registers, A: number of actions, E: number of examples
-        #     selected_reg_masks = jnp.einsum("er,ra->ea", new_active_registers, reg_mask_lookup)
-        #     selected_mem_masks = jnp.einsum("em,ma->ea", new_active_memory, mem_mask_lookup)
-        #     logger.debug("selected_reg_masks shape %s", selected_reg_masks.shape)
-        #     logger.debug("selected_mem_masks shape %s", selected_mem_masks.shape)
-        #     reg_mask = jnp.any(selected_reg_masks, axis=0) # E x A
-        #     mem_mask = jnp.any(selected_mem_masks, axis=0) # E x A
-        #     self.masks[state] = (reg_mask, mem_mask)
-        # # now we need to make sure that only one read and one write is allowed for each memory location
-        # # this should be computed on the fly, as the program keeps changing in crazy ways.
-        # # BUT, we can cache the histor so we don't have to iterate over it every time
-        # # since we only use this in MCTS which is depth-first
-
-        # reg_mask, mem_mask = self.masks[state]
-        # reg_mask = reg_mask.copy()
-        # mem_mask = mem_mask.copy()
-
-        # # mem mask lookup is of shape (M, A)
-        # # mems_read and mems_written are sets of indices m \in M
-        # # we need to take the union of the masks for the read and write locations
-        # # if a memory location is both read and written, we need to exclude it from the mask
-        # both = jnp.all(jnp.stack([
-        #     jnp.any(mem_mask_lookup[list(self._mems_read),:], axis=0),
-        #     jnp.any(mem_mask_lookup[list(self._mems_written),:], axis=0)])
-        # )
-        # # both indicates the indices of actions, where both read and write are used
-        # mem_mask = mem_mask.at[both].set(False)
-
-        # # TODO: this doesn't allow register-only actions to be used because memory mask excludes them.
-        # return reg_mask & mem_mask # take the union of the two masks
-
     def get_space(self, state) -> x86ActionSpace:
         return self.action_space(self.actions, state)
 
@@ -486,7 +436,6 @@ class AssemblyGame(object):
             self.reset()
             # execute the program
             self.emulator.exe()
-            return self.get_state()
 
         @property
         def registers(self): return self.emulator.registers
@@ -514,14 +463,16 @@ class AssemblyGame(object):
         self.previous_correct_items = 0
         self.expected_outputs = self.make_expected_outputs()
 
-    def step(self, action:'Action'):
-        action_space = self.storage.get_space(self.simulator.get_state())
-        instructions = action_space.get(action.index) # lookup x86 instructions and convert to riscv
+    def step(self, action:int):
+        action_space = self.storage.get_space(self.state())
+        logger.debug("action %s", action)
+        instructions = action_space.get(action) # lookup x86 instructions and convert to riscv
+        logger.debug("instructions %s", instructions)
         # there might be multiple instructions in a single action
         if not isinstance(instructions, list):
             instructions = [instructions]
         for riscv_action in instructions:
-            insn = self.AssemblyInstruction(riscv_action, self.storage)
+            insn = self.AssemblyInstruction(riscv_action)
             self.program.append(insn) # append the action (no swap moves)
             self.simulator.apply(insn)
         return self.observation(), self.correctness_reward()
@@ -674,7 +625,7 @@ class UniformNetwork(object):
     # pylint: disable-next=unused-argument
     def inference(self, observation) -> NetworkOutput:
         # representation + prediction function
-        return NetworkOutput(0, 0, 0, {})
+        return NetworkOutput(0, 0, 0, collections.defaultdict(lambda: 1.0))
 
     def get_params(self):
         # Returns the weights of this network.
@@ -1252,11 +1203,14 @@ class PredictionNet(hk.Module):
         correctness_value = value_head(embedding)
         latency_value = latency_value_head(embedding)
 
+        policy = policy_head(embedding)
+        logger.debug("Policy : %s", policy)
+
         return NetworkOutput(
             value=correctness_value['mean'] + latency_value['mean'],
             correctness_value_logits=correctness_value['logits'],
             latency_value_logits=latency_value['logits'],
-            policy=policy_head(embedding),
+            policy_logits=policy['logits'],
         )
 
 
@@ -1488,13 +1442,13 @@ class Game(object):
         actions = self.action_space_storage.get_space(state).actions
         pruned_actions = actions[actions_mask]
         # pruned_actions = actions # FIXME: this is a hotfix, since pruning is broken rn.
-        logger.debug("Pruned actions: (len %s/%s)", pruned_actions.shape, actions.shape)
-        if logger.level == logging.DEBUG:
-            space = self.action_space_storage.get_space(state)
-            logger.debug("Legal actions:")
-            for i, action in enumerate(actions):
-                if actions_mask[i]:
-                    logger.debug("  %s", space.get(action))
+        logger.debug("Pruned actions: (len %d/%d)", pruned_actions.shape[0], actions.shape[0])
+        # if logger.level == logging.DEBUG:
+        #     space = self.action_space_storage.get_space(state)
+        #     logger.debug("Legal actions:")
+        #     for i, action in enumerate(actions):
+        #         if actions_mask[i]:
+        #             logger.debug("  %s", space.get(action))
         
         return pruned_actions
 
@@ -1855,7 +1809,11 @@ def _expand_node(
     node.reward = reward
     # Masked softmax. actions() are the legal actions and network output is the prior
     # TODO: use a more efficient softmax instead of the lines below.
-    policy = {a: math.exp(network_output.policy_logits[a]) for a in actions} # softmax
+    import json
+    logger.debug("Network output (json): %s", json.dumps(network_output._asdict(), indent=2))
+    logger.debug("Actions (shape %s): %s", actions.shape, actions)
+    logger.debug("Network output (keys %s): %s", network_output.policy_logits.keys(), network_output.policy_logits)
+    policy = {a: math.exp(network_output.policy_logits[a]) for a in actions.tolist()} # softmax
     policy_sum = sum(policy.values())
     for action, p in policy.items():
         node.children[action] = Node(p / policy_sum)
