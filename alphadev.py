@@ -205,32 +205,47 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # we create a max_reg x action_space_size and 
         # max_mem x action_space_size masks
         action_space_size = len(self.actions)
-        reg_masks = jnp.zeros((self.max_reg, action_space_size), dtype=jnp.bool)
-        mem_masks = jnp.zeros((self.max_mem, action_space_size), dtype=jnp.bool)
+        # table mapping all registers and memory locations to the action space 
+        # a cell (i,j) is True if location i is accessed by action j.
+        act_loc_table = jnp.zeros(((self.max_reg + self.max_mem), action_space_size), dtype=jnp.bool)
+        # mask for register locations
+        reg_locs = jnp.zeros((self.max_reg + self.max_mem), dtype=jnp.bool).at[:self.max_reg].set(True)
+        # mask for memory locations
+        mem_locs = jnp.zeros((self.max_reg + self.max_mem), dtype=jnp.bool).at[self.max_reg:].set(True)
+        # boolean mask for actions that only use register locations
+        reg_only_actions = jnp.zeros((action_space_size,), dtype=jnp.bool)
+        # boolean mask for actions that read from memory locations
+        mem_read_actions = jnp.zeros((action_space_size,), dtype=jnp.bool)
+        # boolean mask for actions that write to memory locations
+        mem_write_actions = jnp.zeros((action_space_size,), dtype=jnp.bool)
         for i, action in enumerate(self.actions):
             # iterate over the x86 instructions currently under consideration
             x86_opcode, x86_operands = action
             signature = x86_signatures[x86_opcode]
             if signature == (REG_T, REG_T):
-                # move between registers
-                reg_masks = reg_masks.at[x86_operands[0], i].set(True)
-                reg_masks = reg_masks.at[x86_operands[1], i].set(True)
-            elif signature == (MEM_T, REG_T):
-                # load word from memory to register
-                mem_masks = mem_masks.at[x86_operands[0], i].set(True)
-                reg_masks = reg_masks.at[x86_operands[1], i].set(True)
-            elif signature == (REG_T, MEM_T):
-                # store word from register to memory
-                reg_masks = reg_masks.at[x86_operands[0], i].set(True)
-                mem_masks = mem_masks.at[x86_operands[1], i].set(True)
-            else:
-                assert False, f"No signature of type {signature} should be used. fix this."
+                act_loc_table    = act_loc_table.at[x86_operands, i].set(True)
+                reg_only_actions = reg_only_actions.at[i].set(True)
+            else: # action that accesses memory.
+                mem_loc, reg_loc = x86_operands if signature == (MEM_T, REG_T) else reversed(x86_operands)
+                mem_loc += self.max_reg # offset the memory locations
+                act_loc_table    = act_loc_table.at[reg_loc, i].set(True)
+                act_loc_table    = act_loc_table.at[mem_loc, i].set(True)
+                if x86_opcode.startswith("l"): # load action
+                    mem_read_actions = mem_read_actions.at[i].set(True)
+                else:
+                    mem_write_actions = mem_write_actions.at[i].set(True)
         
-        assert reg_masks.any(), "register masks are all false"
-        assert mem_masks.any(), "memory masks are all false"
+        assert (reg_only_actions & mem_read_actions & mem_write_actions == 0).any(), \
+            "Action space was not partitioned correctly"
+        assert (reg_only_actions | mem_read_actions | mem_write_actions).all(), \
+            "Action space was not partitioned correctly"
         
-        self.reg_mask_lookup = reg_masks
-        self.mem_mask_lookup = mem_masks
+        self.act_loc_table = act_loc_table
+        self.reg_locs = reg_locs
+        self.mem_locs = mem_locs
+        self.reg_only_actions = reg_only_actions
+        self.mem_read_actions = mem_read_actions
+        self.mem_write_actions = mem_write_actions
 
     def get_mask(self, state, history:list=None) -> jnp.ndarray:
         """Get the mask over the action space for the given state and history.
@@ -246,55 +261,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             elif action.opcode == "sw": # (_, MEM_T)
                 logger.debug("sw %s", action.operands[1])
                 self._mems_written.add(action.operands[1])
-
-        # broadcast the masks to the number of inputs
-        reg_mask_lookup = self.reg_mask_lookup
-        mem_mask_lookup = self.mem_mask_lookup
-
-        logger.debug("reg_mask_lookup shape %s", reg_mask_lookup.shape)
-        logger.debug("mem_mask_lookup shape %s", mem_mask_lookup.shape)
-        
-        if state not in self.masks:
-            logger.debug("pruning: active locs")
-            active_registers: jnp.ndarray = state.register_mask
-            active_memory: jnp.ndarray = state.memory_mask
-            # increment the active registers and memory by 1 to allow accessing locations
-            # find the last non-zero index
-            last_reg = active_registers.shape[1] - jnp.argmax(active_registers[:, ::-1], axis=1)
-            last_mem = jnp.argmax(active_memory[:, ::-1], axis=1)
-            new_active_registers = active_registers.at[:,last_reg].set(1)
-            new_active_memory = active_memory.at[:,last_mem].set(1)
-            
-            # make sure the two arrays reference the same number of locations
-            # NOTE: this assumes registers are accessed sequentially. floating point regs will make this harder
-            new_active_registers = new_active_registers[:, :reg_mask_lookup.shape[0]]
-            new_active_memory = new_active_memory[:, :mem_mask_lookup.shape[0]]
-            
-            logger.debug("new active registers (shape %s) %s", new_active_registers.shape, new_active_registers[0,...])
-            logger.debug("new active memory (shape %s) %s", new_active_memory.shape, new_active_memory[0,...])
-            
-            # reg_mask_lookup shape is R x A
-            # active_register shape is E x R
-            # des. reg_mask   shape is E x A
-            # with R: number of registers, A: number of actions, E: number of examples
-            selected_reg_masks = jnp.einsum("er,ra->ea", new_active_registers, reg_mask_lookup)
-            selected_mem_masks = jnp.einsum("em,ma->ea", new_active_memory, mem_mask_lookup)
-            logger.debug("selected_reg_masks shape %s", selected_reg_masks.shape)
-            logger.debug("selected_mem_masks shape %s", selected_mem_masks.shape)
-            reg_mask = jnp.any(selected_reg_masks, axis=0) # E x A
-            mem_mask = jnp.any(selected_mem_masks, axis=0) # E x A
-            self.masks[state] = (reg_mask, mem_mask)
-        # now we need to make sure that only one read and one write is allowed for each memory location
-        # this should be computed on the fly, as the program keeps changing in crazy ways.
-        # BUT, we can cache the histor so we don't have to iterate over it every time
-        # since we only use this in MCTS which is depth-first
-
-        reg_mask, mem_mask = self.masks[state]
-        reg_mask = reg_mask.copy()
-        mem_mask = mem_mask.copy()
-
+                
         # check if the history seems to be a continuation of the current state
-        if history is not None:
+        if history is not None: # update history
             logger.debug("pruning: history")
             crnt_space = self.get_space(state) # the action space. almost constant lookup time
             if self._history_cache is not None and\
@@ -316,18 +285,152 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # update the masks
             logger.debug("mems_read %s", self._mems_read)
             logger.debug("mems_written %s", self._mems_written)
-            # mem mask lookup is of shape (M, A)
-            # mems_read and mems_written are sets of indices m \in M
-            # we need to take the union of the masks for the read and write locations
-            # if a memory location is both read and written, we need to exclude it from the mask
-            both = jnp.all(jnp.stack([
-                jnp.any(mem_mask_lookup[list(self._mems_read),:], axis=0),
-                jnp.any(mem_mask_lookup[list(self._mems_written),:], axis=0)])
-            )
-            # both indicates the indices of actions, where both read and write are used
-            mem_mask = mem_mask.at[both].set(False)
 
-        return reg_mask | mem_mask # take the union of the two masks
+        act_loc_table = self.act_loc_table
+        reg_locs = self.reg_locs
+        mem_locs = self.mem_locs
+        reg_only_actions = self.reg_only_actions
+        mem_read_actions = self.mem_read_actions
+        mem_write_actions = self.mem_write_actions
+        
+        # get the active registers and memory locations from the CPU state
+        # note they are matrices of shape E x R and E x M 
+        # (E: number of examples, R: number of registers, M: number of memory locations)
+        # we consider the largest window of active registers and memory locations
+        # so we take their union
+        active_registers = state.register_mask # shape E x R+(unused) # TODO: we might want to let the emulator know
+        active_registers = jnp.any(active_registers, axis=0)[:self.max_reg] # shape R
+        active_memory = state.memory_mask      # shape E x M
+        active_memory = jnp.any(active_memory, axis=0) # shape M
+
+        assert active_registers.shape[0] == self.max_reg, \
+            "active registers and max_reg do not match."
+        assert active_memory.shape[0] == self.max_mem, \
+            "active memory and max_mem do not match."
+
+        logger.debug("active registers (shape %s) %s", active_registers.shape, active_registers)
+        logger.debug("active memory (shape %s) %s", active_memory.shape, active_memory)
+
+        # find windows of locations that are valid
+        reg_window = jnp.zeros_like(reg_locs, dtype=jnp.bool)
+        last_reg = - jnp.argmax(active_registers[::-1])
+        logger.debug("last_reg %d", last_reg)
+        active_registers = active_registers.at[last_reg].set(True)
+        reg_window = reg_window.at[:self.max_reg].set(active_registers)
+        # same for the memory locations
+        mem_window = jnp.zeros_like(mem_locs, dtype=jnp.bool)
+        last_mem = - jnp.argmax(active_memory[::-1])
+        logger.debug("last_mem %d", last_mem)
+        active_memory = active_memory.at[last_mem].set(True)
+        mem_window = mem_window.at[self.max_reg:].set(active_memory)
+        
+        logger.debug("register window (shape %s) %s", reg_window.shape, reg_window)
+        logger.debug("memory window (shape %s) %s", mem_window.shape, mem_window)
+        
+        # reg_window and mem_window now address the rows
+        # of the act_loc_table, which should be considered.
+        
+        # we select all register-only actions, which operate within the register window
+        logger.debug("register-only actions shape %s", reg_only_actions.shape)
+        logger.debug("act_loc_table shape %s", act_loc_table.shape)
+        
+        assert reg_window.shape[0] == act_loc_table.shape[0], \
+            "register window and action location table do not match."
+        assert reg_only_actions.shape[0] == act_loc_table.shape[1], \
+            "register-only actions and action location table do not match."
+
+        # Identify register-only actions that access *any* location *outside* the active register window.
+        # 1. Get access pattern for locations outside the window:
+        inactive_loc_access = act_loc_table[~reg_window, :] # Shape (N_inactive_locs, N_actions)
+        # 2. Check for each action if it accesses *any* inactive location:
+        accesses_inactive_loc = jnp.any(inactive_loc_access, axis=0) # Shape (N_actions,)
+        # A register-only action is valid if it is a register-only action
+        # AND it does NOT access any inactive location.
+        reg_only_mask = reg_only_actions & (~accesses_inactive_loc) # Shape (N_actions,)
+        logger.debug("register-only mask shape %s", reg_only_mask.shape) # Should be (num_actions,)
+        
+        # to enfoce that only one read and one write is allowed at each memory location,
+        # we also need to look at the history of the program
+        # and mask out any actions that are illegal
+        read_locs = jnp.array(list(self._mems_read), dtype=jnp.int32) + self.max_reg
+        # create a mask of memory locations that are read
+        mem_read_locs = jnp.zeros_like(mem_locs, dtype=jnp.bool).at[read_locs].set(True)
+        # subtract the read locations mask from the memory window
+        mem_read_window = mem_window & ~mem_read_locs
+        # select all memory read actions, which operate withing the memory window
+        invalid_mem_read_loc = act_loc_table[~mem_read_window, :]
+        accesses_invalid_mem = jnp.any(invalid_mem_read_loc, axis=0)
+        mem_read_mask = mem_read_actions & (~accesses_invalid_mem)
+        # do the same for write actions
+        write_locs = jnp.array(list(self._mems_written), dtype=jnp.int32) + self.max_reg
+        mem_write_locs = jnp.zeros_like(mem_locs, dtype=jnp.bool).at[write_locs].set(True)
+        mem_write_window = mem_window & ~mem_write_locs
+        invalid_mem_write_loc = act_loc_table[~mem_write_window, :]
+        accesses_invalid_mem = jnp.any(invalid_mem_write_loc, axis=0)
+        mem_write_mask = mem_write_actions & (~accesses_invalid_mem)
+
+        assert reg_only_mask.shape[0] == len(self.actions), \
+            "mask and action space size do not match."
+        assert not (reg_only_mask & mem_read_mask & mem_write_mask).any(), \
+            "masks do not partition the action space."
+        assert (reg_only_mask | mem_read_mask | mem_write_mask).any(), \
+            "no actions left in the action space."
+
+        # combine the masks by taking their union
+        return reg_only_mask | mem_read_mask | mem_write_mask
+
+        # if state not in self.masks:
+        #     logger.debug("pruning: active locs")
+        #     active_registers: jnp.ndarray = state.register_mask
+        #     active_memory: jnp.ndarray = state.memory_mask
+        #     # increment the active registers and memory by 1 to allow accessing locations
+        #     # find the last non-zero index
+        #     last_reg = active_registers.shape[1] - jnp.argmax(active_registers[:, ::-1], axis=1)
+        #     last_mem = jnp.argmax(active_memory[:, ::-1], axis=1)
+        #     new_active_registers = active_registers.at[:,last_reg].set(1)
+        #     new_active_memory = active_memory.at[:,last_mem].set(1)
+            
+        #     # make sure the two arrays reference the same number of locations
+        #     # NOTE: this assumes registers are accessed sequentially. floating point regs will make this harder
+        #     new_active_registers = new_active_registers[:, :reg_mask_lookup.shape[0]]
+        #     new_active_memory = new_active_memory[:, :mem_mask_lookup.shape[0]]
+            
+        #     logger.debug("new active registers (shape %s) %s", new_active_registers.shape, new_active_registers[0,...])
+        #     logger.debug("new active memory (shape %s) %s", new_active_memory.shape, new_active_memory[0,...])
+            
+        #     # reg_mask_lookup shape is R x A
+        #     # active_register shape is E x R
+        #     # des. reg_mask   shape is E x A
+        #     # with R: number of registers, A: number of actions, E: number of examples
+        #     selected_reg_masks = jnp.einsum("er,ra->ea", new_active_registers, reg_mask_lookup)
+        #     selected_mem_masks = jnp.einsum("em,ma->ea", new_active_memory, mem_mask_lookup)
+        #     logger.debug("selected_reg_masks shape %s", selected_reg_masks.shape)
+        #     logger.debug("selected_mem_masks shape %s", selected_mem_masks.shape)
+        #     reg_mask = jnp.any(selected_reg_masks, axis=0) # E x A
+        #     mem_mask = jnp.any(selected_mem_masks, axis=0) # E x A
+        #     self.masks[state] = (reg_mask, mem_mask)
+        # # now we need to make sure that only one read and one write is allowed for each memory location
+        # # this should be computed on the fly, as the program keeps changing in crazy ways.
+        # # BUT, we can cache the histor so we don't have to iterate over it every time
+        # # since we only use this in MCTS which is depth-first
+
+        # reg_mask, mem_mask = self.masks[state]
+        # reg_mask = reg_mask.copy()
+        # mem_mask = mem_mask.copy()
+
+        # # mem mask lookup is of shape (M, A)
+        # # mems_read and mems_written are sets of indices m \in M
+        # # we need to take the union of the masks for the read and write locations
+        # # if a memory location is both read and written, we need to exclude it from the mask
+        # both = jnp.all(jnp.stack([
+        #     jnp.any(mem_mask_lookup[list(self._mems_read),:], axis=0),
+        #     jnp.any(mem_mask_lookup[list(self._mems_written),:], axis=0)])
+        # )
+        # # both indicates the indices of actions, where both read and write are used
+        # mem_mask = mem_mask.at[both].set(False)
+
+        # # TODO: this doesn't allow register-only actions to be used because memory mask excludes them.
+        # return reg_mask & mem_mask # take the union of the two masks
 
     def get_space(self, state) -> x86ActionSpace:
         return self.action_space(self.actions, state)
@@ -1383,15 +1486,15 @@ class Game(object):
         # get a mask over the action space, which indicates which actions are valid in the current state.
         actions_mask = self.action_space_storage.get_mask(state, self.history)
         actions = self.action_space_storage.get_space(state).actions
-        # pruned_actions = actions[actions_mask]
-        pruned_actions = actions # FIXME: this is a hotfix, since pruning is broken rn.
+        pruned_actions = actions[actions_mask]
+        # pruned_actions = actions # FIXME: this is a hotfix, since pruning is broken rn.
         logger.debug("Pruned actions: (len %s/%s)", pruned_actions.shape, actions.shape)
-        # if logger.level == logging.DEBUG:
-        #     space = self.action_space_storage.get_space(state)
-        #     logger.debug("Legal actions:")
-        #     for i, action in enumerate(actions):
-        #         if actions_mask[i]:
-        #             logger.debug("  %s", space.get(action))
+        if logger.level == logging.DEBUG:
+            space = self.action_space_storage.get_space(state)
+            logger.debug("Legal actions:")
+            for i, action in enumerate(actions):
+                if actions_mask[i]:
+                    logger.debug("  %s", space.get(action))
         
         return pruned_actions
 
