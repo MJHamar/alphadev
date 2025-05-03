@@ -27,6 +27,7 @@
 # 5. Part 2: Training
 ###########################
 
+import os
 import collections
 import functools
 import itertools
@@ -427,7 +428,7 @@ class AssemblyGame(object):
             """Initialize the simulator with the task specification."""
             self.task_spec = task_spec
             self.inputs = inputs
-            self.emulator = multi_machine(task_spec.num_mem, task_spec.num_inputs)
+            self.emulator = multi_machine(task_spec.num_mem*4, task_spec.num_inputs)
             self.reset()
         
         def reset(self):
@@ -475,7 +476,7 @@ class AssemblyGame(object):
         action_space = self.storage.get_space(self.state())
         #   logger.debug("step: action index %s", action.index)
         instructions = action_space.get(action.index) # lookup x86 instructions and convert to riscv
-        #   logger.debug("step: act %s, instruction %s", action, instructions)
+        # logger.debug("step: act %s, instruction %s", action, instructions)
         # there might be multiple instructions in a single action
         if not isinstance(instructions, list):
             instructions = [instructions]
@@ -521,7 +522,7 @@ class AssemblyGame(object):
         self.previous_correct_items = correct_items
 
         # Bonus for fully correct programs
-        all_correct = jnp.all(state.memory == self.expected_outputs)
+        all_correct = jnp.all(state.memory[:,:self.expected_outputs.shape[1]] == self.expected_outputs)
         reward += self.task_spec.correct_reward * all_correct
 
         return reward
@@ -1264,7 +1265,7 @@ class AlphaDevConfig(object):
 
         # Environment: spec of the Variable Sort 3 task
         self.task_spec = TaskSpec(
-            max_program_size=100,
+            max_program_size=10,
             num_inputs=17,
             num_funcs=14,
             num_locations=19,
@@ -1471,12 +1472,12 @@ class Game(object):
         pruned_actions = actions[actions_mask]
         # pruned_actions = actions # FIXME: this is a hotfix, since pruning is broken rn.
         #   logger.debug("Pruned actions: (len %d/%d)", pruned_actions.shape[0], actions.shape[0])
-        if logger.level == logging.DEBUG:
-            space = self.action_space_storage.get_space(state)
-            #   logger.debug("Legal actions:")
-            for i, action in enumerate(actions):
-                if actions_mask[i]:
-                    #   logger.debug("  %s", space.get(action))
+        # if logger.level == logging.DEBUG:
+        #     space = self.action_space_storage.get_space(state)
+        #     logger.debug("Legal actions:")
+        #     for i, action in enumerate(actions):
+        #         if actions_mask[i]:
+        #                 logger.debug("  %s", space.get(action))
         
         return [Action(a) for a in pruned_actions.tolist()]
 
@@ -1590,6 +1591,10 @@ class ReplayBuffer(object):
         idx = numpy.random.randint(len(game.history))
         return idx
 
+    def save(self, path: str):
+        jnp.save(path, self.buffer)
+    def load(self, path: str):
+        self.buffer = jnp.load(path, allow_pickle=True)
 
 class SharedStorage(object):
     """Controls which network is used at inference."""
@@ -1621,11 +1626,21 @@ def alphadev(config: AlphaDevConfig):
     storage = SharedStorage()
     replay_buffer = ReplayBuffer(config)
 
+    debug_buffer_path = 'buffer.npy'
+    if os.path.exists(debug_buffer_path):
+        replay_buffer.load(debug_buffer_path)
+
     # TODO: this should handled by a multiprocessing pool
     # or a job queue.
-    for _ in range(config.num_actors):
+    # for _ in range(config.num_actors):
+    #     launch_job(run_selfplay, config, storage, replay_buffer)
+    if len(replay_buffer.buffer) == 0:
+        logger.debug("Starting self-play job")
         launch_job(run_selfplay, config, storage, replay_buffer)
-
+        logger.debug("Self-play job done, saving the buffer to %s", debug_buffer_path)
+        replay_buffer.save(debug_buffer_path)
+    
+    logger.debug("Starting training job")
     # it's fine to keep this in the main thread
     train_network(config, storage, replay_buffer)
 
@@ -1648,6 +1663,8 @@ def run_selfplay(
         network = storage.latest_network()
         game = play_game(config, network)
         replay_buffer.save_game(game)
+        logger.debug("Self-play game finished. Game length: %d", len(game.history))
+        break
 
 
 def play_game(config: AlphaDevConfig, network: Network) -> Game:
@@ -1702,6 +1719,7 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
         )
         # NOTE: make a move after the MCTS policy improvement step
         action = _select_action(config, len(game.history), root, network)
+        logger.debug("play_game: selected action %s", action)
         game.apply(action) # step the environment
         game.store_search_statistics(root)
     return game
@@ -1729,7 +1747,7 @@ def run_mcts(
         min_max_stats: min-max statistics for the tree.
         env: an instance of the AssemblyGame.
     """
-
+    # logger.debug("Running MCTS with %d simulations", config.num_simulations)
     for r_ in range(config.num_simulations): # rollouts
         #   logger.debug("Rollout %d", r_)
         history = action_history.clone()
@@ -1773,12 +1791,13 @@ def run_mcts(
         )
     #   logger.debug("MCTS finished. Root node: %s", root)
     #   logger.debug("Tree:\n")
-    root.show_tree(only_expanded=True)
+    # root.show_tree(only_expanded=True)
 
 def _select_action(
     # pylint: disable-next=unused-argument
     config: AlphaDevConfig, num_moves: int, node: Node, network: Network
 ) -> Action:
+    # logger.debug("select_action at node %s", node)
     visit_counts = jnp.array([
         (child.visit_count, action.index) for action, child in node.children.items()
     ])
@@ -1787,6 +1806,7 @@ def _select_action(
     )
     _, action = softmax_sample(visit_counts, t)
     # i.e. posterior probability based on the visit counts
+    # logger.debug("select_action: selected action %s", action)
     return Action(action)
 
 
@@ -1982,12 +2002,9 @@ def scalar_loss(prediction, target, network) -> float:
 # Stubs to make the typechecker happy.
 # pylint: disable-next=unused-argument
 def softmax_sample(distribution, temperature: float):
-    logger.info("softmax_sample: distribution shape: %s", distribution.shape)
-    logger.info("softmax_sample: temperature: %s", temperature)
     scaled = distribution[:,0] / temperature
-    action = jax.random.categorical(jax.random.PRNGKey(0), scaled)
-    logger.info("softmax_sample: action shape %s", action.shape)
-    return scaled[action], action
+    action_idx = jax.random.categorical(jax.random.PRNGKey(0), scaled)
+    return distribution[action_idx].tolist()
 
 
 def launch_job(f, *args):
