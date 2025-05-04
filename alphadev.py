@@ -607,7 +607,9 @@ class Network(object):
         self.prediction = None
         self.params = None
     
-    def init_network(self, hparams: ml_collections.ConfigDict, task_spec: TaskSpec):
+    def init_network(self):
+        hparams = self.hparams
+        task_spec = self.task_spec
         def representation_fn(x):
             return RepresentationNet(hparams, task_spec, hparams.embedding_dim)(x)
         
@@ -652,14 +654,14 @@ class Network(object):
 
     def update_params(self, updates: Any) -> None:
         # Update network weights internally.
-        self.params = jax.tree_map(lambda p, u: p + u, self.params, updates)
+        self.params = jax.tree.map(lambda p, u: p + u, self.params, updates)
 
     def copy(self):
         # Returns a copy of the network.
         net = Network(self.hparams, self.task_spec)
         net.representation = self.representation
         net.prediction = self.prediction
-        net.params = jax.tree_map(lambda p: p.copy(), self.params)
+        net.params = jax.tree.map(lambda p: p.copy(), self.params)
         return net
 
 
@@ -680,11 +682,11 @@ class UniformNetwork(object):
 
     def get_params(self):
         # Returns the weights of this network.
-        return self.params
+        return {}
 
     def update_params(self, updates: Any) -> None:
         # Update network weights internally.
-        self.params = jax.tree_map(lambda p, u: p + u, self.params, updates)
+        pass
 
     @property
     def training_steps(self) -> int:
@@ -2066,12 +2068,15 @@ def train_network(
     optimizer_state = optimizer.init(network.get_params())
 
     for i in range(config.training_steps): # insertion point for training pipeline
+        logger.info("Training step %d", i)
         network.training_steps = i # increment the training steps
         if i % config.checkpoint_interval == 0:
+            logger.info("Saving network at step %d", i)
             storage.save_network(i, network) # save the current network
         if i % config.target_network_interval == 0:
+            logger.info("Updating target network at step %d", i)
             target_network = network.copy() # update the bootstrap network
-        batch = replay_buffer.sample_batch(config.num_unroll_steps, config.td_steps)
+        batch = replay_buffer.sample_batch(config.num_simulations, config.td_steps)
         optimizer_state = _update_weights(
             optimizer, optimizer_state, network, target_network, batch)
     storage.save_network(config.training_steps, network)
@@ -2093,6 +2098,10 @@ def _loss_fn(
         # NOTE: re-compute the priors instead of using the cached ones
         # which is fine, we want the updated network to be used for each batch.
         predictions = network.inference(network_params, observation)
+        logger.debug("<train_label>")
+        logger.debug("loss_fn: prediction dict shapes %s", str({k:v.shape for k, v in predictions._asdict().items()}))
+        logger.debug("loss_fn: policy all zeros %s", (predictions.policy_logits == 0).all())
+        
         bootstrap_predictions = target_network.inference(
             target_network_params, bootstrap_obs)
         target_correctness, target_latency, target_policy, bootstrap_discount = (
