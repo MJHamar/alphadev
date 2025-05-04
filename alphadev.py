@@ -84,49 +84,83 @@ x86_signatures = {
     "cmovle" : (REG_T, REG_T),
     # skip jump instructions, they are not used in the published sort algorithms
     }
+x86_opcode2int = {
+    k: i for i, k in enumerate(x86_signatures.keys())
+}
 
-class RiscvAction(NamedTuple):
-    opcode: str
-    operands: Tuple[int, ...]
+
+class Action(object):
+    """Action representation."""
+
+    def __init__(self, index: int):
+        self.index = index
+
+    def __hash__(self):
+        return self.index
+
+    def __eq__(self, other):
+        return self.index == other.index
+
+    def __gt__(self, other):
+        return self.index > other.index
 
     def __repr__(self):
-        return f"RiscvAction(opcode={self.opcode}, operands={self.operands}"
+        return f"A({self.index})"
+
+class RiscvAction(Action):
+    def __init__(self, index: int,
+        opcode: str,
+        operands: Tuple[int, ...],
+                 ):
+        super().__init__(index)
+        self.opcode = opcode
+        self.operands = operands
+
+    def __repr__(self):
+        return f"RiscvAction(i={self.index}, opcode={self.opcode}, operands={self.operands}"
 
     def __str__(self):
         return f"{self.opcode} {', '.join(map(str, self.operands))}"
 
-def x86_to_riscv(x86_opcode, x86_operands, state):
-    """
-    Convert x86 opcode and operands to RISC-V opcode and operands.
-    Args:
-        x86_opcode (str): The x86 opcode.
-        x86_operands (list): The x86 operands.
-    Returns:
-        list: A list of RISC-V instructions. Using the conversion described above
-    """
-    if x86_opcode == "mv": # move between registers
-        return [RiscvAction("ADD", (x86_operands[0], X0, x86_operands[1]))]
-    elif x86_opcode == "lw": # load word from memory to register
-        return [RiscvAction("LW", (x86_operands[1], x86_operands[0], X0))] # rd,imm,rs -- rd, rs(imm)
-    elif x86_opcode == "sw": # store word from register to memory
-        return [RiscvAction("SW", (x86_operands[0], x86_operands[1], X0))] # rs1,imm,rs2 -- rs1, rs2(imm)
-    elif x86_opcode == "cmp": # compare two registers
-        return [RiscvAction("SUB", (X1, x86_operands[0], x86_operands[1]))]
-        # if A > B, then X1 > 0
-        # if A < B, then X1 < 0
-        # riscv has bge (>=) and blt (<) instructions
-    elif x86_opcode == "cmovg": # conditional move if greater than
-        return [ # A > B <=> B < A -- 0 < X1
-            RiscvAction("BLT", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A < B
-            RiscvAction("ADD", (x86_operands[1], X0, x86_operands[0]))  # copy C to D
-        ]
-    elif x86_opcode == "cmovle": # conditional move if less than or equal
-        return [ # A <= B <=> B >= A -- 0 >= X1
-            RiscvAction("BGE", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A > B
-            RiscvAction("ADD", (x86_operands[1], X0, x86_operands[0]))  # copy E to F
-        ]
-    else:
-        raise ValueError(f"Unknown opcode: {x86_opcode}")
+class x86Action(Action):
+    def __init__(self, index, 
+        opcode: str,
+        operands: Tuple[int, int]):
+        super().__init__(index)
+        self.opcode = opcode
+        self.operands = operands
+
+    def asm(self, state) -> List[RiscvAction]:
+        """
+        Convert x86 opcode and operands to RISC-V opcode and operands.
+        Args:
+            state: The current state of the CPU.
+        Returns:
+            list: A list of RISC-V instructions. Using the conversion described above
+        """
+        if self.opcode == "mv": # move between registers
+            return [RiscvAction("ADD", (self.operands[0], X0, self.operands[1]))]
+        elif self.opcode == "lw": # load word from memory to register
+            return [RiscvAction("LW", (self.operands[1], self.operands[0], X0))] # rd,imm,rs -- rd, rs(imm)
+        elif self.opcode == "sw": # store word from register to memory
+            return [RiscvAction("SW", (self.operands[0], self.operands[1], X0))] # rs1,imm,rs2 -- rs1, rs2(imm)
+        elif self.opcode == "cmp": # compare two registers
+            return [RiscvAction("SUB", (X1, self.operands[0], self.operands[1]))]
+            # if A > B, then X1 > 0
+            # if A < B, then X1 < 0
+            # riscv has bge (>=) and blt (<) instructions
+        elif self.opcode == "cmovg": # conditional move if greater than
+            return [ # A > B <=> B < A -- 0 < X1
+                RiscvAction("BLT", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A < B
+                RiscvAction("ADD", (self.operands[1], X0, self.operands[0]))  # copy C to D
+            ]
+        elif self.opcode == "cmovle": # conditional move if less than or equal
+            return [ # A <= B <=> B >= A -- 0 >= X1
+                RiscvAction("BGE", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A > B
+                RiscvAction("ADD", (self.operands[1], X0, self.operands[0]))  # copy E to F
+            ]
+        else:
+            raise ValueError(f"Unknown opcode: {self.opcode}")
 
 def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[int, int]]]:
     def apply_opcode(opcode: str, operands: Tuple[int, int, int]) -> List[Tuple[str, Tuple[int, int]]]:
@@ -148,7 +182,8 @@ def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[i
                     for opcode in x86_signatures.keys():
                         yield from apply_opcode(opcode, (i, j, k))
     #   logger.debug("Enumerating actions for max_reg=%d, max_mem=%d", max_reg, max_mem)
-    actions = list(set(enum_actions(max_reg, max_reg, max_mem)))
+    actions = set(enum_actions(max_reg, max_reg, max_mem))
+    actions = {i: x86Action(i, *action) for i, action in enumerate(actions)}
     #   logger.debug("Enumerated %d actions", len(actions))
     return actions
 
@@ -171,20 +206,20 @@ class ActionSpace(object):
 
 class x86ActionSpace(ActionSpace):
     def __init__(self,
-            actions: List[Callable[[Any],Tuple[str, Tuple[int, int]]]],
+            actions: Dict[int, Action],
             state: 'CPUState'):
         self._actions = actions
         self.state = state
     
     @property
     def actions(self):
-        return jnp.arange(len(self._actions))
+        return jnp.array(self._actions.keys())
     
     def __len__(self):
         return len(self._actions)
     
     def get(self, action_id: int) -> List[RiscvAction]:
-        return x86_to_riscv(*self._actions[action_id], self.state) # convert to RISC-V
+        return self._actions[action_id].asm(self.state) # convert to RISC-V
 
 class ActionSpaceStorage(object):
     # placeholder for now.
@@ -194,9 +229,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
     def __init__(self, max_reg: int, max_mem: int):
         self.max_reg = max_reg
         self.max_mem = max_mem
-        self.actions = x86_enumerate_actions(max_reg, max_mem)
+        self.actions: Dict[int, Action] = x86_enumerate_actions(max_reg, max_mem)
         # there is a single action space for the given task
-        self.action_space = x86ActionSpace # these are still x86 instructions
+        self.action_space_cls = x86ActionSpace # these are still x86 instructions
         # TODO: make sure we don't flood the memory with this
         self.masks = {}
         # for pruning the action space (one read and one write per memory location)
@@ -231,9 +266,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         mem_read_actions = jnp.zeros((action_space_size,), dtype=jnp.bool)
         # boolean mask for actions that write to memory locations
         mem_write_actions = jnp.zeros((action_space_size,), dtype=jnp.bool)
-        for i, action in enumerate(self.actions):
+        for i, action in enumerate(self.actions.items()):
             # iterate over the x86 instructions currently under consideration
-            x86_opcode, x86_operands = action
+            x86_opcode, x86_operands = action.opcode, action.operands
             signature = x86_signatures[x86_opcode]
             if signature == (REG_T, REG_T):
                 act_loc_table    = act_loc_table.at[x86_operands, i].set(True)
@@ -402,7 +437,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         return reg_only_mask | mem_read_mask | mem_write_mask
 
     def get_space(self, state) -> x86ActionSpace:
-        return self.action_space(self.actions, state)
+        return self.action_space_cls(self.actions, state)
 
 class IOExample(NamedTuple):
     inputs: jnp.ndarray # num_inputs x <sequence_length>
@@ -490,7 +525,7 @@ class AssemblyGame(object):
         self.previous_correct_items = 0
         self.expected_outputs = self.make_expected_outputs()
 
-    def step(self, action:'Action'):
+    def step(self, action:Action):
         action_space = self.storage.get_space(self.state())
         #   logger.debug("step: action index %s", action.index)
         instructions = action_space.get(action.index) # lookup x86 instructions and convert to riscv
@@ -587,25 +622,6 @@ class AssemblyGame(object):
 ############ 2. Networks ############
 
 ######## 2.1 Network helpers ########
-
-
-class Action(object):
-    """Action representation."""
-
-    def __init__(self, index: int):
-        self.index = index
-
-    def __hash__(self):
-        return self.index
-
-    def __eq__(self, other):
-        return self.index == other.index
-
-    def __gt__(self, other):
-        return self.index > other.index
-
-    def __repr__(self):
-        return f"A({self.index})"
 
 class NetworkOutput(NamedTuple):
     value: float
@@ -1568,12 +1584,6 @@ class ActionHistory(object):
     def to_play(self) -> Player:
         return Player()
 
-    def action_space(self) -> Sequence[Action]:
-        # NOTE: this is the original implementation.
-        # used during MCTS, we return the entire action space (no pruning).
-        # TODO: we might want to apply pruning here. See implementation of `Game.legal_actions`.
-        return [Action(i) for i in range(self.action_space_size)]
-
 
 class Target(NamedTuple):
     correctness_value: float
@@ -1644,7 +1654,7 @@ class Game(object):
         #         if actions_mask[i]:
         #                 logger.debug("  %s", space.get(action))
         
-        return [Action(a) for a in pruned_actions.tolist()]
+        return [self.action_space_storage.actions[a] for a in pruned_actions.tolist()]
 
     def apply(self, action: Action):
         _, reward = self.environment.step(action)
@@ -1883,12 +1893,13 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
             config,
             root,
             game.action_history(), # newly initialized action history at the current root
+            game.action_space_storage, # action space storage
             network,
             min_max_stats,
             game.environment,
         )
         # NOTE: make a move after the MCTS policy improvement step
-        action = _select_action(config, len(game.history), root, network)
+        action = _select_action(config, len(game.history), root, network, game.action_space_storage)
         logger.debug("play_game: selected action %s", action)
         game.apply(action) # step the environment
         game.store_search_statistics(root)
@@ -1899,6 +1910,7 @@ def run_mcts(
     config: AlphaDevConfig,
     root: Node,
     action_history: ActionHistory,
+    action_space_storage: x86ActionSpaceStorage, # NOTE: added this. also, type should be the superclass
     network: Network,
     min_max_stats: MinMaxStats,
     env: AssemblyGame,
@@ -1950,7 +1962,7 @@ def run_mcts(
             # pruning the action space during MCTS might entail a big overhead.
             # we need to experiment with this.
             # NOTE: for now, we go with AlphaDev's implementation of returning all actions.
-            node, history.to_play(), history.action_space(), network_output, reward
+            node, history.to_play(), action_space_storage.get_space(CPUState(**observation)), network_output, reward
         )
         _backpropagate(
             search_path,
@@ -1965,7 +1977,8 @@ def run_mcts(
 
 def _select_action(
     # pylint: disable-next=unused-argument
-    config: AlphaDevConfig, num_moves: int, node: Node, network: Network
+    config: AlphaDevConfig, num_moves: int, node: Node, network: Network,
+    action_space_storage: x86ActionSpaceStorage,
 ) -> Action:
     # logger.debug("select_action at node %s", node)
     visit_counts = jnp.array([
@@ -1977,7 +1990,7 @@ def _select_action(
     _, action = softmax_sample(visit_counts, t)
     # i.e. posterior probability based on the visit counts
     # logger.debug("select_action: selected action %s", action)
-    return Action(action)
+    return action_space_storage.actions[action]
 
 
 def _select_child(
@@ -1986,9 +1999,9 @@ def _select_child(
     """Selects the child with the highest UCB score."""
     scores = [(_ucb_score(config, node, child, min_max_stats), action, child)
         for action, child in node.children.items()]
-    unique_scores, unique_indices = numpy.unique(
-        [s[0] for s in scores], return_index=True
-    )
+    # unique_scores, unique_indices = numpy.unique(
+    #     [s[0] for s in scores], return_index=True
+    # )
     #   logger.debug("select_child: unique scores: %s", unique_scores)
     #   logger.debug("select_child: unique indices: %s", unique_indices)
     _, action, child = max(scores)
