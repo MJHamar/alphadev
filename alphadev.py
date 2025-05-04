@@ -1298,19 +1298,18 @@ class DistributionSupport(object):
         self.num_bins = num_bins
 
     def mean(self, logits: jnp.ndarray) -> float:
+        # logits has shape B x num_bins
         logger.debug("DistSup.mean compute twohot logits for %s", logits.shape)
-        twohot_logits = jnp.stack([
-            self.scalar_to_two_hot(i) for i in logits
-        ])
+        twohot_logits = self.scalar_to_two_hot(logits) # B x num_bins x num_bins
         logger.debug("DistSup.mean twohot logits shape %s", twohot_logits.shape)
-        sum_twohots = jnp.sum(twohot_logits, axis=1)
+        sum_twohots = jnp.sum(twohot_logits, axis=-1) # B x num_bins
         logger.debug("DistSup.mean sum_twohots shape %s", sum_twohots.shape)
         assert logits.shape == sum_twohots.shape, f"Logits shape {logits.shape} and sum_twohots shape {sum_twohots.shape} do not match."
-        mean = sum_twohots / jnp.sum(sum_twohots)
+        mean = sum_twohots / jnp.sum(sum_twohots) # B x num_bins
         logger.debug("DistSup.mean mean shape %s", mean.shape)
         return mean
 
-    def scalar_to_two_hot(self, scalar: float) -> jnp.ndarray:
+    def scalar_to_two_hot(self, scalar: jnp.ndarray) -> jnp.ndarray:
         """
         Converts a scalar to a two-hot encoding.
         Finds the two closest bins to the scalar (lower and upper) and
@@ -1319,29 +1318,26 @@ class DistributionSupport(object):
         # Bins are -probably- a linear interpolation between 0 and value_max
         # and we need to assign non-zero values to the two closest bins
         # based on proximity to the scalar.
-        toohot = jnp.zeros(self.num_bins, dtype=jnp.float32)
-        # bin indices correspond to scalar values uniformly
-        # distributed on the range [0,value_max]
-        # val(bin_i) = i * (value_max / num_bins)
-        # i = val(bin_i) * (value_max / num_bins)^-1
-        # logger.debug("scalar_to_two_hot: value_max %s, num_bins %s", self.value_max, self.num_bins)
-        step = self.value_max / self.num_bins
-        # logger.debug("scalar_to_two_hot:\n scalar %s,\n step %s", scalar, step)
-        low_bin = jnp.floor(scalar / step).astype(jnp.int32)
-        high_bin = jnp.ceil(scalar / step).astype(jnp.int32)
+        # input is B x num_bins
+        toohot = jnp.zeros((*scalar.shape, self.num_bins), dtype=jnp.float32) # B x num_bins x num_bins
+        
+        step = self.value_max / self.num_bins # scalar step size
+        
+        low_bin = jnp.floor(scalar / step).astype(jnp.int32) # B x num_bins
+        high_bin = jnp.ceil(scalar / step).astype(jnp.int32) # B x num_bins
         # low_bin and high_bin are the indices of the two closest bins
         # to the scalar value.
-        low_prox = jnp.abs(scalar - low_bin * step)
-        high_prox = jnp.abs(scalar - high_bin * step)
+        low_prox = jnp.abs(scalar - low_bin * step) # B x num_bins
+        high_prox = jnp.abs(scalar - high_bin * step) # B x num_bins
         # low_prox and high_prox are the distances from the scalar
         # to the two closest bins.
-        low_weight = 1 - low_prox / (low_prox + high_prox)
+        low_weight = 1 - low_prox / (low_prox + high_prox) 
         high_weight = 1 - low_weight
         
-        # # logger.debug("scalar_to_two_hot:\n scalar %s,\n low_bin %s,\n high_bin %s,\n low_prox %s,\n high_prox %s\n low_weight %s\n high_weight %s ", scalar, low_bin, high_bin, low_prox, high_prox, low_weight, high_weight)
+        # logger.debug("scalar_to_two_hot:\n scalar %s,\n low_bin %s,\n high_bin %s,\n low_prox %s,\n high_prox %s\n low_weight %s\n high_weight %s ", scalar.shape, low_bin.shape, high_bin.shape, low_prox.shape, high_prox.shape, low_weight.shape, high_weight.shape)
         
-        toohot = toohot.at[low_bin].set(low_weight)
-        toohot = toohot.at[high_bin].set(high_weight)
+        toohot = toohot.at[:, :, low_bin].set(low_weight)
+        toohot = toohot.at[:, :, high_bin].set(high_weight)
         
         # logger.debug("scalar_to_two_hot: sum = %s", jnp.sum(toohot))
         
@@ -1367,7 +1363,8 @@ class CategoricalHead(hk.Module):
         # For training returns the logits, for inference the mean.
         logits = self._head(x) # project the embedding to the value support's numbeer of bins 
         probs = jax.nn.softmax(logits) # take softmax
-        mean = jax.vmap(self._value_support.mean)(probs) # compute the mean
+        logger.debug("CategoricalHead: logits shape %s, probs shape %s", logits.shape, probs.shape)
+        mean = self._value_support.mean(probs) # compute the mean
         return dict(logits=logits, mean=mean)
 
 class PredictionNet(hk.Module):
@@ -2195,8 +2192,9 @@ def _loss_fn(
     # which is fine, we want the updated network to be used for each batch.
     predictions = network.inference(network_params, observation, action_space)
     logger.debug("<train_label>")
-    logger.debug("loss_fn: prediction dict shapes %s", str({k:v.shape for k, v in predictions._asdict().items()}))
-    logger.debug("loss_fn: policy all zeros %s", (predictions.policy_logits == 0).all())
+    logger.debug("loss_fn: prediction dict shapes %s", str({k:v.shape for k, v in predictions._asdict().items() if isinstance(v, jnp.ndarray)}))
+    logger.debug("loss_fn: policy all zeros %s", (
+        jnp.array([v for v in predictions.policy_logits.values()]) == 0).all())
     
     # TODO: understand the impact of having potentially
     # different action spaces for network and target network.
