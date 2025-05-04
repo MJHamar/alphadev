@@ -55,12 +55,12 @@ logger = logging.getLogger(__name__)
 
 
 class CPUState(NamedTuple):
-    registers: jnp.ndarray
-    memory: jnp.ndarray
-    register_mask: jnp.ndarray
-    memory_mask: jnp.ndarray
-    program: jnp.ndarray
-    program_length: int
+    registers: jnp.ndarray # num_inputs x num_regs current state of the registers in each cpu
+    memory: jnp.ndarray # num_inputs x mem_size current state of the memory in each cpu
+    register_mask: jnp.ndarray # num_inputs x num_regs active registers in each cpu
+    memory_mask: jnp.ndarray # num_inputs x mem_size active memory in each cpu
+    program: jnp.ndarray # current program applied to all inputs
+    program_length: jnp.ndarray # current position of the program counter for different inputs
     
     def __hash__(self):
         return hash(self.register_mask.tobytes() + self.memory_mask.tobytes())
@@ -454,6 +454,8 @@ class AssemblyGame(object):
         def register_mask(self): return self.emulator.register_mask
         @property
         def memory_mask(self): return self.emulator.memory_mask
+        @property
+        def program_counter(self): return self.emulator.program_counter
 
         def measure_latency(self) -> float:
             """Measure the latency of a program."""
@@ -494,7 +496,7 @@ class AssemblyGame(object):
             register_mask=jnp.array(self.simulator.register_mask),
             memory_mask=jnp.array(self.simulator.memory_mask),
             program=self.program,
-            program_length=len(self.program),
+            program_length=jnp.array(self.simulator.program_counter),
         )
 
     def observation(self):
@@ -620,12 +622,12 @@ class Network(object):
         # We need dummy inputs to initialize the networks
         # Observation has four fields:
         #    - program: shape (1, max_program_size, 3) -- opcode, arg1, arg2 in range [0, num_regs + num_mem)] # TODO: ensure memory offset
-        #    - program_length: shape (1,) -- can be used to maks the program
+        #    - program_length: shape (num_inputs,) -- can be used to maks the program
         #    - registers: shape (1, num_inputs, num_regs)
         #    - memory: shape (1, num_inputs, num_mem)
         dummy_obs = {
             'program': jnp.zeros((1, task_spec.max_program_size, 3), dtype=jnp.int32),
-            'program_length': jnp.zeros((1,), dtype=jnp.int32),
+            'program_length': jnp.zeros((1,task_spec.num_inputs,), dtype=jnp.int32) + 3,
             'registers': jnp.zeros((1, task_spec.num_inputs, task_spec.num_regs), dtype=jnp.int32),
             'memory': jnp.zeros((1, task_spec.num_inputs, task_spec.num_mem), dtype=jnp.int32),
         }
@@ -728,14 +730,25 @@ class MultiQueryAttentionBlock(hk.Module):
         K = self._linear_projection(inputs, 1, self.head_depth, name='P_k') # B x M x K
         V = self._linear_projection(inputs, 1, self.head_depth, name='P_v') # B x M x V
         
+        logger.debug("MQAB: logits einsum Q (bnhk) %s, K (bmk) %s -> bhnm", Q.shape, K.shape)
         logits = jnp.einsum("bnhk,bmk->bhnm", Q, K) # B x N x H x M
+        logger.debug("MQAB: logits shape (bhnm) %s", logits.shape)
         weights = jax.nn.softmax(logits) # NOTE: no causal masking, this is an encoder block
-        if self.attention_dropout > 0:
+        logger.debug("MQAB: weights shape (bhnm) %s", weights.shape)
+        if self.attention_dropout: # boolean
+            logger.debug("MQAB: applying attention dropout %s", self.attention_dropout)
             weights = hk.dropout(hk.next_rng_key(), self.attention_dropout, weights)
-        
+        logger.debug("MQAB: output projection einsum weights (bhnm) %s, V (bmv) %s -> bhnv", weights.shape, V.shape)
         O = jnp.einsum("bhnm,bmv->bhnv", weights, V) # B x N x H x V
-        Y = self._linear_projection(O, 1, self.head_depth, name='P_o') # B x N x V
-        
+        logger.debug("MQAB: O shape (bhnv) %s", O.shape)
+        B, _, N, _ = O.shape # B x H x N x V
+        # reshape O to B x N x (H*V)
+        O = O.reshape((B, N, -1)) # B x N x (H*V)
+        logger.debug("MQAB: O reshaped to %s", O.shape)
+        # apply the output projection
+        logger.debug("MQAB: aggregate head projection bn[h*v] %s to bnd %s ", O.shape, inputs.shape)
+        Y = self._linear_projection(O, 1, inputs.shape[-1], name='P_o') # B x N x V
+        logger.debug("MQAB: output shape (bnd) %s", Y.shape)
         assert Y.shape == inputs.shape, f"Output shape {Y.shape} does not match input shape {inputs.shape}."
         
         return Y # B x N x D
@@ -743,15 +756,20 @@ class MultiQueryAttentionBlock(hk.Module):
     @hk.transparent
     def _linear_projection(
         self,
-        x: jax.Array,
-        num_heads: int, # added this one
+        x: jax.Array, # [B, N, D] (batch, seqence length, embedding dim)
+        num_heads: int,
         head_size: int,
         name: str | None = None,
     ) -> jax.Array:
         """Copy-paste from hhk.MultiHeadAttention."""
-        y = hk.Linear(num_heads * head_size, name=name)(x)
-        *leading_dims, _ = x.shape
+        y = hk.Linear(num_heads * head_size, name=name)(x) # proj mat. D x (H*K) 
+        # y should be [B, N, H*K]
+        assert y.ndim == 3, f"y should be 3D, but got {y.ndim}D"
+        assert y.shape[-1] == num_heads * head_size, f"y should be of shape [B, N, H*K], but got {y.shape}"
+        *leading_dims, _ = x.shape # [B, N, D]
+        # split last dimension (H*K) into H, K
         new_shape = (*leading_dims, num_heads, head_size) if num_heads > 1 else (*leading_dims, head_size)
+        logger.debug("linear_projection, reshaping y from %s to %s", y.shape, new_shape)
         return y.reshape(new_shape) # [B, N, H, K] or [B, N, K]
 
     def sinusoid_position_encoding(seq_size, feat_size):
@@ -1043,7 +1061,9 @@ class RepresentationNet(hk.Module):
         self, program_encoding, batch_size, program_length, max_program_size
     ):
         """Pads the program encoding to account for state-action stagger."""
+        logger.debug("pad_program_encoding shape %s", program_encoding.shape)
         chex.assert_shape(program_encoding, (batch_size, max_program_size, None))
+        chex.assert_shape(program_length, (batch_size, self._task_spec.num_inputs))
 
         empty_program_output = jnp.zeros(
             [batch_size, program_encoding.shape[-1]],
@@ -1053,10 +1073,12 @@ class RepresentationNet(hk.Module):
         )
 
         program_length_onehot = jax.nn.one_hot(program_length, max_program_size + 1)
-
+        logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
+        logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
         program_encoding = jnp.einsum(
             'bnd,bNn->bNd', program_encoding, program_length_onehot
         )
+        logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
 
         return program_encoding
 
@@ -1067,10 +1089,10 @@ class RepresentationNet(hk.Module):
         logger.debug("apply_program_mlp_embedder program shape %s, embedding_dim %s", program_encoding.shape, self._embedding_dim)
         program_embedder = hk.Sequential(
             [
-                hk.Linear(self._embedding_dim),
+                hk.Linear(self._embedding_dim), # (nF + 2*nL) x D -- input size is decided automatically
                 hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
                 jax.nn.relu,
-                hk.Linear(self._embedding_dim),
+                hk.Linear(self._embedding_dim), # D x D
             ],
             name='per_instruction_program_embedder',
         )
@@ -1082,6 +1104,16 @@ class RepresentationNet(hk.Module):
 
     def apply_program_attention_embedder(self, program_encoding):
         logger.debug("apply_program_attention_embedder program shape %s", program_encoding.shape)
+        # input is B x P x D (batch, program length, embedding dim)
+        # output is B x P x D
+        _, program_length, d = program_encoding.shape
+        assert program_length == self._task_spec.max_program_size, (
+            f"program length {program_length} does not match max program size "
+            f"{self._task_spec.max_program_size}"
+        )
+        assert d == self._embedding_dim, (
+            f"program encoding dim {d} does not match embedding dim {self._embedding_dim}"
+        ) 
         attention_params = self._hparams.representation.attention
         make_attention_block = functools.partial(
             MultiQueryAttentionBlock, attention_params
@@ -1104,6 +1136,7 @@ class RepresentationNet(hk.Module):
         for e in attention_encoders:
             logger.debug("apply_program_attention_embedder layer %s", e.name)
             program_encoding = e(program_encoding, encoded_state=None)
+        logger.debug("apply_program_attention_embedder post MQAB %s", program_encoding.shape)
 
         return program_encoding
 
