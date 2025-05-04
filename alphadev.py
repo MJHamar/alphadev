@@ -130,40 +130,41 @@ class x86Action(Action):
         self.opcode = opcode
         self.operands = operands
 
-    def asm(self, state) -> List[RiscvAction]:
-        """
-        Convert x86 opcode and operands to RISC-V opcode and operands.
-        Args:
-            state: The current state of the CPU.
-        Returns:
-            list: A list of RISC-V instructions. Using the conversion described above
-        """
-        if self.opcode == "mv": # move between registers
-            return [RiscvAction(self.index, "ADD", (self.operands[0], X0, self.operands[1]))]
-        elif self.opcode == "lw": # load word from memory to register
-            return [RiscvAction(self.index, "LW", (self.operands[1], self.operands[0], X0))] # rd,imm,rs -- rd, rs(imm)
-        elif self.opcode == "sw": # store word from register to memory
-            return [RiscvAction(self.index, "SW", (self.operands[0], self.operands[1], X0))] # rs1,imm,rs2 -- rs1, rs2(imm)
-        elif self.opcode == "cmp": # compare two registers
-            return [RiscvAction(self.index, "SUB", (X1, self.operands[0], self.operands[1]))]
-            # if A > B, then X1 > 0
-            # if A < B, then X1 < 0
-            # riscv has bge (>=) and blt (<) instructions
-        elif self.opcode == "cmovg": # conditional move if greater than
-            return [ # A > B <=> B < A -- 0 < X1
-                RiscvAction(self.index, "BLT", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A < B
-                RiscvAction(self.index, "ADD", (self.operands[1], X0, self.operands[0]))  # copy C to D
-            ]
-        elif self.opcode == "cmovle": # conditional move if less than or equal
-            return [ # A <= B <=> B >= A -- 0 >= X1
-                RiscvAction(self.index, "BGE", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A > B
-                RiscvAction(self.index, "ADD", (self.operands[1], X0, self.operands[0]))  # copy E to F
-            ]
-        else:
-            raise ValueError(f"Unknown opcode: {self.opcode}")
 
     def to_numpy(self):
         return jnp.array([x86_opcode2int[self.opcode], *self.operands], dtype=jnp.int32)
+
+def x86_to_riscv(action:x86Action, state:CPUState, mem_offset:int) -> List[RiscvAction]:
+    """
+    Convert x86 opcode and operands to RISC-V opcode and operands.
+    Args:
+        state: The current state of the CPU.
+    Returns:
+        list: A list of RISC-V instructions. Using the conversion described above
+    """
+    if action.opcode == "mv": # move between registers
+        return [RiscvAction(action.index, "ADD", (action.operands[0], X0, action.operands[1]))]
+    elif action.opcode == "lw": # load word from memory to register
+        return [RiscvAction(action.index, "LW", (action.operands[1], action.operands[0]-mem_offset, X0))] # rd,imm,rs -- rd, rs(imm)
+    elif action.opcode == "sw": # store word from register to memory
+        return [RiscvAction(action.index, "SW", (action.operands[0], action.operands[1]-mem_offset, X0))] # rs1,imm,rs2 -- rs1, rs2(imm)
+    elif action.opcode == "cmp": # compare two registers
+        return [RiscvAction(action.index, "SUB", (X1, action.operands[0], action.operands[1]))]
+        # if A > B, then X1 > 0
+        # if A < B, then X1 < 0
+        # riscv has bge (>=) and blt (<) instructions
+    elif action.opcode == "cmovg": # conditional move if greater than
+        return [ # A > B <=> B < A -- 0 < X1
+            RiscvAction(action.index, "BLT", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A < B
+            RiscvAction(action.index, "ADD", (action.operands[1], X0, action.operands[0]))  # copy C to D
+        ]
+    elif action.opcode == "cmovle": # conditional move if less than or equal
+        return [ # A <= B <=> B >= A -- 0 >= X1
+            RiscvAction(action.index, "BGE", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A > B
+            RiscvAction(action.index, "ADD", (action.operands[1], X0, action.operands[0]))  # copy E to F
+        ]
+    else:
+        raise ValueError(f"Unknown opcode: {action.opcode}")
 
 def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[int, int]]]:
     def apply_opcode(opcode: str, operands: Tuple[int, int, int]) -> List[Tuple[str, Tuple[int, int]]]:
@@ -180,7 +181,7 @@ def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[i
     def enum_actions(r1: int, r2: int, m: int) -> Generator[Tuple[str, Tuple[int, int]], None, None]:
         for i in range(r1):
             for j in range(r2):
-                for k in range(m):
+                for k in range(max_reg, max_reg + m): # offset the memory locations
                     # generate all combinations of registers and memory
                     for opcode in x86_signatures.keys():
                         yield from apply_opcode(opcode, (i, j, k))
@@ -210,9 +211,11 @@ class ActionSpace(object):
 class x86ActionSpace(ActionSpace):
     def __init__(self,
             actions: Dict[int, Action],
-            state: 'CPUState'):
+            state: 'CPUState',
+            mem_offset: int = 0):
         self._actions = actions
         self.state = state
+        self.mem_offset = mem_offset
     
     @property
     def actions(self):
@@ -222,7 +225,7 @@ class x86ActionSpace(ActionSpace):
         return len(self._actions)
     
     def get(self, action_id: int) -> List[RiscvAction]:
-        return self._actions[action_id].asm(self.state) # convert to RISC-V
+        return x86_to_riscv(self._actions[action_id], self.state, self.mem_offset) # convert to RISC-V
 
 class ActionSpaceStorage(object):
     # placeholder for now.
@@ -440,7 +443,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         return reg_only_mask | mem_read_mask | mem_write_mask
 
     def get_space(self, state) -> x86ActionSpace:
-        return self.action_space_cls(self.actions, state)
+        return self.action_space_cls(self.actions, state, self.max_reg)
 
 class IOExample(NamedTuple):
     inputs: jnp.ndarray # num_inputs x <sequence_length>
