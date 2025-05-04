@@ -618,12 +618,18 @@ class Network(object):
         # Initialize parameters using PRNGKeys
         rep_key, pred_key = jax.random.split(jax.random.PRNGKey(42), 2)
         # We need dummy inputs to initialize the networks
+        # Observation has four fields:
+        #    - program: shape (1, max_program_size, 3) -- opcode, arg1, arg2 in range [0, num_regs + num_mem)] # TODO: ensure memory offset
+        #    - program_length: shape (1,) -- can be used to maks the program
+        #    - registers: shape (1, num_inputs, num_regs)
+        #    - memory: shape (1, num_inputs, num_mem)
         dummy_obs = {
             'program': jnp.zeros((1, task_spec.max_program_size, 3), dtype=jnp.int32),
             'program_length': jnp.zeros((1,), dtype=jnp.int32),
             'registers': jnp.zeros((1, task_spec.num_inputs, task_spec.num_regs), dtype=jnp.int32),
             'memory': jnp.zeros((1, task_spec.num_inputs, task_spec.num_mem), dtype=jnp.int32),
         }
+        logger.debug("init_params: dummy_obs %s", str({k:v.shape for k,v in dummy_obs.items()}))
         self.params = {
             'representation': self.representation.init(rep_key, dummy_obs),
             'prediction': self.prediction.init(pred_key, jnp.zeros((1, hparams.embedding_dim))),
@@ -888,6 +894,7 @@ class RepresentationNet(hk.Module):
         self._embedding_dim = embedding_dim
 
     def __call__(self, inputs):
+        logger.debug("representation_net program shape %s", inputs['program'].shape)
         # inputs is the observation dict
         batch_size = inputs['program'].shape[0]
 
@@ -924,8 +931,9 @@ class RepresentationNet(hk.Module):
         )
 
     def _encode_program(self, inputs, batch_size):
+        logger.debug("encode_program shape %s", inputs['program'].shape)
         program = inputs['program']
-        max_program_size = inputs['program'].shape[1]
+        max_program_size = inputs['program'].shape[1] # TODO: this might not be a constant
         program_length = inputs['program_length'].astype(jnp.int32)
         program_onehot = self.make_program_onehot(
             program, batch_size, max_program_size
@@ -1016,16 +1024,19 @@ class RepresentationNet(hk.Module):
         return joint_encoding
 
     def make_program_onehot(self, program, batch_size, max_program_size):
+        logger.debug("make_program_onehot shape %s", program.shape)
         func = program[:, :, 0] # the opcode -- int
         arg1 = program[:, :, 1] # the first operand -- int 
         arg2 = program[:, :, 2] # the second operand -- int
         func_onehot = jax.nn.one_hot(func, self._task_spec.num_funcs)
         arg1_onehot = jax.nn.one_hot(arg1, self._task_spec.num_locations)
         arg2_onehot = jax.nn.one_hot(arg2, self._task_spec.num_locations)
+        logger.debug("func %s, arg1 %s, arg2 %s", func_onehot.shape, arg1_onehot.shape, arg2_onehot.shape)
         program_onehot = jnp.concatenate(
             [func_onehot, arg1_onehot, arg2_onehot], axis=-1
         )
         chex.assert_shape(program_onehot, (batch_size, max_program_size, None))
+        logger.debug("program_onehot shape %s", program_onehot.shape)
         return program_onehot
 
     def pad_program_encoding(
@@ -1050,6 +1061,10 @@ class RepresentationNet(hk.Module):
         return program_encoding
 
     def apply_program_mlp_embedder(self, program_encoding):
+        # input: B x P x (num_funcs + 2 * num_locations)
+        # output: B x P x embedding_dim
+        # P is the program length
+        logger.debug("apply_program_mlp_embedder program shape %s, embedding_dim %s", program_encoding.shape, self._embedding_dim)
         program_embedder = hk.Sequential(
             [
                 hk.Linear(self._embedding_dim),
@@ -1059,12 +1074,14 @@ class RepresentationNet(hk.Module):
             ],
             name='per_instruction_program_embedder',
         )
-
+        logger.debug("program.shape %s -->", program_encoding.shape)
+        logger.debug("  program_embedder %s", program_embedder)
         program_encoding = program_embedder(program_encoding)
+        logger.debug("program_encoding shape %s <--", program_encoding.shape)
         return program_encoding
 
     def apply_program_attention_embedder(self, program_encoding):
-        logger.debug("apply_program_attention_embedder")
+        logger.debug("apply_program_attention_embedder program shape %s", program_encoding.shape)
         attention_params = self._hparams.representation.attention
         make_attention_block = functools.partial(
             MultiQueryAttentionBlock, attention_params
@@ -1324,7 +1341,7 @@ class AlphaDevConfig(object):
         self.checkpoint_interval = 500
         self.target_network_interval = 100
         self.window_size = int(1e6)
-        self.batch_size = 512
+        self.batch_size = 1
         self.td_steps = 5
         self.lr_init = 2e-4
         self.momentum = 0.9
