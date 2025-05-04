@@ -351,7 +351,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # we consider the largest window of active registers and memory locations
         # so we take their union
         active_registers = state.register_mask # shape E x R+(unused) # TODO: we might want to let the emulator know
-        active_registers = jnp.any(active_registers, axis=0)[:self.max_reg] # shape R
+        active_registers = jnp.any(active_registers, axis=0) # shape R
         active_memory = state.memory_mask      # shape E x M
         active_memory = jnp.any(active_memory, axis=0) # shape M
 
@@ -539,13 +539,21 @@ class AssemblyGame(object):
     def state(self) -> CPUState:
         # convert from numpy to jax.numpy arrays
         state = CPUState(
-            registers=jnp.array(self.simulator.registers),
+            registers=jnp.array(self.simulator.registers)[:, :self.task_spec.num_regs],
             memory=jnp.array(self.simulator.memory),
-            register_mask=jnp.array(self.simulator.register_mask),
+            register_mask=jnp.array(self.simulator.register_mask)[:, :self.task_spec.num_regs],
             memory_mask=jnp.array(self.simulator.memory_mask),
             program=jnp.array([p.to_numpy() for p in self.program]),
             program_length=jnp.array(self.simulator.program_counter),
         )
+        assert state.registers.shape == (self.task_spec.num_inputs, self.task_spec.num_regs), \
+            "registers shape mismatch: %s expected %s" % (state.registers.shape, self.task_spec.num_regs)
+        assert state.register_mask.shape == (self.task_spec.num_inputs, self.task_spec.num_regs), \
+            "register mask shape mismatch: %s expected %s" % (state.register_mask.shape, self.task_spec.num_regs)
+        assert state.memory.shape == (self.task_spec.num_inputs, self.task_spec.num_mem), \
+            "memory shape mismatch: %s expected %s" % (state.memory.shape, self.task_spec.num_mem)
+        assert state.memory_mask.shape == (self.task_spec.num_inputs, self.task_spec.num_mem), \
+            "memory mask shape mismatch: %s expected %s" % (state.memory_mask.shape, self.task_spec.num_mem)
         # logger.debug("AssemblyGame: state program %s", state.program.shape)
         return state
 
