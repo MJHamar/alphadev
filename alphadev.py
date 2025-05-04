@@ -139,25 +139,25 @@ class x86Action(Action):
             list: A list of RISC-V instructions. Using the conversion described above
         """
         if self.opcode == "mv": # move between registers
-            return [RiscvAction("ADD", (self.operands[0], X0, self.operands[1]))]
+            return [RiscvAction(self.index, "ADD", (self.operands[0], X0, self.operands[1]))]
         elif self.opcode == "lw": # load word from memory to register
-            return [RiscvAction("LW", (self.operands[1], self.operands[0], X0))] # rd,imm,rs -- rd, rs(imm)
+            return [RiscvAction(self.index, "LW", (self.operands[1], self.operands[0], X0))] # rd,imm,rs -- rd, rs(imm)
         elif self.opcode == "sw": # store word from register to memory
-            return [RiscvAction("SW", (self.operands[0], self.operands[1], X0))] # rs1,imm,rs2 -- rs1, rs2(imm)
+            return [RiscvAction(self.index, "SW", (self.operands[0], self.operands[1], X0))] # rs1,imm,rs2 -- rs1, rs2(imm)
         elif self.opcode == "cmp": # compare two registers
-            return [RiscvAction("SUB", (X1, self.operands[0], self.operands[1]))]
+            return [RiscvAction(self.index, "SUB", (X1, self.operands[0], self.operands[1]))]
             # if A > B, then X1 > 0
             # if A < B, then X1 < 0
             # riscv has bge (>=) and blt (<) instructions
         elif self.opcode == "cmovg": # conditional move if greater than
             return [ # A > B <=> B < A -- 0 < X1
-                RiscvAction("BLT", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A < B
-                RiscvAction("ADD", (self.operands[1], X0, self.operands[0]))  # copy C to D
+                RiscvAction(self.index, "BLT", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A < B
+                RiscvAction(self.index, "ADD", (self.operands[1], X0, self.operands[0]))  # copy C to D
             ]
         elif self.opcode == "cmovle": # conditional move if less than or equal
             return [ # A <= B <=> B >= A -- 0 >= X1
-                RiscvAction("BGE", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A > B
-                RiscvAction("ADD", (self.operands[1], X0, self.operands[0]))  # copy E to F
+                RiscvAction(self.index, "BGE", (0, X1, 4*len(state.program)+8)),  # skip next instruction if A > B
+                RiscvAction(self.index, "ADD", (self.operands[1], X0, self.operands[0]))  # copy E to F
             ]
         else:
             raise ValueError(f"Unknown opcode: {self.opcode}")
@@ -213,7 +213,7 @@ class x86ActionSpace(ActionSpace):
     
     @property
     def actions(self):
-        return jnp.array(self._actions.keys())
+        return jnp.array(list(self._actions.keys()))
     
     def __len__(self):
         return len(self._actions)
@@ -266,7 +266,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         mem_read_actions = jnp.zeros((action_space_size,), dtype=jnp.bool)
         # boolean mask for actions that write to memory locations
         mem_write_actions = jnp.zeros((action_space_size,), dtype=jnp.bool)
-        for i, action in enumerate(self.actions.items()):
+        for i, action in enumerate(self.actions.values()):
             # iterate over the x86 instructions currently under consideration
             x86_opcode, x86_operands = action.opcode, action.operands
             signature = x86_signatures[x86_opcode]
@@ -705,7 +705,7 @@ class UniformNetwork(object):
     """Network representation that returns uniform output."""
     # NOTE: this module is returned instead of the Network in case no parameters are in the buffer.
     # pylint: disable-next=unused-argument
-    def inference(self, observation, action_space) -> NetworkOutput:
+    def inference(self, observation, action_space: x86ActionSpace) -> NetworkOutput:
         # representation + prediction function
         return NetworkOutput(
             value=jax.random.uniform(jax.random.PRNGKey(0), minval=-1.0, maxval=1.0),
@@ -1677,7 +1677,7 @@ class Game(object):
                 root.children[a].visit_count / sum_visits
                 if a in root.children
                 else 0
-                for a in action_space
+                for a in action_space.values()
             ]
         )
         self.root_values.append(root.value())
@@ -1969,7 +1969,7 @@ def run_mcts(
             # pruning the action space during MCTS might entail a big overhead.
             # we need to experiment with this.
             # NOTE: for now, we go with AlphaDev's implementation of returning all actions.
-            node, history.to_play(), action_space, network_output, reward
+            node, history.to_play(), list(action_space._actions.values()), network_output, reward
         )
         _backpropagate(
             search_path,
@@ -2056,9 +2056,9 @@ def _expand_node(
     for action, p in policy.items():
         node.children[action] = Node(p / policy_sum)
     #   logger.debug("Expanded node: %s", node)
-    unique_scores, unique_indices = numpy.unique(
-        [c.prior for c in node.children.values()], return_index=True
-    )
+    # unique_scores, unique_indices = numpy.unique(
+    #     [c.prior for c in node.children.values()], return_index=True
+    # )
     #   logger.debug("expand: unique scores: %s", unique_scores)
     #   logger.debug("expand: unique indices: %s", unique_indices)
 
