@@ -546,7 +546,7 @@ class AssemblyGame(object):
             program=jnp.array([p.to_numpy() for p in self.program]),
             program_length=jnp.array(self.simulator.program_counter),
         )
-        logger.debug("AssemblyGame: state program %s", state.program.shape)
+        # logger.debug("AssemblyGame: state program %s", state.program.shape)
         return state
 
     def observation(self):
@@ -1446,6 +1446,8 @@ class AlphaDevConfig(object):
         self.pb_c_init = 1.25
 
         self.known_bounds = KnownBounds(-6.0, 6.0)
+        
+        self.padding_token = 0
 
         # Environment: spec of the Variable Sort 3 task
         self.task_spec = TaskSpec(
@@ -1489,7 +1491,7 @@ class AlphaDevConfig(object):
         self.checkpoint_interval = 500
         self.target_network_interval = 100
         self.window_size = int(1e6)
-        self.batch_size = 1
+        self.batch_size = 2
         self.td_steps = 5
         self.lr_init = 2e-4
         self.momentum = 0.9
@@ -1599,6 +1601,9 @@ class Sample(NamedTuple):
     observation: Dict[str, jnp.ndarray]
     bootstrap_observation: Dict[str, jnp.ndarray]
     target: Target
+
+class SampleBatch(Sample): # type hinting
+    pass
 
 
 class Game(object):
@@ -1718,10 +1723,10 @@ class Game(object):
 
         # NOTE: this is a TD(n) target
         return Target(
-            value,
-            self.latency_reward, # =0 unless the game is finished
-            self.child_visits[state_index],
-            bootstrap_discount,
+            correctness_value=value,
+            latency_value=self.latency_reward, # =0 unless the game is finished
+            policy=jnp.array(self.child_visits[state_index]),
+            bootstrap_discount=bootstrap_discount,
         )
 
     def to_play(self) -> Player:
@@ -1737,6 +1742,8 @@ class ReplayBuffer(object):
     def __init__(self, config: AlphaDevConfig):
         self.window_size = config.window_size
         self.batch_size = config.batch_size
+        self.max_program_size = config.task_spec.max_program_size
+        self.padding_token = config.padding_token
         self.buffer = []
 
     def save_game(self, game):
@@ -1746,20 +1753,47 @@ class ReplayBuffer(object):
         assert len(self.buffer) <= self.window_size+10, \
             f"Replay buffer size growing uncontrollably: {len(self.buffer)} > {self.window_size}"
 
-    def sample_batch(self, td_steps: int) -> Sequence[Sample]:
+    def sample_batch(self, td_steps: int) -> SampleBatch:
         games = [self.sample_game() for _ in range(self.batch_size)]
         game_pos = [(g, self.sample_position(g)) for g in games]
         # pylint: disable=g-complex-comprehension
-        # FIXME: there is no batching here...
-        return [
-            Sample(
-                observation=g.make_observation(i), # NOTE: this re-computes the game from scratch each time.
-                bootstrap_observation=g.make_observation(i + td_steps),
-                target=g.make_target(i, td_steps, g.to_play()),
-            )
-            for (g, i) in game_pos
-        ]
+        observation_batch = []
+        bootstrap_observation_batch = []
+        target_batch = []
+        for g, pos in game_pos:
+            observation_batch.append(self._process_observation(g.make_observation(pos)))
+            bootstrap_observation_batch.append(self._process_observation(g.make_observation(pos + td_steps)))
+            target_batch.append(g.make_target(pos, td_steps, g.to_play())._asdict())
+            # logger.debug("ReplayBuffer.sample_batch: observation %s", observation_batch[-1])
+            # logger.debug("ReplayBuffer.sample_batch: bootstrap_observation %s", bootstrap_observation_batch[-1])
+            # logger.debug("ReplayBuffer.sample_batch: target %s", target_batch[-1])
+        
+        return SampleBatch(
+            observation=self._collate_batch(observation_batch),
+            bootstrap_observation=self._collate_batch(bootstrap_observation_batch),
+            target=Target(**self._collate_batch(target_batch)),
+        )
         # pylint: enable=g-complex-comprehension
+    
+    def _collate_batch(self, batch: Sequence[Dict[str, jnp.ndarray]]) -> Dict[str, jnp.ndarray]:
+        # Collate a batch of dictionaries into a single dictionary.
+        collated = {}
+        for k in batch[0].keys():
+            collated[k] = jnp.stack([b[k] for b in batch])
+        return collated
+    
+    def _process_observation(self, observation: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
+        # pad the program encoding to the max program length
+        program = observation['program']
+        # program shape is p x 3, we want to return P x 3, where P is the max program size and p is the current proogram length
+        padded_program = jnp.pad(
+            program, ((0, self.max_program_size - program.shape[0]), (0, 0)),
+            mode='constant', constant_values=self.padding_token
+        )
+        assert padded_program.shape == (self.max_program_size,3), \
+            f"Expected padded program shape {(self.max_program_size,3)}, got {padded_program.shape}"
+        observation['program'] = padded_program
+        return observation
 
     def sample_game(self) -> Game:
         # sample an index uniformly
@@ -2137,41 +2171,40 @@ def _loss_fn(
     target_network_params: jnp.array,
     network: Network,
     target_network: Network,
-    batch: Sequence[Sample],
-    action_space_storage: ActionSpaceStorage
+    batch: SampleBatch,
+    action_space_storage: x86ActionSpaceStorage
 ) -> float:
     """Computes loss."""
     loss = 0
-    for observation, bootstrap_obs, target in batch:
-        # FIXME: we process the elements in the batch one by one. there is also no batch dimension this way.
+    observation, bootstrap_obs, target = batch
 
-        state = CPUState(**observation)
-        action_space = action_space_storage.get_space(state)
-        # NOTE: re-compute the priors instead of using the cached ones
-        # which is fine, we want the updated network to be used for each batch.
-        predictions = network.inference(network_params, observation, action_space)
-        logger.debug("<train_label>")
-        logger.debug("loss_fn: prediction dict shapes %s", str({k:v.shape for k, v in predictions._asdict().items()}))
-        logger.debug("loss_fn: policy all zeros %s", (predictions.policy_logits == 0).all())
-        
-        # TODO: understand the impact of having potentially
-        # different action spaces for network and target network.
-        bootstrap_space = action_space_storage.get_space(CPUState(**bootstrap_obs))
-        bootstrap_predictions = target_network.inference(
-            target_network_params, bootstrap_obs, bootstrap_space)
-        target_correctness, target_latency, target_policy, bootstrap_discount = (
-            target
-        )
-        target_correctness += (
-            bootstrap_discount * bootstrap_predictions.correctness_value_logits
-        )
+    state = CPUState(**observation) # TODO: with dynamic action spaces, this will get ugly fast.
+    action_space = action_space_storage.get_space(state)
+    # NOTE: re-compute the priors instead of using the cached ones
+    # which is fine, we want the updated network to be used for each batch.
+    predictions = network.inference(network_params, observation, action_space)
+    logger.debug("<train_label>")
+    logger.debug("loss_fn: prediction dict shapes %s", str({k:v.shape for k, v in predictions._asdict().items()}))
+    logger.debug("loss_fn: policy all zeros %s", (predictions.policy_logits == 0).all())
+    
+    # TODO: understand the impact of having potentially
+    # different action spaces for network and target network.
+    bootstrap_space = action_space_storage.get_space(CPUState(**bootstrap_obs))
+    bootstrap_predictions = target_network.inference(
+        target_network_params, bootstrap_obs, bootstrap_space)
+    target_correctness, target_latency, target_policy, bootstrap_discount = (
+        target
+    )
+    target_correctness += (
+        bootstrap_discount * bootstrap_predictions.correctness_value_logits
+    )
 
-        l = optax.softmax_cross_entropy(predictions.policy_logits, target_policy)
-        l += scalar_loss(
-            predictions.correctness_value_logits, target_correctness, network
-        )
-        l += scalar_loss(predictions.latency_value_logits, target_latency, network)
-        loss += l
+    l = optax.softmax_cross_entropy(predictions.policy_logits, target_policy)
+    l += scalar_loss(
+        predictions.correctness_value_logits, target_correctness, network
+    )
+    l += scalar_loss(predictions.latency_value_logits, target_latency, network)
+    loss += l
     loss /= len(batch)
     return loss
 
@@ -2184,7 +2217,7 @@ def _update_weights(
     optimizer_state: Any,
     network: Network,
     target_network: Network,
-    batch: Sequence[Sample],
+    batch: SampleBatch,
     action_space_storage: ActionSpaceStorage,
 ) -> Any:
     """Updates the weight of the network."""
