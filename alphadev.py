@@ -687,11 +687,11 @@ class MultiQueryAttentionBlock(hk.Module):
             attention_params: ml_collections.ConfigDict,
             name: str | None = None,
         ):
+        super().__init__(name=name)
         self.head_depth = attention_params.head_depth
         self.num_heads = attention_params.num_heads
         self.attention_dropout = attention_params.attention_dropout
         self.position_encoding = attention_params.position_encoding
-        super().__init__(name=name)
     
     def __call__(self, inputs, encoded_state=None):
         """
