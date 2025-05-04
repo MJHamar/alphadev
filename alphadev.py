@@ -859,7 +859,7 @@ class ResBlockV2(hk.Module):
         x = shortcut = inputs
 
         for i, (conv_i, ln_i) in enumerate(self.layers):
-            x = ln_i(x, is_training, test_local_stats)
+            x = ln_i(x)
             x = jax.nn.relu(x)
         if i == 0 and self.use_projection:
             shortcut = self.proj_conv(x)
