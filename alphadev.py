@@ -162,6 +162,9 @@ class x86Action(Action):
         else:
             raise ValueError(f"Unknown opcode: {self.opcode}")
 
+    def to_numpy(self):
+        return jnp.array([x86_opcode2int[self.opcode], *self.operands], dtype=jnp.int32)
+
 def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[int, int]]]:
     def apply_opcode(opcode: str, operands: Tuple[int, int, int]) -> List[Tuple[str, Tuple[int, int]]]:
         # operands is a triple (reg1, reg2, mem)
@@ -467,12 +470,6 @@ class AssemblyGame(object):
             self.opcode = action.opcode # str
             self.operands = action.operands # list
 
-        def to_numpy(self):
-            """
-            Convert the instruction to a numpy array.
-            """
-            return jnp.array([riscv_opcode_to_int[self.opcode], *self.operands], dtype=jnp.int32)
-
     class AssemblySimulator(object):
         
         def __init__(self, task_spec, inputs:List[IOExample]):
@@ -527,6 +524,7 @@ class AssemblyGame(object):
 
     def step(self, action:Action):
         action_space = self.storage.get_space(self.state())
+        self.program.append(action) # append the action (no swap moves)
         #   logger.debug("step: action index %s", action.index)
         instructions = action_space.get(action.index) # lookup x86 instructions and convert to riscv
         # logger.debug("step: act %s, instruction %s", action, instructions)
@@ -535,7 +533,6 @@ class AssemblyGame(object):
             instructions = [instructions]
         for riscv_action in instructions:
             insn = self.AssemblyInstruction(riscv_action)
-            self.program.append(insn) # append the action (no swap moves)
             self.simulator.apply(insn)
         return self.observation(), self.correctness_reward()
 
@@ -549,7 +546,7 @@ class AssemblyGame(object):
             program=jnp.array([p.to_numpy() for p in self.program]),
             program_length=jnp.array(self.simulator.program_counter),
         )
-        logger.debug("AssemblyGame: state program %s", state.program)
+        logger.debug("AssemblyGame: state program %s", state.program.shape)
         return state
 
     def observation(self):
@@ -644,16 +641,16 @@ class Network(object):
     def init_network(self, action_space: ActionSpace) -> None:
         hparams = self.hparams
         task_spec = self.task_spec
-        def representation_fn(x):
-            return RepresentationNet(hparams, task_spec, hparams.embedding_dim)(x)
+        def representation_fn(*a, **k):
+            return RepresentationNet(hparams, task_spec, hparams.embedding_dim)(*a, **k)
         
-        def prediction_fn(x):
+        def prediction_fn(*a, **k):
             return PredictionNet(
                 task_spec=task_spec,
                 value_max=hparams.value.max,
                 value_num_bins=hparams.value.num_bins,
                 embedding_dim=hparams.embedding_dim,
-            )(x)
+            )(*a, **k)
         
         # Transform the functions that build and apply modules
         self.representation = hk.transform(representation_fn)
@@ -1398,16 +1395,18 @@ class PredictionNet(hk.Module):
         policy = policy_head(embedding)
         logger.debug("Policy shape: %s", policy.shape)
         policy_dict = { # map Action -> logit
-            a: logit for a, logit in zip(action_space._actions, policy)
+            a: logit for a, logit in zip(action_space._actions.values(), policy)
         }
+        assert isinstance(list(policy_dict.keys())[0], Action), \
+            f"Expected action to be of type Action, got {type(list(policy_dict.keys())[0])}"
 
         output = NetworkOutput(
             value=correctness_value['mean'] + latency_value['mean'],
             correctness_value_logits=correctness_value['logits'],
             latency_value_logits=latency_value['logits'],
-            policy_logits={policy},
+            policy_logits=policy_dict,
         )
-        logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items()}))
+        logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items() if isinstance(v, jnp.ndarray)}))
         return output
 
 
@@ -1452,7 +1451,7 @@ class AlphaDevConfig(object):
         self.task_spec = TaskSpec(
             max_program_size=10,
             num_inputs=17,
-            num_funcs=14,
+            num_funcs=len(x86_opcode2int),
             num_locations=19,
             num_regs=5,
             num_mem=14,
@@ -1751,6 +1750,7 @@ class ReplayBuffer(object):
         games = [self.sample_game() for _ in range(self.batch_size)]
         game_pos = [(g, self.sample_position(g)) for g in games]
         # pylint: disable=g-complex-comprehension
+        # FIXME: there is no batching here...
         return [
             Sample(
                 observation=g.make_observation(i), # NOTE: this re-computes the game from scratch each time.
@@ -2142,11 +2142,13 @@ def _loss_fn(
 ) -> float:
     """Computes loss."""
     loss = 0
-    for observation, bootstrap_obs, target in batch: # processes batches
-        # NOTE: re-compute the priors instead of using the cached ones
-        # which is fine, we want the updated network to be used for each batch.
+    for observation, bootstrap_obs, target in batch:
+        # FIXME: we process the elements in the batch one by one. there is also no batch dimension this way.
+
         state = CPUState(**observation)
         action_space = action_space_storage.get_space(state)
+        # NOTE: re-compute the priors instead of using the cached ones
+        # which is fine, we want the updated network to be used for each batch.
         predictions = network.inference(network_params, observation, action_space)
         logger.debug("<train_label>")
         logger.debug("loss_fn: prediction dict shapes %s", str({k:v.shape for k, v in predictions._asdict().items()}))
