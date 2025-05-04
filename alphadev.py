@@ -1261,17 +1261,26 @@ class DistributionSupport(object):
         # distributed on the range [0,value_max]
         # val(bin_i) = i * (value_max / num_bins)
         # i = val(bin_i) * (value_max / num_bins)^-1
-        step = self.value_max / self.num_bins 
-        index = scalar / step
-        low_bin = math.floor(index)
-        high_bin = math.ceil(index)
-        # find proximity to low and high bins
-        low_prox = index - low_bin 
-        high_prox = step - low_prox
-        # is low_prox + high_prox == step?
-        # index - low_bin + step - index + low_bin = 
-        # step QED
-        toohot[[low_bin, high_bin]] = low_prox, high_prox
+        logger.debug("scalar_to_two_hot: value_max %s, num_bins %s", self.value_max, self.num_bins)
+        step = self.value_max / self.num_bins
+        logger.debug("scalar_to_two_hot:\n scalar %s,\n step %s", scalar, step)
+        low_bin = jnp.floor(scalar / step).astype(jnp.int32)
+        high_bin = jnp.ceil(scalar / step).astype(jnp.int32)
+        # low_bin and high_bin are the indices of the two closest bins
+        # to the scalar value.
+        low_prox = jnp.abs(scalar - low_bin * step)
+        high_prox = jnp.abs(scalar - high_bin * step)
+        # low_prox and high_prox are the distances from the scalar
+        # to the two closest bins.
+        low_weight = 1 - low_prox / (low_prox + high_prox)
+        high_weight = 1 - low_weight
+        # low_weight and high_weight are the weights of the two closest bins
+        # to the scalar value.
+        
+        logger.debug("scalar_to_two_hot:\n scalar %s,\n low_bin %s,\n high_bin %s,\n low_prox %s,\n high_prox %s\n low_weight %s\n high_weight %s ", scalar, low_bin, high_bin, low_prox, high_prox, low_weight, high_weight)
+        toohot = toohot.at[low_bin].set(low_weight)
+        toohot = toohot.at[high_bin].set(high_weight)
+        logger.debug("scalar_to_two_hot: toohot %s", toohot)
         assert jnp.sum(toohot) == jnp.array([1]), f"two-hot representation is computed incorrectly. Should sum to 1 but sum is {jnp.sum(toohot)}"
         return toohot
 
