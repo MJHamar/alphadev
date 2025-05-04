@@ -641,7 +641,7 @@ class Network(object):
         self.prediction = None
         self.params = None
     
-    def init_network(self):
+    def init_network(self, action_space: ActionSpace) -> None:
         hparams = self.hparams
         task_spec = self.task_spec
         def representation_fn(x):
@@ -675,10 +675,12 @@ class Network(object):
         logger.debug("init_params: dummy_obs %s", str({k:v.shape for k,v in dummy_obs.items()}))
         self.params = {
             'representation': self.representation.init(rep_key, dummy_obs),
-            'prediction': self.prediction.init(pred_key, jnp.zeros((1, hparams.embedding_dim))),
+            'prediction': self.prediction.init(pred_key, jnp.zeros((1, hparams.embedding_dim)), action_space),
         }
 
     def inference(self, params: Any, observation: Dict, action_space: ActionSpace) -> NetworkOutput:
+        if self.representation is None or self.prediction is None:
+            raise ValueError("Network not initialized. Call init_network() first.")
         embedding = self.representation.apply(params['representation'], None, observation)
         return self.prediction.apply(params['prediction'], None, embedding, action_space)
 
@@ -2097,11 +2099,15 @@ def train_network(
     config: AlphaDevConfig, storage: SharedStorage, replay_buffer: ReplayBuffer
 ):
     """Trains the network on data stored in the replay buffer."""
+    # TODO: we might want to raise action space storage 
+    # above the context of a game but then we will also have race conditions.
+    game = replay_buffer.sample_game()
+    action_space_storage = game.action_space_storage # any game.
+    action_space = action_space_storage.get_space(game.environment.state())
+
     network = Network(config.hparams, config.task_spec) # the one we train
-    network.init_network() # initialize the network
+    network.init_network(action_space) # initialize the network
     target_network = network.copy() # copy the network for bootstrapping
-    
-    action_space_storage = replay_buffer.sample_game().action_space_storage # any game.
     
     # init optimizer
     optimizer = optax.sgd(config.lr_init, config.momentum)
