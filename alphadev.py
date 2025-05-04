@@ -846,14 +846,16 @@ class ResBlockV2(hk.Module):
                 padding="SAME",
                 name="conv_2")
 
-        # NOTE: Some implementations of ResNet50 v2 suggest initializing
-        # gamma/scale here to zeros.
-        ln_2 = hk.LayerNorm(name="LayerNorm_2", **ln_config)
-        layers = layers + ((conv_2, ln_2),)
+            # NOTE: Some implementations of ResNet50 v2 suggest initializing
+            # gamma/scale here to zeros.
+            ln_2 = hk.LayerNorm(name="LayerNorm_2", **ln_config)
+            layers = layers + ((conv_2, ln_2),)
 
         self.layers = layers
 
-    def __call__(self, inputs, is_training, test_local_stats):
+    def __call__(self, inputs, is_training=True, test_local_stats=False):
+        # FIXME: figure out what to do with the is_training and test_local_stats
+        logger.debug("ResBlockV2: inputs shape %s", inputs.shape)
         x = shortcut = inputs
 
         for i, (conv_i, ln_i) in enumerate(self.layers):
@@ -958,7 +960,8 @@ class RepresentationNet(hk.Module):
         )
         program_encoding = self.apply_program_mlp_embedder(program_onehot)
         program_encoding = self.apply_program_attention_embedder(program_encoding)
-        return self.pad_program_encoding(
+        # select the embedding corresponding to the current instruction in the corr. CPU state
+        return self.pad_program_encoding( # size B x num_inputs x embedding_dim
             program_encoding, batch_size, program_length, max_program_size
         )
 
@@ -975,7 +978,7 @@ class RepresentationNet(hk.Module):
             [
                 # input is embedding_dim size, because we already encoded in either one-hot or binary
                 hk.Linear(self._embedding_dim),
-                hk.LayerNorm(axis=-1),
+                hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
                 jax.nn.relu,
                 hk.Linear(self._embedding_dim),
             ],
@@ -984,33 +987,42 @@ class RepresentationNet(hk.Module):
 
         # locations_encoding.shape == [B, P, D] so map embedder across locations to
         # share weights
+        logger.debug("locations_encoding shape %s", locations_encoding.shape)
+        
         locations_embedding = hk.vmap(
             locations_embedder, in_axes=1, out_axes=1, split_rng=False
         )(locations_encoding)
+        logger.debug("locations_embedding shape %s", locations_embedding.shape)
 
         # broadcast the program encoding for each example.
         # this way, it matches the size of the observations.
+        logger.debug("program_encoding shape %s", program_encoding.shape)
         program_encoded_repeat = self.repeat_program_encoding(
             program_encoding, batch_size
         )
+        logger.debug("program_encoded_repeat shape %s", program_encoded_repeat.shape)
 
         grouped_representation = jnp.concatenate( # concat the CPU state and the program.
             [locations_embedding, program_encoded_repeat], axis=-1
         )
+        logger.debug("grouped_representation shape %s", grouped_representation.shape)
 
         return self.apply_joint_embedder(grouped_representation, batch_size)
 
     def repeat_program_encoding(self, program_encoding, batch_size):
-        return jnp.broadcast_to(
+        logger.debug("repeat_program_encoding pre shape %s", program_encoding.shape)
+        program_encoding = jnp.broadcast_to(
             program_encoding,
             [batch_size, self._task_spec.num_inputs, program_encoding.shape[-1]],
         )
+        logger.debug("repeat_program_encoding post shape %s", program_encoding.shape)
+        return program_encoding
 
     def apply_joint_embedder(self, grouped_representation, batch_size):
         all_locations_net = hk.Sequential(
             [
                 hk.Linear(self._embedding_dim),
-                hk.LayerNorm(axis=-1),
+                hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
                 jax.nn.relu,
                 hk.Linear(self._embedding_dim),
             ],
@@ -1019,7 +1031,7 @@ class RepresentationNet(hk.Module):
         joint_locations_net = hk.Sequential(
             [
                 hk.Linear(self._embedding_dim),
-                hk.LayerNorm(axis=-1),
+                hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
                 jax.nn.relu,
                 hk.Linear(self._embedding_dim),
             ],
@@ -1033,10 +1045,13 @@ class RepresentationNet(hk.Module):
         chex.assert_shape(
             grouped_representation, (batch_size, self._task_spec.num_inputs, None)
         )
+        logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
         # apply MLP to the combined program and locations embedding
         permutations_encoded = all_locations_net(grouped_representation)
+        logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
         # Combine all permutations into a single vector using a ResNetV2
         joint_encoding = joint_locations_net(jnp.mean(permutations_encoded, axis=1))
+        logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
         for net in joint_resnet:
             joint_encoding = net(joint_encoding)
         return joint_encoding
@@ -1075,9 +1090,17 @@ class RepresentationNet(hk.Module):
         program_length_onehot = jax.nn.one_hot(program_length, max_program_size + 1)
         logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
         logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
-        program_encoding = jnp.einsum(
-            'bnd,bNn->bNd', program_encoding, program_length_onehot
-        )
+        # two cases here:
+        # - program length is a batch of scalars corr. to the program length
+        # - program length is a batch of vectors (of len num_inputs) corr. to the state of the program counters
+        if len(program_length_onehot.shape) == 3:
+            program_encoding = jnp.einsum(
+                'bnd,bNn->bNd', program_encoding, program_length_onehot
+            )
+        else:
+            program_encoding = jnp.einsum(
+                'bnd,bn->bd', program_encoding, program_length_onehot
+            )
         logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
 
         return program_encoding
@@ -1142,20 +1165,38 @@ class RepresentationNet(hk.Module):
 
     def _make_locations_encoding_onehot(self, inputs, batch_size):
         """Creates location encoding using onehot representation."""
-        memory = inputs['memory']
-        registers = inputs['registers']
-        locations = jnp.concatenate([memory, registers], axis=-1)  # [B, H, P, D]
-        locations = jnp.transpose(locations, [0, 2, 1, 3])  # [B, P, H, D]
+        logger.debug("make_locations_encoding_onehot shapes %s", str({k:v.shape for k,v in inputs.items()}))
+        memory = inputs['memory'] # B x E x M (batch, num_inputs, memory size)
+        registers = inputs['registers'] # B x E x R (batch, num_inputs, register size)
+        # NOTE: originall implementation suggests the shape [B, H, P, D]
+        # where we can only assume that 
+        #   B - batch,
+        #   H - num_inputs,
+        #   P - program length,
+        #   D - num_locations
+        # this goes against what the paper suggests (although very vaguely)
+        # that only the current state is passed to the network as input,
+        # instead of the whole sequence of states,
+        # that the CPU has seen while executing the program.
+        locations = jnp.concatenate([registers, memory], axis=-1) # B x E x (R + M)
+        logger.debug("locations shape %s", locations.shape)
+        # to support inputs with sequences of states, we conditinally transpose
+        # the locations tensor to have the shape [B, P, H, D]
+        if len(locations.shape) == 4:
+            # in this case, locations is [B, H, P, D]
+            # and we need to transpose it to [B, P, H, D]
+            locations = jnp.transpose(locations, [0, 2, 1, 3])  # [B, P, H, D]
 
         # One-hot encode the values in the memory and average everything across
         # permutations.
-        locations_onehot = jax.nn.one_hot(
-            locations, self._task_spec.num_location_values, dtype=jnp.int32
+        locations_onehot = jax.nn.one_hot( # shape is now B x E x num_locations x num_locations
+            locations, self._task_spec.num_locations, dtype=jnp.float32
         )
+        logger.debug("locations_onehot shape %s", locations_onehot.shape)
         locations_onehot = locations_onehot.reshape(
             [batch_size, self._task_spec.num_inputs, -1]
         )
-
+        logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
         return locations_onehot
 
     def _make_locations_encoding_binary(self, inputs, batch_size):
