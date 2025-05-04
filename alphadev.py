@@ -598,24 +598,40 @@ class Network(object):
     """Wrapper around Representation and Prediction networks."""
 
     def __init__(self, hparams: ml_collections.ConfigDict, task_spec: TaskSpec):
-        self.representation = hk.transform(RepresentationNet(
-            hparams, task_spec, hparams.embedding_dim
-        ))
-        self.prediction = hk.transform(PredictionNet(
-            task_spec=task_spec,
-            value_max=hparams.value.max,
-            value_num_bins=hparams.value.num_bins,
-            embedding_dim=hparams.embedding_dim,
-        ))
-        rep_key, pred_key = jax.random.PRNGKey(42).split()
+        # Use function builders to create representation and prediction networks
+        # This ensures modules are initialized inside the transform context
+        def representation_fn(x):
+            return RepresentationNet(hparams, task_spec, hparams.embedding_dim)(x)
+        
+        def prediction_fn(x):
+            return PredictionNet(
+                task_spec=task_spec,
+                value_max=hparams.value.max,
+                value_num_bins=hparams.value.num_bins,
+                embedding_dim=hparams.embedding_dim,
+            )(x)
+        
+        # Transform the functions that build and apply modules
+        self.representation = hk.transform(representation_fn)
+        self.prediction = hk.transform(prediction_fn)
+        
+        # Initialize parameters using PRNGKeys
+        rep_key, pred_key = jax.random.split(jax.random.PRNGKey(42), 2)
+        # We need dummy inputs to initialize the networks
+        dummy_obs = {
+            'program': jnp.zeros((1, task_spec.max_program_size, 3), dtype=jnp.int32),
+            'program_length': jnp.zeros((1,), dtype=jnp.int32),
+            'registers': jnp.zeros((1, task_spec.num_inputs, task_spec.num_regs), dtype=jnp.int32),
+            'memory': jnp.zeros((1, task_spec.num_inputs, task_spec.num_mem), dtype=jnp.int32),
+        }
         self.params = {
-            'representation': self.representation.init(rep_key),
-            'prediction': self.prediction.init(pred_key),
+            'representation': self.representation.init(rep_key, dummy_obs),
+            'prediction': self.prediction.init(pred_key, jnp.zeros((1, hparams.embedding_dim))),
         }
 
     def inference(self, params: Any, observation: Dict) -> NetworkOutput:
-        embedding = self.representation.apply(params['representation'], observation)
-        return self.prediction.apply(params['prediction'], embedding)
+        embedding = self.representation.apply(params['representation'], None, observation)
+        return self.prediction.apply(params['prediction'], None, embedding)
 
     def get_params(self):
         # Returns the weights of this network.
@@ -662,15 +678,14 @@ class MultiQueryAttentionBlock(hk.Module):
     see https://arxiv.org/abs/1911.02150.
     """
     def __init__(self,
-            head_depth,
-            num_heads,
-            attention_dropout,
-            position_encoding,
+            attention_params: ml_collections.ConfigDict,
+            name: str | None = None,
         ):
-        self.head_depth = head_depth
-        self.num_heads = num_heads
-        self.attention_dropout = attention_dropout
-        self.position_encoding = position_encoding
+        self.head_depth = attention_params.head_depth
+        self.num_heads = attention_params.num_heads
+        self.attention_dropout = attention_params.attention_dropout
+        self.position_encoding = attention_params.position_encoding
+        super().__init__(name=name)
     
     def __call__(self, inputs, encoded_state=None):
         """
@@ -715,6 +730,8 @@ class MultiQueryAttentionBlock(hk.Module):
         O = jnp.einsum("bhnm,bmv->bhnv", weights, V) # B x N x H x V
         Y = self._linear_projection(O, 1, self.head_depth, name='P_o') # B x N x V
         
+        assert Y.shape == inputs.shape, f"Output shape {Y.shape} does not match input shape {inputs.shape}."
+        
         return Y # B x N x D
     
     @hk.transparent
@@ -738,8 +755,8 @@ class MultiQueryAttentionBlock(hk.Module):
         pe = jnp.zeros((seq_size, feat_size))
         position = jnp.arange(0, seq_size, dtype=jnp.float32)[:,None]
         div_term = jnp.exp(jnp.arange(0, feat_size, 2) * (-math.log(10000.0) / feat_size))
-        pe[:, 0::2] = jnp.sin(position * div_term)
-        pe[:, 1::2] = jnp.cos(position * div_term)
+        pe.at[:, 0::2].set(jnp.sin(position * div_term))
+        pe.at[:, 1::2].set(jnp.cos(position * div_term))
         pe = pe[None]
         return pe
 
@@ -1036,7 +1053,7 @@ class RepresentationNet(hk.Module):
         program_embedder = hk.Sequential(
             [
                 hk.Linear(self._embedding_dim),
-                hk.LayerNorm(axis=-1),
+                hk.LayerNorm(axis=-1, create_scale=True, create_offset=True),
                 jax.nn.relu,
                 hk.Linear(self._embedding_dim),
             ],
@@ -1047,9 +1064,10 @@ class RepresentationNet(hk.Module):
         return program_encoding
 
     def apply_program_attention_embedder(self, program_encoding):
+        logger.debug("apply_program_attention_embedder")
         attention_params = self._hparams.representation.attention
         make_attention_block = functools.partial(
-            MultiQueryAttentionBlock, attention_params, causal_mask=False
+            MultiQueryAttentionBlock, attention_params
         )
         attention_encoders = [
             make_attention_block(name=f'attention_program_sequencer_{i}')
@@ -1067,7 +1085,8 @@ class RepresentationNet(hk.Module):
         program_encoding += position_encodings
 
         for e in attention_encoders:
-            program_encoding, _ = e(program_encoding, encoded_state=None)
+            logger.debug("apply_program_attention_embedder layer %s", e.name)
+            program_encoding = e(program_encoding, encoded_state=None)
 
         return program_encoding
 
