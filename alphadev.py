@@ -152,6 +152,16 @@ def x86_enumerate_actions(max_reg: int, max_mem: int) -> List[Tuple[str, Tuple[i
     #   logger.debug("Enumerated %d actions", len(actions))
     return actions
 
+riscv_opcode_to_int = {
+    "ADD": 0,
+    "SUB": 1,
+    "LW": 2,
+    "SW": 3,
+    "BLT": 4,
+    "BGE": 5,
+}
+RISCV_NUM_OPERANDS = 3 # TODO: actually 4 but we don't use the last one
+
 # the emulator should call ActionSpace.get(action) to get the action
 # the action space can use the emulator to get the action
 # the action space also needs to define a masking function that masks invalid actions based on the emulator state
@@ -422,6 +432,12 @@ class AssemblyGame(object):
             self.opcode = action.opcode # str
             self.operands = action.operands # list
 
+        def to_numpy(self):
+            """
+            Convert the instruction to a numpy array.
+            """
+            return jnp.array([riscv_opcode_to_int[self.opcode], *self.operands], dtype=jnp.int32)
+
     class AssemblySimulator(object):
         
         def __init__(self, task_spec, inputs:List[IOExample]):
@@ -490,14 +506,16 @@ class AssemblyGame(object):
 
     def state(self) -> CPUState:
         # convert from numpy to jax.numpy arrays
-        return CPUState(
+        state = CPUState(
             registers=jnp.array(self.simulator.registers),
             memory=jnp.array(self.simulator.memory),
             register_mask=jnp.array(self.simulator.register_mask),
             memory_mask=jnp.array(self.simulator.memory_mask),
-            program=self.program,
+            program=jnp.array([p.to_numpy() for p in self.program]),
             program_length=jnp.array(self.simulator.program_counter),
         )
+        logger.debug("AssemblyGame: state program %s", state.program)
+        return state
 
     def observation(self):
         return self.state()._asdict()
@@ -1651,6 +1669,7 @@ class Game(object):
         self.root_values.append(root.value())
 
     def make_observation(self, state_index: int):
+        logger.debug("Game.make_observation: state_index %d", state_index)
         # NOTE: returns the observation corresponding to the last action
         if state_index == -1:
             return self.environment.observation()
@@ -1675,6 +1694,7 @@ class Game(object):
         # use an offset to account for cases when the td_target is further than the last action.
         # TODO: this might be a mistake and hard to check.
         offset = max(0, (state_index + td_steps) - len(self.history))
+        value = 0
         for i, reward in enumerate(self.rewards[state_index:bootstrap_index]):
             value += reward * self.discount**(i+offset)  # pytype: disable=unsupported-operands
 
@@ -2076,7 +2096,7 @@ def train_network(
         if i % config.target_network_interval == 0:
             logger.info("Updating target network at step %d", i)
             target_network = network.copy() # update the bootstrap network
-        batch = replay_buffer.sample_batch(config.num_simulations, config.td_steps)
+        batch = replay_buffer.sample_batch(config.td_steps)
         optimizer_state = _update_weights(
             optimizer, optimizer_state, network, target_network, batch)
     storage.save_network(config.training_steps, network)
