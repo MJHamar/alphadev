@@ -600,8 +600,14 @@ class Network(object):
     """Wrapper around Representation and Prediction networks."""
 
     def __init__(self, hparams: ml_collections.ConfigDict, task_spec: TaskSpec):
-        # Use function builders to create representation and prediction networks
-        # This ensures modules are initialized inside the transform context
+        self.hparams = hparams
+        self.task_spec = task_spec
+        self.training_steps = 0
+        self.representation = None
+        self.prediction = None
+        self.params = None
+    
+    def init_network(self, hparams: ml_collections.ConfigDict, task_spec: TaskSpec):
         def representation_fn(x):
             return RepresentationNet(hparams, task_spec, hparams.embedding_dim)(x)
         
@@ -616,7 +622,6 @@ class Network(object):
         # Transform the functions that build and apply modules
         self.representation = hk.transform(representation_fn)
         self.prediction = hk.transform(prediction_fn)
-        
         # Initialize parameters using PRNGKeys
         rep_key, pred_key = jax.random.split(jax.random.PRNGKey(42), 2)
         # We need dummy inputs to initialize the networks
@@ -649,19 +654,29 @@ class Network(object):
         # Update network weights internally.
         self.params = jax.tree_map(lambda p, u: p + u, self.params, updates)
 
-    def training_steps(self) -> int:
-        # How many steps / batches the network has been trained for.
-        return 0
+    def copy(self):
+        # Returns a copy of the network.
+        net = Network(self.hparams, self.task_spec)
+        net.representation = self.representation
+        net.prediction = self.prediction
+        net.params = jax.tree_map(lambda p: p.copy(), self.params)
+        return net
 
 
 class UniformNetwork(object):
-    # NOTE: what does this do?
     """Network representation that returns uniform output."""
-
+    # NOTE: this module is returned instead of the Network in case no parameters are in the buffer.
     # pylint: disable-next=unused-argument
     def inference(self, observation) -> NetworkOutput:
         # representation + prediction function
-        return NetworkOutput(0, 0, 0, collections.defaultdict(lambda: 1.0))
+        return NetworkOutput(
+            value=jax.random.uniform(jax.random.PRNGKey(0), minval=-1.0, maxval=1.0),
+            correctness_value_logits=jax.random.uniform(jax.random.PRNGKey(1), shape=(1,), minval=-1.0, maxval=1.0),
+            latency_value_logits=jax.random.uniform(jax.random.PRNGKey(2), shape=(1,), minval=-1.0, maxval=1.0),
+            policy_logits=collections.defaultdict(
+            lambda: jax.random.uniform(jax.random.PRNGKey(3), minval=-1.0, maxval=1.0)
+            ),
+        )
 
     def get_params(self):
         # Returns the weights of this network.
@@ -671,6 +686,7 @@ class UniformNetwork(object):
         # Update network weights internally.
         self.params = jax.tree_map(lambda p, u: p + u, self.params, updates)
 
+    @property
     def training_steps(self) -> int:
         # How many steps / batches the network has been trained for.
         return 0
@@ -1237,14 +1253,16 @@ class DistributionSupport(object):
         self.num_bins = num_bins
 
     def mean(self, logits: jnp.ndarray) -> float:
+        logger.debug("DistSup.mean compute twohot logits for %s", logits.shape)
         twohot_logits = jnp.stack([
             self.scalar_to_two_hot(i) for i in logits
         ])
+        logger.debug("DistSup.mean twohot logits shape %s", twohot_logits.shape)
         sum_twohots = jnp.sum(twohot_logits, axis=1)
+        logger.debug("DistSup.mean sum_twohots shape %s", sum_twohots.shape)
         assert logits.shape == sum_twohots.shape, f"Logits shape {logits.shape} and sum_twohots shape {sum_twohots.shape} do not match."
-        mean = jnp.sum(
-            jnp.arange(self.num_bins) * sum_twohots, axis=1
-        ) / jnp.sum(sum_twohots, axis=1)
+        mean = sum_twohots / jnp.sum(sum_twohots)
+        logger.debug("DistSup.mean mean shape %s", mean.shape)
         return mean
 
     def scalar_to_two_hot(self, scalar: float) -> jnp.ndarray:
@@ -1261,9 +1279,9 @@ class DistributionSupport(object):
         # distributed on the range [0,value_max]
         # val(bin_i) = i * (value_max / num_bins)
         # i = val(bin_i) * (value_max / num_bins)^-1
-        logger.debug("scalar_to_two_hot: value_max %s, num_bins %s", self.value_max, self.num_bins)
+        # logger.debug("scalar_to_two_hot: value_max %s, num_bins %s", self.value_max, self.num_bins)
         step = self.value_max / self.num_bins
-        logger.debug("scalar_to_two_hot:\n scalar %s,\n step %s", scalar, step)
+        # logger.debug("scalar_to_two_hot:\n scalar %s,\n step %s", scalar, step)
         low_bin = jnp.floor(scalar / step).astype(jnp.int32)
         high_bin = jnp.ceil(scalar / step).astype(jnp.int32)
         # low_bin and high_bin are the indices of the two closest bins
@@ -1274,14 +1292,14 @@ class DistributionSupport(object):
         # to the two closest bins.
         low_weight = 1 - low_prox / (low_prox + high_prox)
         high_weight = 1 - low_weight
-        # low_weight and high_weight are the weights of the two closest bins
-        # to the scalar value.
         
-        logger.debug("scalar_to_two_hot:\n scalar %s,\n low_bin %s,\n high_bin %s,\n low_prox %s,\n high_prox %s\n low_weight %s\n high_weight %s ", scalar, low_bin, high_bin, low_prox, high_prox, low_weight, high_weight)
+        # # logger.debug("scalar_to_two_hot:\n scalar %s,\n low_bin %s,\n high_bin %s,\n low_prox %s,\n high_prox %s\n low_weight %s\n high_weight %s ", scalar, low_bin, high_bin, low_prox, high_prox, low_weight, high_weight)
+        
         toohot = toohot.at[low_bin].set(low_weight)
         toohot = toohot.at[high_bin].set(high_weight)
-        logger.debug("scalar_to_two_hot: toohot %s", toohot)
-        assert jnp.sum(toohot) == jnp.array([1]), f"two-hot representation is computed incorrectly. Should sum to 1 but sum is {jnp.sum(toohot)}"
+        
+        # logger.debug("scalar_to_two_hot: sum = %s", jnp.sum(toohot))
+        
         return toohot
 
 class CategoricalHead(hk.Module):
@@ -1302,9 +1320,9 @@ class CategoricalHead(hk.Module):
 
     def __call__(self, x: jnp.ndarray):
         # For training returns the logits, for inference the mean.
-        logits = self._head(x)
-        probs = jax.nn.softmax(logits)
-        mean = jax.vmap(self._value_support.mean)(probs)
+        logits = self._head(x) # project the embedding to the value support's numbeer of bins 
+        probs = jax.nn.softmax(logits) # take softmax
+        mean = jax.vmap(self._value_support.mean)(probs) # compute the mean
         return dict(logits=logits, mean=mean)
 
 class PredictionNet(hk.Module):
@@ -1326,23 +1344,31 @@ class PredictionNet(hk.Module):
         self.embedding_dim = embedding_dim
 
     def __call__(self, embedding: jnp.ndarray):
+        logger.debug("PredictionNet: embedding shape %s", embedding.shape)
         policy_head = make_head_network(
             self.embedding_dim, self.task_spec.num_actions
         )
+        logger.debug("PredictionNet: policy_head %s", policy_head)
         value_head = CategoricalHead(self.embedding_dim, self.support)
+        logger.debug("PredictionNet: value_head %s", value_head)
         latency_value_head = CategoricalHead(self.embedding_dim, self.support)
+        logger.debug("PredictionNet: latency_value_head %s", latency_value_head)
         correctness_value = value_head(embedding)
+        logger.debug("PredictionNet: correctness_value shape %s", str({k:v.shape for k, v in correctness_value.items()}))
         latency_value = latency_value_head(embedding)
+        logger.debug("PredictionNet: latency_value shape %s", str({k:v.shape for k, v in latency_value.items()}))
 
         policy = policy_head(embedding)
-        #   logger.debug("Policy : %s", policy)
+        logger.debug("Policy shape: %s", policy.shape)
 
-        return NetworkOutput(
+        output = NetworkOutput(
             value=correctness_value['mean'] + latency_value['mean'],
             correctness_value_logits=correctness_value['logits'],
             latency_value_logits=latency_value['logits'],
-            policy_logits=policy['logits'],
+            policy_logits=policy,
         )
+        logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items()}))
+        return output
 
 
 ####### End Networks ########
@@ -1720,16 +1746,19 @@ class SharedStorage(object):
 
     def __init__(self):
         self._networks = {}
+        self._latest_step = 0
 
     def latest_network(self) -> Network:
         if self._networks:
-            return self._networks[max(self._networks.keys())]
+            return self._networks[self._latest_step]
         else:
         # policy -> uniform, value -> 0, reward -> 0
             return make_uniform_network()
 
     def save_network(self, step: int, network: Network):
         self._networks[step] = network
+        self._latest_step = max(step, self._latest_step)
+        logger.debug("SharedStorage: saved network at step %d", step)
 
 
 ##### End Helpers ########
@@ -1921,7 +1950,7 @@ def _select_action(
         (child.visit_count, action.index) for action, child in node.children.items()
     ])
     t = config.visit_softmax_temperature_fn(
-        steps=network.training_steps()
+        steps=network.training_steps
     )
     _, action = softmax_sample(visit_counts, t)
     # i.e. posterior probability based on the visit counts
@@ -2029,12 +2058,15 @@ def train_network(
 ):
     """Trains the network on data stored in the replay buffer."""
     network = Network(config.hparams, config.task_spec) # the one we train
-    target_network = Network(config.hparams, config.task_spec) # target network is updated periodically (bootstrap)
+    network.init_network() # initialize the network
+    target_network = network.copy() # copy the network for bootstrapping
+    
     # init optimizer
     optimizer = optax.sgd(config.lr_init, config.momentum)
     optimizer_state = optimizer.init(network.get_params())
 
     for i in range(config.training_steps): # insertion point for training pipeline
+        network.training_steps = i # increment the training steps
         if i % config.checkpoint_interval == 0:
             storage.save_network(i, network) # save the current network
         if i % config.target_network_interval == 0:
