@@ -678,9 +678,9 @@ class Network(object):
             'prediction': self.prediction.init(pred_key, jnp.zeros((1, hparams.embedding_dim))),
         }
 
-    def inference(self, params: Any, observation: Dict) -> NetworkOutput:
+    def inference(self, params: Any, observation: Dict, action_space: ActionSpace) -> NetworkOutput:
         embedding = self.representation.apply(params['representation'], None, observation)
-        return self.prediction.apply(params['prediction'], None, embedding)
+        return self.prediction.apply(params['prediction'], None, embedding, action_space)
 
     def get_params(self):
         # Returns the weights of this network.
@@ -703,15 +703,14 @@ class UniformNetwork(object):
     """Network representation that returns uniform output."""
     # NOTE: this module is returned instead of the Network in case no parameters are in the buffer.
     # pylint: disable-next=unused-argument
-    def inference(self, observation) -> NetworkOutput:
+    def inference(self, observation, action_space) -> NetworkOutput:
         # representation + prediction function
         return NetworkOutput(
             value=jax.random.uniform(jax.random.PRNGKey(0), minval=-1.0, maxval=1.0),
             correctness_value_logits=jax.random.uniform(jax.random.PRNGKey(1), shape=(1,), minval=-1.0, maxval=1.0),
             latency_value_logits=jax.random.uniform(jax.random.PRNGKey(2), shape=(1,), minval=-1.0, maxval=1.0),
-            policy_logits=collections.defaultdict(
-            lambda: jax.random.uniform(jax.random.PRNGKey(3), minval=-1.0, maxval=1.0)
-            ),
+            policy_logits={a: jax.random.uniform(jax.random.PRNGKey(3), minval=-1.0, maxval=1.0)
+                for a in action_space._actions.values()},
         )
 
     def get_params(self):
@@ -1379,7 +1378,7 @@ class PredictionNet(hk.Module):
         self.support = DistributionSupport(self.value_max, self.value_num_bins)
         self.embedding_dim = embedding_dim
 
-    def __call__(self, embedding: jnp.ndarray):
+    def __call__(self, embedding: jnp.ndarray, action_space: x86ActionSpace):
         logger.debug("PredictionNet: embedding shape %s", embedding.shape)
         policy_head = make_head_network(
             self.embedding_dim, self.task_spec.num_actions
@@ -1396,12 +1395,15 @@ class PredictionNet(hk.Module):
 
         policy = policy_head(embedding)
         logger.debug("Policy shape: %s", policy.shape)
+        policy_dict = { # map Action -> logit
+            a: logit for a, logit in zip(action_space._actions, policy)
+        }
 
         output = NetworkOutput(
             value=correctness_value['mean'] + latency_value['mean'],
             correctness_value_logits=correctness_value['logits'],
             latency_value_logits=latency_value['logits'],
-            policy_logits=policy,
+            policy_logits={policy},
         )
         logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items()}))
         return output
@@ -1871,7 +1873,9 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
         # Initialisation of the root node and addition of exploration noise
         root = Node(0) # NOTE: a dummy root
         current_observation = game.make_observation(-1)
-        network_output = network.inference(current_observation)
+        state = CPUState(**current_observation) # easier to create a new one
+        action_space = game.action_space_storage.get_space(state)
+        network_output = network.inference(current_observation, action_space)
         _expand_node( # expand current root
             root, game.to_play(), game.legal_actions(), network_output, reward=0
         )
@@ -1950,8 +1954,9 @@ def run_mcts(
         # Inside the search tree we use the environment to obtain the next
         # observation and reward given an action.
         observation, reward = sim_env.observation(), sim_env.correctness_reward()
+        action_space = action_space_storage.get_space(CPUState(**observation))
         # get the priors
-        network_output = network.inference(observation)
+        network_output = network.inference(observation, action_space)
         _expand_node( # expand the leaf node
             # here, game is not available. I suppose we do not perform action pruning.
             # instead, the history should be initialized either 
@@ -1962,7 +1967,7 @@ def run_mcts(
             # pruning the action space during MCTS might entail a big overhead.
             # we need to experiment with this.
             # NOTE: for now, we go with AlphaDev's implementation of returning all actions.
-            node, history.to_play(), action_space_storage.get_space(CPUState(**observation)), network_output, reward
+            node, history.to_play(), action_space, network_output, reward
         )
         _backpropagate(
             search_path,
@@ -2096,6 +2101,8 @@ def train_network(
     network.init_network() # initialize the network
     target_network = network.copy() # copy the network for bootstrapping
     
+    action_space_storage = replay_buffer.sample_game().action_space_storage # any game.
+    
     # init optimizer
     optimizer = optax.sgd(config.lr_init, config.momentum)
     optimizer_state = optimizer.init(network.get_params())
@@ -2111,7 +2118,8 @@ def train_network(
             target_network = network.copy() # update the bootstrap network
         batch = replay_buffer.sample_batch(config.td_steps)
         optimizer_state = _update_weights(
-            optimizer, optimizer_state, network, target_network, batch)
+            optimizer, optimizer_state, network, target_network, batch,
+            action_space_storage)
     storage.save_network(config.training_steps, network)
 
 def scale_gradient(tensor: Any, scale):
@@ -2123,20 +2131,26 @@ def _loss_fn(
     target_network_params: jnp.array,
     network: Network,
     target_network: Network,
-    batch: Sequence[Sample]
+    batch: Sequence[Sample],
+    action_space_storage: ActionSpaceStorage
 ) -> float:
     """Computes loss."""
     loss = 0
     for observation, bootstrap_obs, target in batch: # processes batches
         # NOTE: re-compute the priors instead of using the cached ones
         # which is fine, we want the updated network to be used for each batch.
-        predictions = network.inference(network_params, observation)
+        state = CPUState(**observation)
+        action_space = action_space_storage.get_space(state)
+        predictions = network.inference(network_params, observation, action_space)
         logger.debug("<train_label>")
         logger.debug("loss_fn: prediction dict shapes %s", str({k:v.shape for k, v in predictions._asdict().items()}))
         logger.debug("loss_fn: policy all zeros %s", (predictions.policy_logits == 0).all())
         
+        # TODO: understand the impact of having potentially
+        # different action spaces for network and target network.
+        bootstrap_space = action_space_storage.get_space(CPUState(**bootstrap_obs))
         bootstrap_predictions = target_network.inference(
-            target_network_params, bootstrap_obs)
+            target_network_params, bootstrap_obs, bootstrap_space)
         target_correctness, target_latency, target_policy, bootstrap_discount = (
             target
         )
@@ -2163,6 +2177,7 @@ def _update_weights(
     network: Network,
     target_network: Network,
     batch: Sequence[Sample],
+    action_space_storage: ActionSpaceStorage,
 ) -> Any:
     """Updates the weight of the network."""
     updates = _loss_grad(
@@ -2170,7 +2185,8 @@ def _update_weights(
         target_network.get_params(),
         network,
         target_network,
-        batch)
+        batch,
+        action_space_storage)
 
     optim_updates, new_optim_state = optimizer.update(updates, optimizer_state)
     network.update_params(optim_updates)
