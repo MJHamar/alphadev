@@ -1952,20 +1952,19 @@ def alphadev(config: AlphaDevConfig):
     if len(replay_buffer.buffer) == 0:
         logger.debug("Starting self-play job")
         # run using the profiler
-        profiling_name = f'profiling/selfplay_{time.strftime('%Y%m%d%H%M%S', time.localtime())}'
-        cProfile.runctx(
-            'launch_job(run_selfplay, config, storage, replay_buffer)',
-            globals=globals(),
-            locals=locals(),
-            filename=f'{profiling_name}.prof',
-            sort='cumulative'
-        )
-        flameprof_path = f'{profiling_name}.svg'
-        subprocess.run(['flameprof', f'{profiling_name}.prof'], stdout=open(flameprof_path, 'w'))
-        # launch_job(run_selfplay, config, storage, replay_buffer)
+        # profiling_name = f'profiling/selfplay_{time.strftime('%Y%m%d%H%M%S', time.localtime())}'
+        # cProfile.runctx(
+        #     'launch_job(run_selfplay, config, storage, replay_buffer)',
+        #     globals=globals(),
+        #     locals=locals(),
+        #     filename=f'{profiling_name}.prof',
+        #     sort='cumulative'
+        # )
+        # flameprof_path = f'{profiling_name}.svg'
+        # subprocess.run(['flameprof', f'{profiling_name}.prof'], stdout=open(flameprof_path, 'w'))
+        launch_job(run_selfplay, config, storage, replay_buffer)
         logger.debug("Self-play job done, saving the buffer to %s", debug_buffer_path)
         replay_buffer.save(debug_buffer_path)
-    return
     logger.debug("Starting training job")
     # it's fine to keep this in the main thread
     train_network(config, storage, replay_buffer)
