@@ -47,6 +47,10 @@ import optax
 
 from tinyfive.multi_machine import multi_machine
 
+# profiling
+import cProfile
+import pstats
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -226,6 +230,11 @@ class x86ActionSpace(ActionSpace):
     
     def get(self, action_id: int) -> List[RiscvAction]:
         return x86_to_riscv(self._actions[action_id], self.state, self.mem_offset) # convert to RISC-V
+    def __hash__(self):
+        return 1 # x86ActionSpace is practically static, except for the state
+    def __eq__(self, other):
+        return self.state.program == other.state.program
+
 
 class ActionSpaceStorage(object):
     # placeholder for now.
@@ -316,7 +325,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
                 elif act.opcode.startswith("S"): # (_, MEM_T)
                     #   logger.debug("store %s", act.operands[1])
                     self._mems_written.add(act.operands[1])
-                
+        
         # check if the history seems to be a continuation of the current state
         if history is not None: # update history
             #   logger.debug("pruning: history")
@@ -523,7 +532,7 @@ class AssemblyGame(object):
         self.program = [] # program here is an array, which suggests that there are only append actions
         self.simulator = self.AssemblySimulator(task_spec, inputs)
         self.previous_correct_items = 0
-        self.expected_outputs = self.make_expected_outputs()
+        self.expected_outputs, self.output_masks = self.make_expected_outputs()
 
     def step(self, action:Action):
         action_space = self.storage.get_space(self.state())
@@ -542,12 +551,12 @@ class AssemblyGame(object):
     def state(self) -> CPUState:
         # convert from numpy to jax.numpy arrays
         state = CPUState(
-            registers=jnp.array(self.simulator.registers)[:, :self.task_spec.num_regs],
-            memory=jnp.array(self.simulator.memory),
-            register_mask=jnp.array(self.simulator.register_mask)[:, :self.task_spec.num_regs],
-            memory_mask=jnp.array(self.simulator.memory_mask),
-            program=jnp.array([p.to_numpy() for p in self.program]),
-            program_length=jnp.array(self.simulator.program_counter),
+            registers=jnp.asarray(self.simulator.registers)[:, :self.task_spec.num_regs],
+            memory=jnp.asarray(self.simulator.memory),
+            register_mask=jnp.asarray(self.simulator.register_mask)[:, :self.task_spec.num_regs],
+            memory_mask=jnp.asarray(self.simulator.memory_mask),
+            program=jnp.asarray([p.to_numpy() for p in self.program]),
+            program_length=jnp.asarray(self.simulator.program_counter),
         )
         assert state.registers.shape == (self.task_spec.num_inputs, self.task_spec.num_regs), \
             "registers shape mismatch: %s expected %s" % (state.registers.shape, self.task_spec.num_regs)
@@ -557,6 +566,8 @@ class AssemblyGame(object):
             "memory shape mismatch: %s expected %s" % (state.memory.shape, self.task_spec.num_mem)
         assert state.memory_mask.shape == (self.task_spec.num_inputs, self.task_spec.num_mem), \
             "memory mask shape mismatch: %s expected %s" % (state.memory_mask.shape, self.task_spec.num_mem)
+        assert len(self.program) == 0 or state.program.shape == (len(self.program), 3), \
+            "program shape mismatch: %s expected %s" % (state.program.shape, (len(self.program), 3))
         # logger.debug("AssemblyGame: state program %s", state.program.shape)
         return state
 
@@ -564,31 +575,55 @@ class AssemblyGame(object):
         return self.state()._asdict()
 
     def make_expected_outputs(self):
-        return jnp.stack(
-            [example.outputs for example in self.inputs]
-        )
+        outputs = jnp.zeros((self.task_spec.num_inputs, self.task_spec.num_mem), dtype=jnp.int32)
+        output_masks = jnp.zeros((self.task_spec.num_inputs, self.task_spec.num_mem), dtype=jnp.int32)
+        for i, inp in enumerate(self.inputs):
+            # expected outputs is of shape (num_inputs, num_examples)
+            # current state is of shape (num_inputs, num_examples)
+            out = inp.outputs
+            outputs = outputs.at[i, :out.shape[0]].set(out)
+            output_masks = output_masks.at[i, :out.shape[0]].set(1)
+            assert out.shape[0] == output_masks[i].sum(), \
+                "expected outputs and masks do not match: %s %s" % (out.shape, output_masks[i].sum())
+        return outputs, output_masks
 
     def correctness_reward(self) -> float:
         """Computes a reward based on the correctness of the output."""
         state = self.state()
-
-        # Weighted sum of correctly placed items
-        correct_items = 0
-        # NOTE: this assumes that the expected outputs are always written from index 0
-        for output, expected in zip(state.memory, self.expected_outputs):
-            correct_items += sum(
-                output[i] == expected[i] for i in range(len(output))
-            )
-            reward = self.task_spec.correctness_reward_weight * (
-                correct_items - self.previous_correct_items
-            )
-        self.previous_correct_items = correct_items
-
-        # Bonus for fully correct programs
-        all_correct = jnp.all(state.memory[:,:self.expected_outputs.shape[1]] == self.expected_outputs)
+        
+        # expected outputs is of shape (num_inputs, num_examples)
+        # current state is of shape (num_inputs, num_examples)
+        crnt_mem = state.memory
+        masked_mem = crnt_mem * self.output_masks
+        matches = jnp.equal(masked_mem, self.expected_outputs)
+        correct_items = jnp.sum(matches)
+        all_correct = jnp.all(matches)
+        
+        reward = self.task_spec.correctness_reward_weight * (
+            correct_items - self.previous_correct_items
+        )
         reward += self.task_spec.correct_reward * all_correct
-
+        # update the previous correct items
+        self.previous_correct_items = correct_items
+        
         return reward
+        # OLD REWARD FUNCTION
+        # # Weighted sum of correctly placed items
+        # correct_items = 0
+        # # NOTE: this assumes that the expected outputs are always written from index 0
+        # for output, expected in zip(state.memory, self.expected_outputs):
+        #     correct_items += sum(
+        #         output[i] == expected[i] for i in range(len(output))
+        #     )
+        #     reward = self.task_spec.correctness_reward_weight * (
+        #         correct_items - self.previous_correct_items
+        #     )
+        # self.previous_correct_items = correct_items
+
+        # # Bonus for fully correct programs
+        # all_correct = jnp.all(state.memory[:,:self.expected_outputs.shape[1]] == self.expected_outputs)
+        # reward += self.task_spec.correct_reward * all_correct
+        # return reward
 
     def latency_reward(self) -> float:
         latency_samples = [
@@ -666,6 +701,20 @@ class Network(object):
         # Transform the functions that build and apply modules
         self.representation = hk.transform(representation_fn)
         self.prediction = hk.transform(prediction_fn)
+        if self.hparams.use_jit:
+            self.representation = collections.namedtuple(
+                'jitted_representation', ('apply', 'init')
+            )(
+                apply=jax.jit(self.representation.apply),
+                init=jax.jit(self.representation.init),
+            )
+            self.prediction = collections.namedtuple(
+                'jitted_prediction', ('apply', 'init')
+            )(
+                apply=jax.jit(self.prediction.apply, static_argnums=(3,)),
+                init=jax.jit(self.prediction.init, static_argnums=(2,)),
+            )
+        
         # Initialize parameters using PRNGKeys
         rep_key, pred_key = jax.random.split(jax.random.PRNGKey(42), 2)
         # We need dummy inputs to initialize the networks
@@ -1490,6 +1539,7 @@ class AlphaDevConfig(object):
         self.hparams.value = ml_collections.ConfigDict()
         self.hparams.value.max = 3.0  # These two parameters are task / reward-
         self.hparams.value.num_bins = 301  # dependent and need to be adjusted.
+        self.hparams.use_jit = False # no jit for now
 
         ### Training
         self.training_steps = 10 #int(1000e3)
@@ -1864,10 +1914,18 @@ def alphadev(config: AlphaDevConfig):
     #     launch_job(run_selfplay, config, storage, replay_buffer)
     if len(replay_buffer.buffer) == 0:
         logger.debug("Starting self-play job")
-        launch_job(run_selfplay, config, storage, replay_buffer)
+        # run using the profiler
+        cProfile.runctx(
+            'launch_job(run_selfplay, config, storage, replay_buffer)',
+            globals=globals(),
+            locals=locals(),
+            filename='selfplay.prof',
+            sort='cumulative'
+        )
+        # launch_job(run_selfplay, config, storage, replay_buffer)
         logger.debug("Self-play job done, saving the buffer to %s", debug_buffer_path)
         replay_buffer.save(debug_buffer_path)
-    
+    return
     logger.debug("Starting training job")
     # it's fine to keep this in the main thread
     train_network(config, storage, replay_buffer)
