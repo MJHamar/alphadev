@@ -29,6 +29,7 @@
 
 import os
 import collections
+import subprocess
 import functools
 import itertools
 import json
@@ -50,6 +51,7 @@ from tinyfive.multi_machine import multi_machine
 # profiling
 import cProfile
 import pstats
+import flameprof
 
 import logging
 logger = logging.getLogger(__name__)
@@ -490,7 +492,10 @@ class AssemblyGame(object):
             self.task_spec = task_spec
             self.inputs = inputs
             self.emulator = multi_machine(
-                task_spec.num_mem*4, task_spec.num_inputs, self.inputs.inputs)
+                mem_size=task_spec.num_mem*4,
+                num_machines=task_spec.num_inputs, 
+                initial_state=self.inputs.inputs
+            )
             self.reset()
         
         def reset(self):
@@ -523,10 +528,21 @@ class AssemblyGame(object):
             latencies = jnp.asarray(self.emulator.measure_latency(), dtype=jnp.float32)
             logger.debug(f"measure_latency: {latencies}")
             return latencies
-
+        
         def invalid(self) -> bool:
             # FIXME: need to check if the program can be invalid at any point in time.
             return False
+
+        def clone(self):
+            ret = object.__new__(AssemblyGame.AssemblySimulator)
+            # immutables
+            ret.task_spec = self.task_spec
+            ret.inputs = self.inputs
+            # copy the emulator
+            ret.emulator = self.emulator.clone()
+            
+            return ret
+
 
     def __init__(self, task_spec, inputs: IOExample, action_space_storage: ActionSpaceStorage):
         self.task_spec = task_spec
@@ -537,6 +553,8 @@ class AssemblyGame(object):
         self.previous_correct_items = 0
         self.expected_outputs = inputs.outputs
         self.output_masks = inputs.output_mask
+        # compute initial observation and correctness reward
+        self._update_state(); self._update_reward() # NOTE: order matters.
 
     def step(self, action:Action):
         action_space = self.storage.get_space(self.state())
@@ -550,9 +568,11 @@ class AssemblyGame(object):
         for riscv_action in instructions:
             insn = self.AssemblyInstruction(riscv_action)
             self.simulator.apply(insn)
+        # update the state of the simulator and compute reward
+        self._update_state(); self._update_reward() # NOTE: order matters.
         return self.observation(), self.correctness_reward()
 
-    def state(self) -> CPUState:
+    def _update_state(self) -> CPUState:
         # convert from numpy to jax.numpy arrays
         state = CPUState(
             registers=jnp.asarray(self.simulator.registers)[:, :self.task_spec.num_regs],
@@ -573,12 +593,9 @@ class AssemblyGame(object):
         assert len(self.program) == 0 or state.program.shape == (len(self.program), 3), \
             "program shape mismatch: %s expected %s" % (state.program.shape, (len(self.program), 3))
         # logger.debug("AssemblyGame: state program %s", state.program.shape)
-        return state
+        self._state = state
 
-    def observation(self):
-        return self.state()._asdict()
-
-    def correctness_reward(self) -> float:
+    def _update_reward(self) -> float:
         """Computes a reward based on the correctness of the output."""
         state = self.state()
         
@@ -597,7 +614,7 @@ class AssemblyGame(object):
         # update the previous correct items
         self.previous_correct_items = correct_items
         
-        return reward
+        self._reward = reward
         # OLD REWARD FUNCTION
         # # Weighted sum of correctly placed items
         # correct_items = 0
@@ -616,6 +633,16 @@ class AssemblyGame(object):
         # reward += self.task_spec.correct_reward * all_correct
         # return reward
 
+    def state(self) -> CPUState:
+        return self._state
+
+    def observation(self):
+        return self.state()._asdict()
+
+    def correctness_reward(self) -> float:
+        # return the correctness reward
+        return self._reward
+
     def latency_reward(self) -> float:
         latency_samples = [
             # NOTE: measure latency n times
@@ -629,17 +656,30 @@ class AssemblyGame(object):
 
     def clone(self):
         # reinitialises the program, simulator (which makes a new emulator)
-        ret = AssemblyGame(
-            task_spec=self.task_spec,
-            inputs=self.inputs,
-            action_space_storage=self.storage,
-        ) 
-        # only mutable thing left is the program inside the simulator and in this class
-        # also note that since "program" is independent of the machine instance,
-        # we can simply shallow copy the array
-        del ret.simulator.emulator # make sure we don't allocate too much space
-        ret.simulator.emulator = self.simulator.emulator.clone()
+        ret = object.__new__(AssemblyGame) 
+        # copy immutables
+        ret.task_spec = self.task_spec
+        ret.storage = self.storage
+        ret.inputs = self.inputs
+        ret.expected_outputs = self.expected_outputs
+        ret.output_masks = self.output_masks
+        # copy the simulator
+        ret.simulator = self.simulator.clone()
+        # (shallow) copy the program. Actions are immutable
         ret.program = self.program.copy()
+        # copy the state
+        ret._state = CPUState(
+            registers=self._state.registers.copy(),
+            memory=self._state.memory.copy(),
+            register_mask=self._state.register_mask.copy(),
+            memory_mask=self._state.memory_mask.copy(),
+            program=ret.program, # already copied
+            program_length=self._state.program_length.copy(), # might be an array of immutables
+        )
+        # copy previous correct items 
+        ret.previous_correct_items = self.previous_correct_items
+        # copy the reward
+        ret._reward = self._reward
         return ret
 
     def terminal(self) -> bool:
@@ -752,14 +792,16 @@ class Network(object):
 class UniformNetwork(object):
     """Network representation that returns uniform output."""
     # NOTE: this module is returned instead of the Network in case no parameters are in the buffer.
+    def __init__(self):
+        self.key = jax.random.PRNGKey(0)
     # pylint: disable-next=unused-argument
     def inference(self, observation, action_space: x86ActionSpace) -> NetworkOutput:
         # representation + prediction function
         return NetworkOutput(
-            value=jax.random.uniform(jax.random.PRNGKey(0), minval=-1.0, maxval=1.0),
-            correctness_value_logits=jax.random.uniform(jax.random.PRNGKey(1), shape=(1,), minval=-1.0, maxval=1.0),
-            latency_value_logits=jax.random.uniform(jax.random.PRNGKey(2), shape=(1,), minval=-1.0, maxval=1.0),
-            policy_logits={a: jax.random.uniform(jax.random.PRNGKey(3), minval=-1.0, maxval=1.0)
+            value=jax.random.uniform(self.key, minval=-1.0, maxval=1.0),
+            correctness_value_logits=jax.random.uniform(self.key, shape=(1,), minval=-1.0, maxval=1.0),
+            latency_value_logits=jax.random.uniform(self.key, shape=(1,), minval=-1.0, maxval=1.0),
+            policy_logits={a: jax.random.uniform(self.key, minval=-1.0, maxval=1.0)
                 for a in action_space._actions.values()},
         )
 
@@ -1542,10 +1584,14 @@ class AlphaDevConfig(object):
         self.lr_init = 2e-4
         self.momentum = 0.9
         
-        self.inputs = generate_sort_inputs(3, self.task_spec.num_mem, self.task_spec.num_inputs)
+        self.inputs = generate_sort_inputs(
+            items_to_sort=3,
+            max_len=self.task_spec.num_mem, 
+            num_samples=self.task_spec.num_inputs
+        )
         #   logger.debug("Inputs: %s", self.inputs)
-        assert self.task_spec.num_inputs == len(self.inputs),\
-            f"Expected {self.task_spec.num_inputs} inputs, got {len(self.inputs)}"
+        assert self.task_spec.num_inputs == self.inputs.inputs.shape[0],\
+            f"Expected {self.task_spec.num_inputs} inputs, got {self.inputs.inputs.shape[0]}"
 
     def new_game(self):
         return Game(self.task_spec.num_actions, self.discount, self.task_spec, self.inputs)
@@ -1906,13 +1952,16 @@ def alphadev(config: AlphaDevConfig):
     if len(replay_buffer.buffer) == 0:
         logger.debug("Starting self-play job")
         # run using the profiler
+        profiling_name = f'profiling/selfplay_{time.strftime('%Y%m%d%H%M%S', time.localtime())}'
         cProfile.runctx(
             'launch_job(run_selfplay, config, storage, replay_buffer)',
             globals=globals(),
             locals=locals(),
-            filename='selfplay.prof',
+            filename=f'{profiling_name}.prof',
             sort='cumulative'
         )
+        flameprof_path = f'{profiling_name}.svg'
+        subprocess.run(['flameprof', f'{profiling_name}.prof'], stdout=open(flameprof_path, 'w'))
         # launch_job(run_selfplay, config, storage, replay_buffer)
         logger.debug("Self-play job done, saving the buffer to %s", debug_buffer_path)
         replay_buffer.save(debug_buffer_path)
@@ -2401,8 +2450,7 @@ def generate_sort_inputs(
     i_list = numpy.stack([i for i, _ in io_list])
     # padded outputs
     o_list = numpy.stack([
-        o +\
-        [0 for _ in range(max_len-len(o))]
+        numpy.pad(o, (0, max_len-len(o)), 'constant', constant_values=0)
         for _, o in io_list])
     o_mask = numpy.stack([
         [1 for _ in range(len(o))] +\
@@ -2416,6 +2464,7 @@ def generate_sort_inputs(
     o_list = o_list[uidx, :] # shape F(items_to_sort) x max_len
     o_mask = o_mask[uidx, :] # shape F(items_to_sort) x max_len
     
+    
     #   logger.debug("Generated %d test cases", len(io_list))
     # shuffle the permutations. if num_samples > len(permutations), we set
     # inputs = permutations + num_samples - len(permutations) random samples from permutations
@@ -2423,8 +2472,8 @@ def generate_sort_inputs(
     new_indices = numpy.random.permutation(len(i_list))
     if num_samples is None:
         pass # select all elements
-    elif num_samples > len(io_list):
-        new_indices = jnp.concatenate([new_indices, new_indices[:num_samples - len(io_list)]])
+    elif num_samples > i_list.shape[0]:
+        new_indices = jnp.concatenate([new_indices, new_indices[:num_samples - i_list.shape[0]]])
     else:
         new_indices = new_indices[:num_samples]
     
@@ -2434,6 +2483,10 @@ def generate_sort_inputs(
     # add some noise to the inputs
     for i in range(i_list.shape[0]):
         i_list[i], o_list[i] = remap_input(i_list[i], o_list[i])
+    
+    # logger.debug("generate_sort_inputs: i_list shape %s", i_list.shape)
+    # logger.debug("generate_sort_inputs: o_list shape %s", o_list.shape)
+    # logger.debug("generate_sort_inputs: o_mask shape %s", o_mask.shape)
     
     return IOExample(
         inputs=i_list,
