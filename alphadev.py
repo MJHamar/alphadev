@@ -457,6 +457,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
 class IOExample(NamedTuple):
     inputs: jnp.ndarray # num_inputs x <sequence_length>
     outputs: jnp.ndarray # num_inputs x <sequence_length>
+    output_mask: jnp.ndarray # num_inputs x <sequence_length>
 
 class TaskSpec(NamedTuple):
     max_program_size: int
@@ -484,18 +485,18 @@ class AssemblyGame(object):
 
     class AssemblySimulator(object):
         
-        def __init__(self, task_spec, inputs:List[IOExample]):
+        def __init__(self, task_spec, inputs:IOExample):
             """Initialize the simulator with the task specification."""
             self.task_spec = task_spec
             self.inputs = inputs
-            self.emulator = multi_machine(task_spec.num_mem*4, task_spec.num_inputs)
+            self.emulator = multi_machine(
+                task_spec.num_mem*4, task_spec.num_inputs, self.inputs.inputs)
             self.reset()
         
         def reset(self):
             """Reset the simulator to an initial state."""
-            self.emulator.reset_state()
-            for i, example in enumerate(self.inputs):
-                self.emulator.set_memory(i, example.inputs)
+            # restore initial state (with inputs given at init time)
+            self.emulator.reset_state() 
 
         # pylint: disable-next=unused-argument
         def apply(self, instruction):
@@ -519,20 +520,23 @@ class AssemblyGame(object):
 
         def measure_latency(self) -> float:
             """Measure the latency of a program."""
-            self.emulator.measure_latency()
+            latencies = jnp.asarray(self.emulator.measure_latency(), dtype=jnp.float32)
+            logger.debug(f"measure_latency: {latencies}")
+            return latencies
 
         def invalid(self) -> bool:
             # FIXME: need to check if the program can be invalid at any point in time.
             return False
 
-    def __init__(self, task_spec, inputs: List[IOExample], action_space_storage: ActionSpaceStorage):
+    def __init__(self, task_spec, inputs: IOExample, action_space_storage: ActionSpaceStorage):
         self.task_spec = task_spec
         self.inputs = inputs
         self.storage = action_space_storage
         self.program = [] # program here is an array, which suggests that there are only append actions
         self.simulator = self.AssemblySimulator(task_spec, inputs)
         self.previous_correct_items = 0
-        self.expected_outputs, self.output_masks = self.make_expected_outputs()
+        self.expected_outputs = inputs.outputs
+        self.output_masks = inputs.output_mask
 
     def step(self, action:Action):
         action_space = self.storage.get_space(self.state())
@@ -573,19 +577,6 @@ class AssemblyGame(object):
 
     def observation(self):
         return self.state()._asdict()
-
-    def make_expected_outputs(self):
-        outputs = jnp.zeros((self.task_spec.num_inputs, self.task_spec.num_mem), dtype=jnp.int32)
-        output_masks = jnp.zeros((self.task_spec.num_inputs, self.task_spec.num_mem), dtype=jnp.int32)
-        for i, inp in enumerate(self.inputs):
-            # expected outputs is of shape (num_inputs, num_examples)
-            # current state is of shape (num_inputs, num_examples)
-            out = inp.outputs
-            outputs = outputs.at[i, :out.shape[0]].set(out)
-            output_masks = output_masks.at[i, :out.shape[0]].set(1)
-            assert out.shape[0] == output_masks[i].sum(), \
-                "expected outputs and masks do not match: %s %s" % (out.shape, output_masks[i].sum())
-        return outputs, output_masks
 
     def correctness_reward(self) -> float:
         """Computes a reward based on the correctness of the output."""
@@ -1551,7 +1542,7 @@ class AlphaDevConfig(object):
         self.lr_init = 2e-4
         self.momentum = 0.9
         
-        self.inputs = generate_sort_inputs(3, self.task_spec.num_inputs)
+        self.inputs = generate_sort_inputs(3, self.task_spec.num_mem, self.task_spec.num_inputs)
         #   logger.debug("Inputs: %s", self.inputs)
         assert self.task_spec.num_inputs == len(self.inputs),\
             f"Expected {self.task_spec.num_inputs} inputs, got {len(self.inputs)}"
@@ -1665,7 +1656,7 @@ class Game(object):
     """A single episode of interaction with the environment."""
 
     def __init__(
-        self, action_space_size: int, discount: float, task_spec: TaskSpec, inputs: List[IOExample]
+        self, action_space_size: int, discount: float, task_spec: TaskSpec, inputs: IOExample
     ):
         self.task_spec = task_spec
         self.inputs = inputs
@@ -2351,7 +2342,8 @@ def launch_job(f, *args):
 def make_uniform_network():
     return UniformNetwork()
 
-def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=42) -> List[IOExample]:
+def generate_sort_inputs(
+    items_to_sort: int, max_len:int, num_samples: int=None, rnd_key:int=42) -> IOExample:
     """
     This is equivalent to the C++ code sort_functioons_test.cc:
     TestCases GenerateSortTestCases(int items_to_sort) {
@@ -2407,27 +2399,47 @@ def generate_sort_inputs(items_to_sort: int, num_samples: int=None, rnd_key:int=
 
     generate_testcases(items_to_sort)
     i_list = numpy.stack([i for i, _ in io_list])
-    o_list = numpy.stack([o for _, o in io_list])
-    io_list = numpy.stack([i_list, o_list], axis=1)
-    _, uidx = numpy.unique(io_list, axis=0, return_index=True) # remove duplicates
-    io_list = io_list[uidx, :]
+    # padded outputs
+    o_list = numpy.stack([
+        o +\
+        [0 for _ in range(max_len-len(o))]
+        for _, o in io_list])
+    o_mask = numpy.stack([
+        [1 for _ in range(len(o))] +\
+        [0 for _ in range(max_len-len(o))]
+        for _, o in io_list])
+    assert o_list.shape[1] == o_mask.shape[1] == max_len, \
+        f"Expected output shape {max_len}, got {o_list.shape[1]}"
+    # remove duplicates
+    _, uidx = numpy.unique(i_list, axis=0, return_index=True) # remove duplicates
+    i_list = i_list[uidx, :] # shape F(items_to_sort) x items_to_sort
+    o_list = o_list[uidx, :] # shape F(items_to_sort) x max_len
+    o_mask = o_mask[uidx, :] # shape F(items_to_sort) x max_len
     
     #   logger.debug("Generated %d test cases", len(io_list))
     # shuffle the permutations. if num_samples > len(permutations), we set
     # inputs = permutations + num_samples - len(permutations) random samples from permutations
     # otherwise, we set inputs = random.sample(permutations, num_samples)
-    new_indices = numpy.random.permutation(len(io_list))
-    perm = io_list[new_indices]
+    new_indices = numpy.random.permutation(len(i_list))
     if num_samples is None:
-        io_list = perm
+        pass # select all elements
     elif num_samples > len(io_list):
-        io_list = jnp.concatenate([io_list, io_list[:num_samples - len(io_list)]])
+        new_indices = jnp.concatenate([new_indices, new_indices[:num_samples - len(io_list)]])
     else:
-        io_list = io_list[:num_samples]
-    # convert to list of IOExample
-    return [
-        IOExample(*remap_input(*io)) for io in io_list
-    ]
+        new_indices = new_indices[:num_samples]
+    
+    i_list = i_list[new_indices]
+    o_list = o_list[new_indices]
+    o_mask = o_mask[new_indices]
+    # add some noise to the inputs
+    for i in range(i_list.shape[0]):
+        i_list[i], o_list[i] = remap_input(i_list[i], o_list[i])
+    
+    return IOExample(
+        inputs=i_list,
+        outputs=o_list,
+        output_mask=o_mask,
+    )
 
 #definitions for RISC-V dynamic action spaces, not used rn
 # op_list = [
