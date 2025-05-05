@@ -1296,17 +1296,17 @@ class DistributionSupport(object):
     def __init__(self, value_max: float, num_bins: int):
         self.value_max = value_max
         self.num_bins = num_bins
+        self.value_support = jnp.linspace(
+            0, value_max, num_bins
+        ).astype(jnp.float32)
 
     def mean(self, logits: jnp.ndarray) -> float:
         # logits has shape B x num_bins
         logger.debug("DistSup.mean compute twohot logits for %s", logits.shape)
-        twohot_logits = self.scalar_to_two_hot(logits) # B x num_bins x num_bins
-        logger.debug("DistSup.mean twohot logits shape %s", twohot_logits.shape)
-        sum_twohots = jnp.sum(twohot_logits, axis=-1) # B x num_bins
-        logger.debug("DistSup.mean sum_twohots shape %s", sum_twohots.shape)
-        assert logits.shape == sum_twohots.shape, f"Logits shape {logits.shape} and sum_twohots shape {sum_twohots.shape} do not match."
-        mean = sum_twohots / jnp.sum(sum_twohots) # B x num_bins
-        logger.debug("DistSup.mean mean shape %s", mean.shape)
+        chex.assert_shape(logits, (logits.shape[0], self.num_bins))
+        # compute the mean of the logits
+        mean = logits @ self.value_support # (B, num_bins) * (num_bins,) = (B,)
+        chex.assert_shape(mean, (logits.shape[0],))
         return mean
 
     def scalar_to_two_hot(self, scalar: jnp.ndarray) -> jnp.ndarray:
@@ -1318,30 +1318,27 @@ class DistributionSupport(object):
         # Bins are -probably- a linear interpolation between 0 and value_max
         # and we need to assign non-zero values to the two closest bins
         # based on proximity to the scalar.
-        # input is B x num_bins
-        toohot = jnp.zeros((*scalar.shape, self.num_bins), dtype=jnp.float32) # B x num_bins x num_bins
+        # input is B x 1
+        # output needs to be BB x num_bins
         
+        # first, calculate the steep size
         step = self.value_max / self.num_bins # scalar step size
-        
-        low_bin = jnp.floor(scalar / step).astype(jnp.int32) # B x num_bins
-        high_bin = jnp.ceil(scalar / step).astype(jnp.int32) # B x num_bins
-        # low_bin and high_bin are the indices of the two closest bins
-        # to the scalar value.
-        low_prox = jnp.abs(scalar - low_bin * step) # B x num_bins
-        high_prox = jnp.abs(scalar - high_bin * step) # B x num_bins
-        # low_prox and high_prox are the distances from the scalar
-        # to the two closest bins.
-        low_weight = 1 - low_prox / (low_prox + high_prox) 
-        high_weight = 1 - low_weight
-        
-        # logger.debug("scalar_to_two_hot:\n scalar %s,\n low_bin %s,\n high_bin %s,\n low_prox %s,\n high_prox %s\n low_weight %s\n high_weight %s ", scalar.shape, low_bin.shape, high_bin.shape, low_prox.shape, high_prox.shape, low_weight.shape, high_weight.shape)
-        
-        toohot = toohot.at[:, :, low_bin].set(low_weight)
-        toohot = toohot.at[:, :, high_bin].set(high_weight)
-        
-        # logger.debug("scalar_to_two_hot: sum = %s", jnp.sum(toohot))
-        
-        return toohot
+        # find the two closest bins 
+        jnp.asarray(scalar)
+        low_bin = jnp.floor(scalar / step).astype(jnp.int32) # B x 1
+        high_bin = low_bin + 1 # B x 1
+        # find prroximity to the bins
+        low_bin_proximity = jnp.abs(scalar - low_bin * step)
+        high_bin_proximity = jnp.abs(scalar - high_bin * step)
+        # weights are the inverse of the proximity
+        low_bin_weight = high_bin * step - low_bin_proximity
+        high_bin_weight = low_bin * step - high_bin_proximity
+        # create the two-hot encoding
+        two_hot = jnp.zeros((scalar.shape[0], self.num_bins), dtype=jnp.float32)
+        # set the two closest bins to 1
+        two_hot = two_hot.at[:, low_bin].set(low_bin_weight)
+        two_hot = two_hot.at[:, high_bin].set(high_bin_weight)
+        return two_hot
 
 class CategoricalHead(hk.Module):
     """A head that represents continuous values by a categorical distribution."""
@@ -1362,9 +1359,9 @@ class CategoricalHead(hk.Module):
     def __call__(self, x: jnp.ndarray):
         # For training returns the logits, for inference the mean.
         logits = self._head(x) # project the embedding to the value support's numbeer of bins 
-        probs = jax.nn.softmax(logits) # take softmax
+        probs = jax.nn.softmax(logits) # take softmax -- probabilities over the bins
         logger.debug("CategoricalHead: logits shape %s, probs shape %s", logits.shape, probs.shape)
-        mean = self._value_support.mean(probs) # compute the mean
+        mean = self._value_support.mean(probs) # compute the mean, which is probs * [0, max_val/num_bins, 2max_val/num_bins, max_val]
         return dict(logits=logits, mean=mean)
 
 class PredictionNet(hk.Module):
@@ -1495,7 +1492,7 @@ class AlphaDevConfig(object):
         self.hparams.value.num_bins = 301  # dependent and need to be adjusted.
 
         ### Training
-        self.training_steps = int(1000e3)
+        self.training_steps = 10 #int(1000e3)
         self.checkpoint_interval = 500
         self.target_network_interval = 100
         self.window_size = int(1e6)
@@ -1704,7 +1701,8 @@ class Game(object):
             state_index = len(self.history) # for safety
         env = AssemblyGame(self.task_spec, self.inputs, self.action_space_storage)
         for action in self.history[:state_index]:
-            observation, _ = env.step(action)
+            _, _ = env.step(action)
+        observation = env.observation()
         return observation
 
     def make_target(
@@ -1793,6 +1791,10 @@ class ReplayBuffer(object):
     def _process_observation(self, observation: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
         # pad the program encoding to the max program length
         program = observation['program']
+        logger.debug("ReplayBuffer._process_observation: program shape %s", program.shape)
+        if program.shape == () or program.shape == (0,): # empty program
+            logger.debug("ReplayBuffer._process_observation: empty program")
+            program = jnp.zeros((0, 3), dtype=jnp.int32) * self.padding_token
         # program shape is p x 3, we want to return P x 3, where P is the max program size and p is the current proogram length
         padded_program = jnp.pad(
             program, ((0, self.max_program_size - program.shape[0]), (0, 0)),
@@ -2204,17 +2206,30 @@ def _loss_fn(
     target_correctness, target_latency, target_policy, bootstrap_discount = (
         target
     )
-    target_correctness += (
-        bootstrap_discount * bootstrap_predictions.correctness_value_logits
+    target_correctness += ( 
+        #elementwise multipy bootstrap_discount and target_correctness
+        # both have shape B x 1
+        bootstrap_discount * bootstrap_predictions.value
     )
-
-    l = optax.softmax_cross_entropy(predictions.policy_logits, target_policy)
-    l += scalar_loss(
+    policy_logits = jnp.asarray(
+        [predictions.policy_logits[a] for a in predictions.policy_logits.keys()]
+    )
+    l_policy = optax.softmax_cross_entropy(policy_logits, target_policy)
+    # predictions is B x num_bins, target is B x 1
+    # we need to convert the target to a two-hot vector B x num_bins with the two closest bins 
+    # carrying the weight of the distance to the target.
+    # logits are unnormalized.
+    l_correctness = scalar_loss(
         predictions.correctness_value_logits, target_correctness, network
     )
-    l += scalar_loss(predictions.latency_value_logits, target_latency, network)
-    loss += l
-    loss /= len(batch)
+    l_latency = scalar_loss(predictions.latency_value_logits, target_latency, network)
+    # logger.debug("loss_fn: policy loss %s", l_policy)
+    # logger.debug("loss_fn: correctness loss %s", l_correctness)
+    # logger.debug("loss_fn: latency loss %s", l_latency)
+    loss = l_policy + l_correctness + l_latency
+    # loss is of shape B x 1, we take the mean over the batch
+    loss = jnp.mean(loss)
+    assert not jnp.isnan(loss), f"Loss is NaN: {loss}"
     return loss
 
 
@@ -2243,8 +2258,13 @@ def _update_weights(
     return new_optim_state
 
 
-def scalar_loss(prediction, target, network) -> float:
-    support = network.prediction.support
+def scalar_loss(prediction:jnp.ndarray, target:jnp.ndarray, network:Network) -> float:
+    # Get the support from the network's configuration instead of trying to access it directly
+    # from the transformed module
+    support = DistributionSupport(network.hparams.value.max, network.hparams.value.num_bins)
+    # sm_cross_entropy normalizes the prediction and compares it to the target, which
+    # is a two-hot vector, summing up to 1.
+    # The target is a scalar, so we need to convert it to a two-hot vector.
     return optax.softmax_cross_entropy(
         prediction, support.scalar_to_two_hot(target)
     )
