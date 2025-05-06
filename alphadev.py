@@ -46,6 +46,8 @@ import ml_collections
 import numpy
 import optax
 
+from tqdm import tqdm
+
 from tinyfive.multi_machine import multi_machine
 
 # sharing data between processes
@@ -1520,15 +1522,16 @@ KnownBounds = collections.namedtuple('KnownBounds', ['min', 'max'])
 class AlphaDevConfig(object):
     """AlphaDev configuration."""
 
+    @staticmethod
+    def visit_softmax_temperature_fn(steps): 
+        return 1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
+    
     def __init__(
         self,
     ):
         ### Self-Play
-        self.num_actors = 128  # TPU actors
+        self.num_actors = 3  # TPU actors
         # pylint: disable-next=g-long-lambda
-        self.visit_softmax_temperature_fn = lambda steps: (
-            1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
-        )
         self.max_moves = jnp.inf
         self.num_simulations = 5
         self.discount = 1.0
@@ -2069,36 +2072,54 @@ class SharedStorage(object):
 # from the training to the self-play, and the finished games from the self-play
 # to the training.
 def alphadev(config: AlphaDevConfig):
-    storage = SharedStorage()
+    storage = SharedStorage(config.redis)
     replay_buffer = SharedReplayBuffer(config)
 
-    debug_buffer_path = 'buffer.npy'
-    if os.path.exists(debug_buffer_path):
-        replay_buffer.load(debug_buffer_path)
+    actors = []
 
-    # TODO: this should handled by a multiprocessing pool
-    # or a job queue.
-    # for _ in range(config.num_actors):
-    #     launch_job(run_selfplay, config, storage, replay_buffer)
-    if len(replay_buffer.buffer) == 0:
-        logger.debug("Starting self-play job")
-        # run using the profiler
-        # profiling_name = f'profiling/selfplay_{time.strftime('%Y%m%d%H%M%S', time.localtime())}'
-        # cProfile.runctx(
-        #     'launch_job(run_selfplay, config, storage, replay_buffer)',
-        #     globals=globals(),
-        #     locals=locals(),
-        #     filename=f'{profiling_name}.prof',
-        #     sort='cumulative'
-        # )
-        # flameprof_path = f'{profiling_name}.svg'
-        # subprocess.run(['flameprof', f'{profiling_name}.prof'], stdout=open(flameprof_path, 'w'))
-        launch_job(run_selfplay, config, storage, replay_buffer)
-        logger.debug("Self-play job done, saving the buffer to %s", debug_buffer_path)
-        replay_buffer.save(debug_buffer_path)
-    logger.debug("Starting training job")
-    # it's fine to keep this in the main thread
+    logger.info("Starting %d self-play jobs", config.num_actors)
+    for _ in range(config.num_actors):
+        job = launch_job(
+            run_selfplay, config, storage, replay_buffer
+        )
+        actors.append(job)
+    logger.info("Self-play jobs started, start training", len(actors))
+    
+    # start training
     train_network(config, storage, replay_buffer)
+    
+    # wait for all actors to finish
+    logger.info("Training fisihed, terminating self-play jobs")
+    for job in actors:
+        logger.debug("Terminating job %s", job)
+        terminate_job(job)
+    
+    # FOR DEBUGGING
+    # debug_buffer_path = 'buffer.npy'
+    # if os.path.exists(debug_buffer_path):
+    #     replay_buffer.load(debug_buffer_path)
+
+    # # TODO: this should handled by a multiprocessing pool
+    # # or a job queue.
+    # if len(replay_buffer.buffer) == 0:
+    #     logger.debug("Starting self-play job")
+    #     # run using the profiler
+    #     # profiling_name = f'profiling/selfplay_{time.strftime('%Y%m%d%H%M%S', time.localtime())}'
+    #     # cProfile.runctx(
+    #     #     'launch_job(run_selfplay, config, storage, replay_buffer)',
+    #     #     globals=globals(),
+    #     #     locals=locals(),
+    #     #     filename=f'{profiling_name}.prof',
+    #     #     sort='cumulative'
+    #     # )
+    #     # flameprof_path = f'{profiling_name}.svg'
+    #     # subprocess.run(['flameprof', f'{profiling_name}.prof'], stdout=open(flameprof_path, 'w'))
+    #     launch_job(run_selfplay, config, storage, replay_buffer)
+    #     logger.debug("Self-play job done, saving the buffer to %s", debug_buffer_path)
+    #     replay_buffer.save(debug_buffer_path)
+    # logger.debug("Starting training job")
+    # # it's fine to keep this in the main thread
+    # train_network(config, storage, replay_buffer)
 
     return storage.latest_network()
 
@@ -2374,22 +2395,28 @@ def train_network(
     # TODO: we might want to raise action space storage 
     # above the context of a game but then we will also have race conditions.
     game = replay_buffer.sample_game()
+    while game is None:
+        logger.info("Waiting for a game to be available in the replay buffer")
+        time.sleep(1)
+        game = replay_buffer.sample_game()
+    logger.info("A game was found in the replay buffer. Starting training.")
     action_space_storage = game.action_space_storage # any game.
     action_space = action_space_storage.get_space(game.environment.state())
 
+    logger.info("Initializing network")
     network = Network(config.hparams, config.task_spec) # the one we train
     network.init_network(action_space) # initialize the network
     target_network = network.copy() # copy the network for bootstrapping
     
     # init optimizer
+    logger.info("Initializing optimizer")
     optimizer = optax.sgd(config.lr_init, config.momentum)
     optimizer_state = optimizer.init(network.get_params())
 
-    for i in range(config.training_steps): # insertion point for training pipeline
-        logger.info("Training step %d", i)
+    for i in tqdm(range(config.training_steps), desc="Training Loop"): # insertion point for training pipeline
         network.training_steps = i # increment the training steps
         if i % config.checkpoint_interval == 0:
-            logger.info("Saving network at step %d", i)
+            logger.info("Pushing network to storage at step %d", i)
             storage.save_network(i, network) # save the current network
         if i % config.target_network_interval == 0:
             logger.info("Updating target network at step %d", i)
@@ -2513,10 +2540,17 @@ def softmax_sample(distribution, temperature: float):
     action_idx = jax.random.categorical(jax.random.PRNGKey(0), scaled)
     return distribution[action_idx].tolist()
 
-
 def launch_job(f, *args):
     # NOTE: a simple wrapper to launch a job in a separate thread.
-    f(*args)
+    process = multiprocessing.Process(target=f, args=args)
+    process.start()
+    return process
+
+def terminate_job(process:multiprocessing.Process):
+    # NOTE: a simple wrapper to terminate a job in a separate thread.
+    process.terminate()
+    process.join()
+    return process
 
 def make_uniform_network():
     return UniformNetwork()
@@ -2702,31 +2736,34 @@ def generate_sort_inputs(
 # ]
 # idx_to_op = {idx: op for idx, op in enumerate(op_list)}
 # op_to_idx = {op: idx for idx, op in enumerate(op_list)}
-def reader(buffer: SharedStorage):
-    logger.debug("Reader started sleeping for 1 seconds")
-    time.sleep(1)
-    logger.debug("Reader done sleeping")
-    for i in range(10):
-        # game = buffer.sample_game()
-        # logger.debug("Reader sampled game %d at iter %d. sleeping for 0.3", game, i)
-        game = buffer.latest_network()
-        logger.debug("Reader got network %d at iter %d. sleeping for 0.3", game, i)
-        time.sleep(1)
 
-def writer(buffer: SharedStorage):
-    logger.debug("Writer started")
-    for i in range(10):
-        # buffer.save_game(1)
-        # logger.debug("Saved game %d. sleep for 1", i)
-        buffer.save_network(i, i)
-        logger.debug("Saved network %d. sleep for 1", i)
-        time.sleep(1)
+# TESTING
+
+# def reader(buffer: SharedStorage):
+#     logger.debug("Reader started sleeping for 1 seconds")
+#     time.sleep(1)
+#     logger.debug("Reader done sleeping")
+#     for i in range(10):
+#         # game = buffer.sample_game()
+#         # logger.debug("Reader sampled game %d at iter %d. sleeping for 0.3", game, i)
+#         game = buffer.latest_network()
+#         logger.debug("Reader got network %d at iter %d. sleeping for 0.3", game, i)
+#         time.sleep(1)
+
+# def writer(buffer: SharedStorage):
+#     logger.debug("Writer started")
+#     for i in range(10):
+#         # buffer.save_game(1)
+#         # logger.debug("Saved game %d. sleep for 1", i)
+#         buffer.save_network(i, i)
+#         logger.debug("Saved network %d. sleep for 1", i)
+#         time.sleep(1)
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     logger.setLevel(logging.DEBUG)
     config = AlphaDevConfig()
-    # alphadev(config)
+    alphadev(config)
 
     # # test enum actions
     # actions = x86_enumerate_actions(3,3)
@@ -2734,13 +2771,13 @@ if __name__ == '__main__':
     #     print(action)
     # test replay buffer
     
-    config.window_size = 5
-    replay_buffer = SharedStorage(config.redis)
+    # config.window_size = 5
+    # replay_buffer = SharedStorage(config.redis)
     
-    p1 = multiprocessing.Process(target=reader, args=(replay_buffer,))
-    p2 = multiprocessing.Process(target=writer, args=(replay_buffer,))
-    p2.start(); p1.start()
-    logger.debug("Waiting for processes to finish")
-    p2.join(); p1.join()
-    logger.debug("Processes finished")
-    print("Done")
+    # p1 = multiprocessing.Process(target=reader, args=(replay_buffer,))
+    # p2 = multiprocessing.Process(target=writer, args=(replay_buffer,))
+    # p2.start(); p1.start()
+    # logger.debug("Waiting for processes to finish")
+    # p2.join(); p1.join()
+    # logger.debug("Processes finished")
+    # print("Done")
