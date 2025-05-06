@@ -590,7 +590,10 @@ class AssemblyGame(object):
             memory=jnp.asarray(self.simulator.memory),
             register_mask=jnp.asarray(self.simulator.register_mask)[:, :self.task_spec.num_regs],
             memory_mask=jnp.asarray(self.simulator.memory_mask),
-            program=jnp.asarray([p.to_numpy() for p in self.program]),
+            program=(
+                jnp.asarray([p.to_numpy() for p in self.program])
+                if len(self.program) > 0 else jnp.zeros((0, 3), dtype=jnp.int32)
+            ),
             program_length=jnp.asarray(self.simulator.program_counter),
         )
         assert state.registers.shape == (self.task_spec.num_inputs, self.task_spec.num_regs), \
@@ -1945,11 +1948,8 @@ class SharedReplayBuffer(ReplayBuffer):
         return self._client
     
     def save_game(self, game):
-        print("SharedReplayBuffer.save_game: game %s" % game)
         game_bin = pickle.dumps(game) # serialize the game
-        print("SharedReplayBuffer.save_game: getting write lock")
         with self._write_lock:
-            print("SharedReplayBuffer.save_game: got write lock")
             # get the write head
             write_head = self.client.get(self.WRITE_HEAD)
             write_head = int(write_head) if write_head is not None else 0
@@ -1961,28 +1961,19 @@ class SharedReplayBuffer(ReplayBuffer):
             # if the buffer is full, remove the oldest game
             if self.client.llen(self.LIST_NAME) > self.window_size:
                 self.client.lpop(self.LIST_NAME)
-            print("SharedReplayBuffer.save_game: wrote game to index %d" % write_head)
-            print("SharedReplayBuffer.save_game: write head %d" % write_head)
-            print("SharedReplayBuffer.save_game: buffer size %d" % self.client.llen(self.LIST_NAME))
         # release lock
-        print("SharedReplayBuffer.save_game: released write lock")
     
     def sample_game(self):
-        print("SharedReplayBuffer.sample_game")
         # uniformly sample an index
         list_len = self.client.llen(self.LIST_NAME) # <= self.window_size
-        print("SharedReplayBuffer.sample_game: buffer size %d" % list_len)
         if list_len == 0:
-            print("SharedReplayBuffer.sample_game: buffer is empty")
             return None
         list_len = min(list_len, self.window_size) # to be safe
         idx = int(numpy.random.uniform(0, list_len))
         # get the given index from the list
-        print("SharedReplayBuffer.sample_game: reading game from index %d" % idx)
         game_bin = self.client.lindex(self.LIST_NAME, idx)
         # deserialize the game
         game = pickle.loads(game_bin)
-        print("SharedReplayBuffer.sample_game: got game %s" % game)
         # if the game is empty, return a new game
         return game
 
@@ -2022,23 +2013,19 @@ class SharedStorage(object):
         # deserialize the network
         network_bin = self.client.hget(self.STORAGE_NAME, latest_network)
         network = pickle.loads(network_bin)
-        print("SharedStorage.latest_network: got network %s" % network)
         return network
 
     def save_network(self, step: int, parameters: Dict[str, jnp.ndarray]):
-        print("SharedStorage.save_network: step %d" % step)
         # Serialize parameters
         serialized = pickle.dumps(parameters)
         # set the new network
         self.client.hset(self.STORAGE_NAME, step, serialized)
-        print("SharedStorage.save_network: wrote network to index %d" % step)
         # Set the latest network
         # NOTE: we don't check for race conditions.
         # if there are multiple processes calling this function,
         # it can happen that the latest network (step number) is decremented.
         # we only train on a single process tho so this should be fine.
         self.client.set(self.LATEST_NETWORK, step)
-        print("SharedStorage.save_network: set latest netwrork to %d" % step)
 
 ##### End Helpers ########
 ##########################
@@ -2061,7 +2048,7 @@ def alphadev(config: AlphaDevConfig):
             run_selfplay, config, storage, replay_buffer
         )
         actors.append(job)
-    logger.info("Self-play jobs started, start training", len(actors))
+    logger.info("Self-play jobs started, start training")
     
     # start training
     train_network(config, storage, replay_buffer)
@@ -2745,9 +2732,9 @@ def generate_sort_inputs(
 #         logger.debug("Saved network %d. sleep for 1", i)
 #         time.sleep(1)
 
+logging.basicConfig(level=logging.INFO)
+logger.setLevel(logging.DEBUG)
 if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-    logger.setLevel(logging.DEBUG)
     config = AlphaDevConfig()
     alphadev(config)
 
