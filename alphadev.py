@@ -2025,25 +2025,20 @@ class SharedStorage(object):
         print("SharedStorage.latest_network: got network %s" % network)
         return network
 
-    def save_network(self, step: int, network: Network):
+    def save_network(self, step: int, parameters: Dict[str, jnp.ndarray]):
         print("SharedStorage.save_network: step %d" % step)
         # Serialize parameters
-        serialized = pickle.dumps(network)
-        latest_network = self.client.get(self.LATEST_NETWORK)
-        if latest_network is None:
-            latest_network = 1
-        else:
-            latest_network = int(latest_network)
-        
-        print("SharedStorage.save_network: latest network %d" % latest_network)
-        with self._write_lock:
-            new_network = 1 - latest_network
-            # set the new network
-            self.client.hset(self.STORAGE_NAME, new_network, serialized)
-            print("SharedStorage.save_network: wrote network to index %d" % new_network)
-            # Set the latest network
-            self.client.set(self.LATEST_NETWORK, new_network)
-            print("SharedStorage.save_network: set latest netwrork to %d" % new_network)
+        serialized = pickle.dumps(parameters)
+        # set the new network
+        self.client.hset(self.STORAGE_NAME, step, serialized)
+        print("SharedStorage.save_network: wrote network to index %d" % step)
+        # Set the latest network
+        # NOTE: we don't check for race conditions.
+        # if there are multiple processes calling this function,
+        # it can happen that the latest network (step number) is decremented.
+        # we only train on a single process tho so this should be fine.
+        self.client.set(self.LATEST_NETWORK, step)
+        print("SharedStorage.save_network: set latest netwrork to %d" % step)
 
 ##### End Helpers ########
 ##########################
