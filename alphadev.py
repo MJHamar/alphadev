@@ -753,7 +753,7 @@ class Network(object):
             embedding_dim=self.hparams.embedding_dim,
         )(*a, **k)
     
-    def init_params(self, key: jax.random.PRNGKey, action_space: ActionSpace) -> None:
+    def init_params(self, key: jax.random.PRNGKey) -> None:
         """Initialize the network with the given parameters."""
         rep_key, pred_key = jax.random.split(key, 2)
         dummy_obs = self._make_dummy_observation()
@@ -762,8 +762,7 @@ class Network(object):
             'representation': self.representation.init(rep_key, dummy_obs),
             'prediction': self.prediction.init(
                 pred_key, 
-                jnp.zeros((1, self.hparams.embedding_dim)), 
-                action_space
+                jnp.zeros((1, self.hparams.embedding_dim)),
             ),
             'steps': 0  # Store training steps in params
         }
@@ -781,9 +780,9 @@ class Network(object):
             'memory': jnp.zeros((1, self.task_spec.num_inputs, self.task_spec.num_mem), dtype=jnp.int32),
         }
 
-    def inference(self, params: Any, observation: Dict, action_space: ActionSpace) -> NetworkOutput:
+    def inference(self, params: Any, observation: Dict) -> NetworkOutput:
         embedding = self.representation.apply(params['representation'], None, observation)
-        return self.prediction.apply(params['prediction'], None, embedding, action_space)
+        return self.prediction.apply(params['prediction'], None, embedding)
 
     def update_params(self, params, updates: Any) -> None:
         new_params = jax.tree.map(lambda p, u: p + u, params, updates)
@@ -793,27 +792,7 @@ class Network(object):
 
     def copy_params(self, params: Any) -> Any:
         # Copy the parameters of the network
-        return jax.tree_map(lambda p: p.copy(), params)
-
-class UniformNetwork(object):
-    """Network representation that returns uniform output."""
-    # NOTE: this module is returned instead of the Network in case no parameters are in the buffer.
-    def __init__(self):
-        self.key = jax.random.PRNGKey(0)
-    # pylint: disable-next=unused-argument
-    def inference(self, observation, action_space: x86ActionSpace) -> NetworkOutput:
-        # representation + prediction function
-        return NetworkOutput(
-            value=jax.random.uniform(self.key, minval=-1.0, maxval=1.0),
-            correctness_value_logits=jax.random.uniform(self.key, shape=(1,), minval=-1.0, maxval=1.0),
-            latency_value_logits=jax.random.uniform(self.key, shape=(1,), minval=-1.0, maxval=1.0),
-            policy_logits={a: jax.random.uniform(self.key, minval=-1.0, maxval=1.0)
-                for a in action_space._actions.values()},
-        )
-
-    def update_params(self, params, updates: Any) -> None:
-        # Update network weights internally.
-        pass
+        return jax.tree.map(lambda p: p.copy(), params)
 
 
 ######## 2.2 Representation Network ########
@@ -1461,7 +1440,7 @@ class PredictionNet(hk.Module):
         self.support = DistributionSupport(self.value_max, self.value_num_bins)
         self.embedding_dim = embedding_dim
 
-    def __call__(self, embedding: jnp.ndarray, action_space: x86ActionSpace):
+    def __call__(self, embedding: jnp.ndarray):
         logger.debug("PredictionNet: embedding shape %s", embedding.shape)
         policy_head = make_head_network(
             self.embedding_dim, self.task_spec.num_actions
@@ -1476,22 +1455,13 @@ class PredictionNet(hk.Module):
         latency_value = latency_value_head(embedding)
         logger.debug("PredictionNet: latency_value shape %s", str({k:v.shape for k, v in latency_value.items()}))
 
-        policy = policy_head(embedding)
-        # 
-        logger.debug("PredictionNet: Policy shape: %s", policy.shape)
-        logger.debug("PredictionNet: action_space size %s", len(action_space._actions))
-        policy_dict = { # map Action -> logit
-            a: logit for a, logit in zip(action_space._actions.values(), policy)
-        }
-        logger.debug("PredictionNet: policy_dict size %d", len(policy_dict))
-        assert isinstance(list(policy_dict.keys())[0], Action), \
-            f"Expected action to be of type Action, got {type(list(policy_dict.keys())[0])}"
-
+        policy = policy_head(embedding) # B x num_actions
+        
         output = NetworkOutput(
             value=correctness_value['mean'] + latency_value['mean'],
             correctness_value_logits=correctness_value['logits'],
             latency_value_logits=latency_value['logits'],
-            policy_logits=policy_dict,
+            policy_logits=policy,
         )
         logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items() if isinstance(v, jnp.ndarray)}))
         return output
@@ -1518,6 +1488,7 @@ class AlphaDevConfig(object):
     def __init__(
         self,
     ):
+        self.experiment_name = 'AlphaDev-test'
         ### Self-Play
         self.num_actors = 3  # TPU actors
         # pylint: disable-next=g-long-lambda
@@ -1760,9 +1731,8 @@ class Game(object):
         #         if actions_mask[i]:
         #                 logger.debug("  %s", space.get(action))
         
-        legal_actions = [self.action_space_storage.actions[a] for a in pruned_actions.tolist()]
-        logger.debug("Legal actions: %s", legal_actions)
-        return legal_actions
+        logger.debug("legal_actions: pruned_actions shape %s", pruned_actions.shape)
+        return pruned_actions
 
     def apply(self, action: Action):
         _, reward = self.environment.step(action)
@@ -1781,28 +1751,17 @@ class Game(object):
                 root.children[a].visit_count / sum_visits
                 if a in root.children
                 else 0
-                for a in action_space.values()
+                for a in action_space.keys()
             ]
         )
         self.root_values.append(root.value())
-
-    def _batch_observation(self, observation: Dict[str, jnp.ndarray]):
-        # games make a single observation at a time, but the network expects a batch.
-        return {
-            "registers": observation["registers"][None, ...],
-            "memory": observation["memory"][None, ...],
-            "register_mask": observation["register_mask"][None, ...],
-            "memory_mask": observation["memory_mask"][None, ...],
-            "program": jnp.pad(observation["program"],((0, self.task_spec.max_program_size - observation["program"].shape[0]), (0, 0)))[None, ...],
-            "program_length": observation["program_length"][None, ...],
-        }
 
     def make_observation(self, state_index: int):
         logger.debug("Game.make_observation: state_index %d", state_index)
         # NOTE: returns the observation corresponding to the last action
         if state_index == -1:
             observation = self.environment.observation()
-            return self._batch_observation(observation)
+            return _batch_observation(self.task_spec.max_program_size, observation)
         # re-play the game from the initial state.
         if state_index > len(self.history):
             state_index = len(self.history) # for safety
@@ -1811,7 +1770,7 @@ class Game(object):
             _, _ = env.step(action)
         observation = env.observation()
         
-        return self._batch_observation(observation)
+        return _batch_observation(self.task_spec.max_program_size, observation)
 
     def make_target(
         # pylint: disable-next=unused-argument
@@ -1849,6 +1808,19 @@ class Game(object):
     def action_history(self) -> ActionHistory:
         return ActionHistory(self.history, self.action_space_size)
 
+
+def _batch_observation(max_program_size: int, observation: Dict[str, jnp.ndarray]):
+    # games make a single observation at a time, but the network expects a batch.
+    logger.info("_batch_observation: program shape %s", observation["program"].shape)
+    
+    return {
+        "registers": observation["registers"][None, ...],
+        "memory": observation["memory"][None, ...],
+        "register_mask": observation["register_mask"][None, ...],
+        "memory_mask": observation["memory_mask"][None, ...],
+        "program": jnp.pad(observation["program"],((0, max_program_size - observation["program"].shape[0]), (0, 0)))[None, ...],
+        "program_length": observation["program_length"][None, ...],
+    }
 
 class ReplayBuffer(object):
     """Replay buffer object storing games for training."""
@@ -1943,14 +1915,22 @@ class SharedReplayBuffer(ReplayBuffer):
     
     def __init__(self, config: AlphaDevConfig):
         super().__init__(config)
+        # names
+        self.WRITE_HEAD = f"{self.WRITE_HEAD}_{config.experiment_name}"
+        self.LIST_NAME = f"{self.LIST_NAME}_{config.experiment_name}"
+        
         self.redis_config = config.redis
         self._client = None
+        # clean up if necessary
+        self.client.delete(self.WRITE_HEAD)
+        self.client.delete(self.LIST_NAME)
         # set keys
         self.client.set(self.WRITE_HEAD, 0)
         # optionally also make a priority array
         
         # lock for writing
         self._write_lock = multiprocessing.Lock()
+        
         # delete the client so it doesn't get pickled
         self.client.close()
         self._client = None
@@ -2002,13 +1982,21 @@ class SharedStorage(object):
     LATEST_NETWORK = 'latest_network'
     STORAGE_NAME = 'alphadev_storage'
 
-    def __init__(self, redis_config: ml_collections.ConfigDict):
+    def __init__(self, config: AlphaDevConfig):
         # initialize a shared memory for the configuration.
         # all processes will have a pointer to this memory.
         # this will allow us to populate the shared memory 
         # with the network parameters just in time.
         self._client = None
-        self.redis_config = redis_config
+        self.redis_config = config.redis
+        self.LATEST_NETWORK = f"{self.LATEST_NETWORK}_{config.experiment_name}"
+        self.STORAGE_NAME = f"{self.STORAGE_NAME}_{config.experiment_name}"
+        # clean up
+        self.client.delete(self.LATEST_NETWORK)
+        self.client.delete(self.STORAGE_NAME)
+        # delete the client so it doesn't get pickled
+        self.client.close()
+        self._client = None
         
         # write lock, althogh only a single process writes
         self._write_lock = multiprocessing.Lock()
@@ -2055,8 +2043,15 @@ class SharedStorage(object):
 # from the training to the self-play, and the finished games from the self-play
 # to the training.
 def alphadev(config: AlphaDevConfig):
-    storage = SharedStorage(config.redis)
+    storage = SharedStorage(config)
     replay_buffer = SharedReplayBuffer(config)
+
+    # initialize the network by playing a game
+    game, network, network_params = run_once(config)
+    logger.info("Initial game finished, storing the network parameters and the game.")
+    replay_buffer.save_game(game)
+    storage.save_network(0, network_params)
+    logger.info("Game and parameters stored")
 
     actors = []
 
@@ -2069,7 +2064,7 @@ def alphadev(config: AlphaDevConfig):
     logger.info("Self-play jobs started, start training")
     
     # start training
-    train_network(config, storage, replay_buffer)
+    train_network(config, storage, replay_buffer, network, network_params)
     
     # wait for all actors to finish
     logger.info("Training fisihed, terminating self-play jobs")
@@ -2152,10 +2147,8 @@ def play_game(config: AlphaDevConfig, network: Network, params) -> Game:
         # Initialisation of the root node and addition of exploration noise
         root = Node(0) # NOTE: a dummy root
         current_observation = game.make_observation(-1)
-        state = CPUState(**current_observation) # easier to create a new one
-        action_space = game.action_space_storage.get_space(state)
-        logger.debug("play_game: action space actions %s", action_space._actions)
-        network_output = network.inference(params, current_observation, action_space)
+
+        network_output = network.inference(params, current_observation)
         _expand_node( # expand current root
             root, game.to_play(), game.legal_actions(), network_output, reward=0
         )
@@ -2228,6 +2221,8 @@ def run_mcts(
 
         while node.expanded():
             action, node = _select_child(config, node, min_max_stats) # based on UCB
+            action = action_space_storage.actions[action] # convert from int to Action
+            logger.debug("run_mcts: selected action %s", action)
             sim_env.step(action) # step the environment
             history.add_action(action) # update history 
             search_path.append(node) # append to the current trajectory
@@ -2236,9 +2231,10 @@ def run_mcts(
         # Inside the search tree we use the environment to obtain the next
         # observation and reward given an action.
         observation, reward = sim_env.observation(), sim_env.correctness_reward()
+        observation = _batch_observation(env.task_spec.max_program_size, observation)
         action_space = action_space_storage.get_space(CPUState(**observation))
         # get the priors
-        network_output = network.inference(params, observation, action_space)
+        network_output = network.inference(params, observation)
         _expand_node( # expand the leaf node
             # here, game is not available. I suppose we do not perform action pruning.
             # instead, the history should be initialized either 
@@ -2249,7 +2245,7 @@ def run_mcts(
             # pruning the action space during MCTS might entail a big overhead.
             # we need to experiment with this.
             # NOTE: for now, we go with AlphaDev's implementation of returning all actions.
-            node, history.to_play(), list(action_space._actions.values()), network_output, reward
+            node, history.to_play(), jnp.asarray(action_space.actions), network_output, reward
         )
         _backpropagate(
             search_path,
@@ -2270,7 +2266,7 @@ def _select_action(
 ) -> Action:
     # logger.debug("select_action at node %s", node)
     visit_counts = jnp.array([
-        (child.visit_count, action.index) for action, child in node.children.items()
+        (child.visit_count, action) for action, child in node.children.items()
     ])
     t = config.visit_softmax_temperature_fn(
         steps=training_steps
@@ -2322,7 +2318,7 @@ def _ucb_score(
 def _expand_node(
     node: Node,
     to_play: Player,
-    actions: Sequence[Action],
+    actions: jnp.ndarray,
     network_output: NetworkOutput,
     reward: float,
 ):
@@ -2332,18 +2328,20 @@ def _expand_node(
     node.reward = reward
     # Masked softmax. actions() are the legal actions and network output is the prior
     # TODO: use a more efficient softmax instead of the lines below.
-    logger.debug("_expand_node: policy logits keys %s", network_output.policy_logits.keys())
-    policy = {a: math.exp(network_output.policy_logits[a]) for a in actions} # softmax
-    policy_sum = sum(policy.values())
-    for action, p in policy.items():
-        node.children[action] = Node(p / policy_sum)
-    #   logger.debug("Expanded node: %s", node)
-    # unique_scores, unique_indices = numpy.unique(
-    #     [c.prior for c in node.children.values()], return_index=True
-    # )
-    #   logger.debug("expand: unique scores: %s", unique_scores)
-    #   logger.debug("expand: unique indices: %s", unique_indices)
-
+    logger.debug("_expand_node: policy logits shape %s", network_output.policy_logits.shape)
+    policy_logits = network_output.policy_logits # B x A with B = 1 or not included. we first average
+    if len(policy_logits.shape) > 1:
+        policy_logits = jnp.mean(policy_logits, axis=0)
+    # select the logits that correspond to the (legal) actions
+    # take softmax over the logits
+    policy = jax.nn.softmax(policy_logits)
+    logger.debug("_expand_node: indexing policy %s with actions %s", policy.shape, actions.shape)
+    policy = policy[actions]
+    assert len(policy) == len(actions), \
+        f"Expected {len(actions)} actions, got {len(policy)}"
+    for action, p in zip(actions.tolist(), policy.tolist()):
+        node.children[action] = Node(p)
+    
 
 def _backpropagate(
     search_path: Sequence[Node],
@@ -2353,6 +2351,8 @@ def _backpropagate(
     min_max_stats: MinMaxStats,
 ):
     """Propagates the evaluation all the way up the tree to the root."""
+    if isinstance(value, jnp.ndarray) and len(value.shape) > 1:
+        value = jnp.mean(value, axis=0) # remove the batch dimension if present
     for node in reversed(search_path):
         node.value_sum += value if node.to_play == to_play else -value
         node.visit_count += 1
@@ -2378,24 +2378,10 @@ def _add_exploration_noise(config: AlphaDevConfig, node: Node):
 
 
 def train_network(
-    config: AlphaDevConfig, storage: SharedStorage, replay_buffer: ReplayBuffer
+    config: AlphaDevConfig, storage: SharedStorage, replay_buffer: ReplayBuffer,
+    network: Network, network_params
 ):
     """Trains the network on data stored in the replay buffer."""
-    # TODO: we might want to raise action space storage 
-    # above the context of a game but then we will also have race conditions.
-    game = replay_buffer.sample_game()
-    while game is None:
-        logger.info("Waiting for a game to be available in the replay buffer")
-        time.sleep(1)
-        game = replay_buffer.sample_game()
-    logger.info("A game was found in the replay buffer. Starting training.")
-    action_space_storage = game.action_space_storage # any game.
-    action_space = action_space_storage.get_space(game.environment.state())
-
-    logger.info("Initializing network")
-    network = Network(config.hparams, config.task_spec) # the one we train
-    key = jax.random.PRNGKey(0)
-    network_params = network.init_params(key, action_space) # initialize the network
     target_params = network.copy_params(network_params)
     
     # init optimizer
@@ -2417,8 +2403,7 @@ def train_network(
         batch = replay_buffer.sample_batch(config.td_steps)
         # run inference and update the parameters
         network_params, optimizer_state = _update_weights(
-            optimizer, optimizer_state, network, network_params, target_params, batch,
-            action_space_storage)
+            optimizer, optimizer_state, network, network_params, target_params, batch)
     storage.save_network(config.training_steps, network)
 
 def scale_gradient(tensor: Any, scale):
@@ -2429,28 +2414,19 @@ def _loss_fn(
     network_params: jnp.array,
     target_network_params: jnp.array,
     network: Network,
-    batch: SampleBatch,
-    action_space_storage: x86ActionSpaceStorage
+    batch: SampleBatch
 ) -> float:
     """Computes loss."""
     loss = 0
     observation, bootstrap_obs, target = batch
 
-    state = CPUState(**observation) # TODO: with dynamic action spaces, this will get ugly fast.
-    action_space = action_space_storage.get_space(state)
     # NOTE: re-compute the priors instead of using the cached ones
     # which is fine, we want the updated network to be used for each batch.
-    predictions = network.inference(network_params, observation, action_space)
-    logger.debug("<train_label>")
-    logger.debug("loss_fn: prediction dict shapes %s", str({k:v.shape for k, v in predictions._asdict().items() if isinstance(v, jnp.ndarray)}))
-    logger.debug("loss_fn: policy all zeros %s", (
-        jnp.array([v for v in predictions.policy_logits.values()]) == 0).all())
+    predictions = network.inference(network_params, observation)
     
     # TODO: understand the impact of having potentially
     # different action spaces for network and target network.
-    bootstrap_space = action_space_storage.get_space(CPUState(**bootstrap_obs))
-    bootstrap_predictions = network.inference(
-        target_network_params, bootstrap_obs, bootstrap_space)
+    bootstrap_predictions = network.inference(target_network_params, bootstrap_obs)
     target_correctness, target_latency, target_policy, bootstrap_discount = (
         target
     )
@@ -2459,9 +2435,7 @@ def _loss_fn(
         # both have shape B x 1
         bootstrap_discount * bootstrap_predictions.value
     )
-    policy_logits = jnp.asarray(
-        [predictions.policy_logits[a] for a in predictions.policy_logits.keys()]
-    )
+    policy_logits = predictions.policy_logits # B x num_bins
     l_policy = optax.softmax_cross_entropy(policy_logits, target_policy)
     # predictions is B x num_bins, target is B x 1
     # we need to convert the target to a two-hot vector B x num_bins with the two closest bins 
@@ -2491,15 +2465,13 @@ def _update_weights(
     network_params,
     target_params,
     batch: SampleBatch,
-    action_space_storage: ActionSpaceStorage,
 ) -> Any:
     """Updates the weight of the network."""
     updates = _loss_grad(
         network_params,
         target_params,
         network,
-        batch,
-        action_space_storage)
+        batch)
 
     optim_updates, new_optim_state = optimizer.update(updates, optimizer_state)
     new_params = network.update_params(network_params, optim_updates)
@@ -2520,6 +2492,25 @@ def scalar_loss(prediction:jnp.ndarray, target:jnp.ndarray, network:Network) -> 
 
 ######### End Training ###########
 ##################################
+
+######### Non-distributed inference ##########
+
+def run_once(
+    config: AlphaDevConfig
+):
+    """
+    Initializes the network and plays a game.
+    Returns the game, the network and the storage. 
+    """
+    logger.info("Running once to initialize the network")
+    network = Network(config.hparams, config.task_spec)
+    key = jax.random.PRNGKey(0) # TODO: pass this as an argument
+    logger.info("Initializing network")
+    network_params = network.init_params(key)
+    logger.info("Playing a single game")
+    game = play_game(config, network, network_params)
+    return game, network, network_params
+
 
 ################################################################################
 ############################# End of pseudocode ################################
@@ -2753,7 +2744,7 @@ def generate_sort_inputs(
 #         time.sleep(1)
 
 logging.basicConfig(level=logging.INFO)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 if __name__ == '__main__':
     config = AlphaDevConfig()
     alphadev(config)
