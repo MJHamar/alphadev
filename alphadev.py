@@ -49,9 +49,13 @@ import optax
 from tinyfive.multi_machine import multi_machine
 
 # sharing data between processes
+import redis
 import pickle
 import multiprocessing
-from multiprocessing.shared_memory import SharedMemory
+# so jax doesn't complain about forking
+multiprocessing.set_start_method('spawn', force=True)
+# from multiprocessing.shared_memory import SharedMemory
+
 
 # profiling
 import cProfile
@@ -1529,6 +1533,11 @@ class AlphaDevConfig(object):
         self.num_simulations = 5
         self.discount = 1.0
 
+        self.redis = ml_collections.ConfigDict()
+        self.redis.host = 'localhost'
+        self.redis.port = 6379
+        self.redis.db = 0
+
         # Root prior exploration noise.
         self.root_dirichlet_alpha = 0.03
         self.root_exploration_fraction = 0.25
@@ -1913,225 +1922,143 @@ class ReplayBuffer(object):
     def load(self, path: str):
         self.buffer = jnp.load(path, allow_pickle=True)
 
-class SHMConfig(NamedTuple):
-    name: str
-    size: int
-
 class SharedReplayBuffer(ReplayBuffer):
     """Replay buffer object for safely storing games for training.
-    The buffer is filled in a thread-safe manner, with a cyclic buffer.
-    A producer process can request a write position and obtain a lock for it
-    the consumer process can request a read position and obtain a lock for it.
+    The buffer is a cyclical buffer implemented in Redis.
+    There write operations are synchronized,
+    while read operations are not (apart from Redis' single-threaded model).
+    
+    The cool thing about this is that Redis' memory can persist between runs
+    so it is easy to resume training.
     """
-    class Header(NamedTuple):
-        # so we know where to start writing
-        write_head: int
-        # so we know how many elements are in the buffer
-        num_elements: int
-    class MemoryItemHeader(NamedTuple):
-        # prepended to the beginning of each item so we know how many bytes to read
-        # to get the item
-        size: int
+    WRITE_HEAD = 'write_head'
+    LIST_NAME = 'replay_buffer'
     
-    def __init__(self, config, name='replay_buffer'):
+    def __init__(self, config: AlphaDevConfig):
         super().__init__(config)
-        self._name = name
-        self._item_window_size = 1024
+        self.redis_config = config.redis
+        self._client = None
+        # set keys
+        self.client.set(self.WRITE_HEAD, 0)
+        # optionally also make a priority array
         
-        # create header for the shared memory.
-        header = self.Header(write_head=self.window_size, num_elements=self.window_size)
-        header_bin = pickle.dumps(header)
-        # create a dummy memory item header so we know its size
-        item_header = self.MemoryItemHeader(size=self._item_window_size)
-        item_header_bin = pickle.dumps(item_header)
-        # save the sizes of the headers
-        self._header_size = len(header_bin)
-        self._item_header_size = len(item_header_bin)
-        logger.debug("SharedReplayBuffer: header size %d, item header size %d", self._header_size, self._item_header_size)
+        # lock for writing
+        self._write_lock = multiprocessing.Lock()
+        # delete the client so it doesn't get pickled
+        self.client.close()
+        self._client = None
         
-        # calculate the total size of the shared memory
-        # which is header + item_window_size * window_size
-        self._size = self._item_window_size * self.window_size
-        self._size += self._header_size
-        logger.debug("SharedReplayBuffer: size %d", self._size)
-        # create SHM
-        self._shm = SharedMemory(name=self._name, create=True, size=self._size)
-        logger.debug("SharedReplayBuffer: created shared memory %s", self._shm.name)
-        # write the header to the shared memory
-        self._shm.buf[:self._header_size] = header_bin
-        logger.debug("SharedReplayBuffer: wrote header to shared memory")
-        
-        # create separate locks for each item in the buffer
-        self._lock = [multiprocessing.Lock() for _ in range(self.window_size)]
-        # create a lock for the header
-        self._header_lock = multiprocessing.Lock()
-        logger.debug("SharedReplayBuffer: created %d locks for accessing the buffer", self.window_size)
-
-    def _read_shm(self, index: int) -> Game:
-        logger.debug("SharedReplayBuffer._read_shm: index %d", index)
-        # first read the header
-        offset = self._header_size + index * self._item_window_size
-        logger.debug("SharedReplayBuffer._read_shm: offset %d, waiting for lock", offset)
-        with self._lock[index]: # lock this item only
-            logger.debug("SharedReplayBuffer._read_shm: got lock for index %d", index)
-            # read the item header
-            item_header_bin = self._shm.buf[offset:offset+self._item_header_size]
-            item_header = self.MemoryItemHeader(**pickle.loads(item_header_bin))
-            logger.debug("SharedReplayBuffer._read_shm: item header %s", item_header)
-            # read the item
-            offset += self._item_header_size
-            item_bin = self._shm.buf[offset:offset+item_header.size]
-            logger.debug("SharedReplayBuffer._read_shm: item binary %d", len(item_bin))
-        logger.debug("SharedReplayBuffer._read_shm: lock released for index %d", index)
-        item = pickle.loads(item_bin)
-        logger.debug("SharedReplayBuffer._read_shm: item %s", item)
-        return item
+    @property
+    def client(self) -> redis.Redis:
+        # cache the client
+        if self._client is not None:
+            return self._client
+        self._client = redis.Redis(**self.redis_config.to_dict())
+        if not self._client.ping():
+            raise RuntimeError(f"Could not connect to Redis server at {self.redis_config.host}:{self.redis_config.port}.")
+        return self._client
     
-    def _write_shm(self, item):
-        logger.debug("SharedReplayBuffer._write_shm: item %s", item)
-        # convert to binary before locking the shared memory
-        item_bin = pickle.dumps(item)
-        item_header = self.MemoryItemHeader(size=len(item_bin))
-        item_header_bin = pickle.dumps(item_header)
-        logger.debug("SharedReplayBuffer._write_shm: item header %s", item_header)
-
-        # get the header
-        logger.debug("SharedReplayBuffer._write_shm: waiting for header lock")
-        with self._header_lock:
-            logger.debug("SharedReplayBuffer._write_shm: got header lock")
-            header: SharedReplayBuffer.Header = pickle.loads(self._shm.buf[:self._header_size])
-            logger.debug("SharedReplayBuffer._write_shm: header %s", header)
-            write_head = (header.write_head + 1) % self.window_size # cyclic buffer
-            num_elements = min(header.num_elements + 1, self.window_size) # active region of the buffer
-            new_header = SharedReplayBuffer.Header(
-                write_head=write_head,
-                num_elements=num_elements
-            )
-            logger.debug("SharedReplayBuffer._write_shm: new header %s", new_header)
-            # write the header
-            new_header_bin = pickle.dumps(new_header)
-            self._shm.buf[:self._header_size] = new_header_bin
-            # get a lock to the write head before releasing the header lock so that other writers do not 
-            # interfere
-            logger.debug("SharedReplayBuffer._write_shm: waiting for lock for write head %d", write_head)
-            write_lock = self._lock[write_head]
-            write_lock.acquire() # lock the write head
-            logger.debug("SharedReplayBuffer._write_shm: got lock for write head %d", write_head)
-            # release the header lock
-        logger.debug("SharedReplayBuffer._write_shm: header lock released")
-        # first read the item header
-        offset = self._header_size + write_head * self._item_window_size
-        # write the item header
-        self._shm.buf[offset:offset+self._item_header_size] = item_header_bin
-        logger.debug("SharedReplayBuffer._write_shm: wrote item header %s", item_header)
-        # write the item
-        offset += self._item_header_size
-        self._shm.buf[offset:offset+item_header.size] = item_bin
-        logger.debug("SharedReplayBuffer._write_shm: wrote item %s", item)
-        # release the lock
-        write_lock.release() # release the write lock
-        logger.debug("SharedReplayBuffer._write_shm: lock released for write head %d", write_head)
-        # done
-
     def save_game(self, game):
-        logger.debug("SharedReplayBuffer.save_game: game %s", game)
-        # NOTE: _write_shm takes care of indexing and locking
-        self._write_shm(game)
+        print("SharedReplayBuffer.save_game: game %s" % game)
+        game_bin = pickle.dumps(game) # serialize the game
+        print("SharedReplayBuffer.save_game: getting write lock")
+        with self._write_lock:
+            print("SharedReplayBuffer.save_game: got write lock")
+            # get the write head
+            write_head = self.client.get(self.WRITE_HEAD)
+            write_head = int(write_head) if write_head is not None else 0
+            # increment the write head and num_items
+            write_head = (write_head + 1) % self.window_size
+            self.client.set(self.WRITE_HEAD, write_head)
+            # write the game to the shared memory
+            self.client.rpush(self.LIST_NAME, game_bin)
+            # if the buffer is full, remove the oldest game
+            if self.client.llen(self.LIST_NAME) > self.window_size:
+                self.client.lpop(self.LIST_NAME)
+            print("SharedReplayBuffer.save_game: wrote game to index %d" % write_head)
+            print("SharedReplayBuffer.save_game: write head %d" % write_head)
+            print("SharedReplayBuffer.save_game: buffer size %d" % self.client.llen(self.LIST_NAME))
+        # release lock
+        print("SharedReplayBuffer.save_game: released write lock")
     
     def sample_game(self):
-        logger.debug("SharedReplayBuffer.sample_game")
-        with self._header_lock:
-            logger.debug("SharedReplayBuffer.sample_game: header lock acquired")
-            header: SharedReplayBuffer.Header = pickle.loads(self._shm.buf[:self._header_size])
-            # release the header lock immediately. 
-        logger.debug("SharedReplayBuffer.sample_game: header lock released")
+        print("SharedReplayBuffer.sample_game")
         # uniformly sample an index
-        idx = numpy.random.uniform(0, header.num_elements)
-        # read the game from the shared memory
-        # NOTE: again, _read_shm takes care of locking
-        logger.debug("SharedReplayBuffer.sample_game: reading game from index %d", idx)
-        game = self._read_shm(idx)
+        list_len = self.client.llen(self.LIST_NAME) # <= self.window_size
+        print("SharedReplayBuffer.sample_game: buffer size %d" % list_len)
+        if list_len == 0:
+            print("SharedReplayBuffer.sample_game: buffer is empty")
+            return None
+        list_len = min(list_len, self.window_size) # to be safe
+        idx = int(numpy.random.uniform(0, list_len))
+        # get the given index from the list
+        print("SharedReplayBuffer.sample_game: reading game from index %d" % idx)
+        game_bin = self.client.lindex(self.LIST_NAME, idx)
+        # deserialize the game
+        game = pickle.loads(game_bin)
+        print("SharedReplayBuffer.sample_game: got game %s" % game)
+        # if the game is empty, return a new game
         return game
-    
-    def save(self, path):
-        return super().save(path)
-    def load(self, path):
-        super().load(path)
+
 
 class SharedStorage(object):
     """Controls which network is used at inference."""
 
-    def __init__(self, name:str = 'parameter_sharing'):
+    LATEST_NETWORK = 'latest_network'
+    STORAGE_NAME = 'alphadev_storage'
+
+    def __init__(self, redis_config: ml_collections.ConfigDict):
         # initialize a shared memory for the configuration.
         # all processes will have a pointer to this memory.
         # this will allow us to populate the shared memory 
         # with the network parameters just in time.
-        self.config = self.SHMConfig(name=name, size=0)
-        self.config_name = f'{name}_config'
-        cfg_binary = pickle.dumps(self.config)
-        self._config_shm = SharedMemory(name=self.config_name, create=True, size=len(cfg_binary))
-        self._config_shm.buf[:len(cfg_binary)] = cfg_binary
-        self._config_lock = multiprocessing.Lock()
+        self._client = None
+        self.redis_config = redis_config
         
-        self._shared_mem = None
-        self.size = 0
-        self._lock = multiprocessing.Lock()
-        self._write_head = 0
-    
+        # write lock, althogh only a single process writes
+        self._write_lock = multiprocessing.Lock()
+        
     @property
-    def read_head(self) -> int:
-        return 1 - self._write_head
-    @property
-    def size(self) -> int:
-        return self.config.size
-
+    def client(self) -> redis.Redis:
+        # cache the client
+        if self._client is not None:
+            return self._client
+        self._client = redis.Redis(**self.redis_config.to_dict())
+        if not self._client.ping():
+            raise RuntimeError(f"Could not connect to Redis server at {self.redis_config.host}:{self.redis_config.port}.")
+        return self._client
+        
     def latest_network(self) -> Network:
-        if self._shared_mem is None:
-            logger.debug("SharedStorage.latest_network looking for shared memory")
-            # load the config from the shared memory
-            with self._config_lock:
-                self.config = pickle.loads(self._config_shm.buf[:self._config_shm.size])
-                if self.size != 0:
-                    self._shared_mem = SharedMemory(name=self.config.name, create=False)
-                    logger.debug("SharedStorage.latest_network found shared memory %s", self.config.name)
-        # return the latest network
-        # if the shared memory is not initialized, return a default network
-        if self._shared_mem is not None:
-            read_pos = self.read_head * (self.size // 2)
-            return pickle.loads(self._shared_mem.buf[read_pos:read_pos+self.size])
-        else:
-        # policy -> uniform, value -> 0, reward -> 0
-            return make_uniform_network()
+        latest_network = self.client.get(self.LATEST_NETWORK)
+        if latest_network is None:
+            return UniformNetwork()
+        latest_network = int(latest_network)
+        # deserialize the network
+        network_bin = self.client.hget(self.STORAGE_NAME, latest_network)
+        network = pickle.loads(network_bin)
+        print("SharedStorage.latest_network: got network %s" % network)
+        return network
 
     def save_network(self, step: int, network: Network):
-        logger.debug("SharedStorage.save_network: step %d", step)
+        print("SharedStorage.save_network: step %d" % step)
         # Serialize parameters
         serialized = pickle.dumps(network)
-        param_size = len(serialized)
-
-        with self._lock:
-            if self._shared_mem is None:
-                # Initialize shared memory with double size
-                self.config.size = 2 * param_size
-                self._shared_mem = SharedMemory(name=self.config.name, create=True, size=self.size)
-                # update the shared config
-                cfg_binary = pickle.dumps(self.config)
-                with self._config_lock:
-                    self._config_shm.buf[:len(cfg_binary)] = cfg_binary
-                logger.debug("SharedStorage.save_network initialized shared memory %s", self.config.name)
-            else:
-                assert self.size >= 2*param_size, \
-                    f"Shared memory size {self.size} is smaller than 2*param_size {2*param_size}"
-
-            # Determine write location
-            write_pos = self._write_head * param_size
-
-            # Write serialized params to shared memory
-            self._shared_mem.buf[write_pos:write_pos+param_size] = serialized
-
-            # Update write head (toggle between 0 and 1)
-            self._write_head = self.read_head
-
+        latest_network = self.client.get(self.LATEST_NETWORK)
+        if latest_network is None:
+            latest_network = 1
+        else:
+            latest_network = int(latest_network)
+        
+        print("SharedStorage.save_network: latest network %d" % latest_network)
+        with self._write_lock:
+            new_network = 1 - latest_network
+            # set the new network
+            self.client.hset(self.STORAGE_NAME, new_network, serialized)
+            print("SharedStorage.save_network: wrote network to index %d" % new_network)
+            # Set the latest network
+            self.client.set(self.LATEST_NETWORK, new_network)
+            print("SharedStorage.save_network: set latest netwrork to %d" % new_network)
+    
 ##### End Helpers ########
 ##########################
 
@@ -2775,20 +2702,24 @@ def generate_sort_inputs(
 # ]
 # idx_to_op = {idx: op for idx, op in enumerate(op_list)}
 # op_to_idx = {op: idx for idx, op in enumerate(op_list)}
-def reader(buffer: SharedReplayBuffer):
+def reader(buffer: SharedStorage):
     logger.debug("Reader started sleeping for 1 seconds")
     time.sleep(1)
     logger.debug("Reader done sleeping")
-    for i in range(3):
-        game = buffer.sample_game()
-        logger.debug("Reader sampled game %d at iter %d. sleeping for 0.3", game, i)
-        time.sleep(0.3)
+    for i in range(10):
+        # game = buffer.sample_game()
+        # logger.debug("Reader sampled game %d at iter %d. sleeping for 0.3", game, i)
+        game = buffer.latest_network()
+        logger.debug("Reader got network %d at iter %d. sleeping for 0.3", game, i)
+        time.sleep(1)
 
-def writer(buffer: SharedReplayBuffer):
+def writer(buffer: SharedStorage):
     logger.debug("Writer started")
-    for i in range(3):
-        buffer.save_game(1)
-        logger.debug("Saved game %d. sleep for 1", i)
+    for i in range(10):
+        # buffer.save_game(1)
+        # logger.debug("Saved game %d. sleep for 1", i)
+        buffer.save_network(i, i)
+        logger.debug("Saved network %d. sleep for 1", i)
         time.sleep(1)
 
 if __name__ == '__main__':
@@ -2801,11 +2732,11 @@ if __name__ == '__main__':
     # actions = x86_enumerate_actions(3,3)
     # for action in actions:
     #     print(action)
-    multiprocessing.set_start_method('spawn', force=True)
     # test replay buffer
     
-    config.window_size = 2
-    replay_buffer = SharedReplayBuffer(config)
+    config.window_size = 5
+    replay_buffer = SharedStorage(config.redis)
+    
     p1 = multiprocessing.Process(target=reader, args=(replay_buffer,))
     p2 = multiprocessing.Process(target=writer, args=(replay_buffer,))
     p2.start(); p1.start()
