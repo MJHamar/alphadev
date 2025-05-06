@@ -1477,10 +1477,13 @@ class PredictionNet(hk.Module):
         logger.debug("PredictionNet: latency_value shape %s", str({k:v.shape for k, v in latency_value.items()}))
 
         policy = policy_head(embedding)
-        logger.debug("Policy shape: %s", policy.shape)
+        # 
+        logger.debug("PredictionNet: Policy shape: %s", policy.shape)
+        logger.debug("PredictionNet: action_space size %s", len(action_space._actions))
         policy_dict = { # map Action -> logit
             a: logit for a, logit in zip(action_space._actions.values(), policy)
         }
+        logger.debug("PredictionNet: policy_dict size %d", len(policy_dict))
         assert isinstance(list(policy_dict.keys())[0], Action), \
             f"Expected action to be of type Action, got {type(list(policy_dict.keys())[0])}"
 
@@ -1757,7 +1760,9 @@ class Game(object):
         #         if actions_mask[i]:
         #                 logger.debug("  %s", space.get(action))
         
-        return [self.action_space_storage.actions[a] for a in pruned_actions.tolist()]
+        legal_actions = [self.action_space_storage.actions[a] for a in pruned_actions.tolist()]
+        logger.debug("Legal actions: %s", legal_actions)
+        return legal_actions
 
     def apply(self, action: Action):
         _, reward = self.environment.step(action)
@@ -1781,11 +1786,23 @@ class Game(object):
         )
         self.root_values.append(root.value())
 
+    def _batch_observation(self, observation: Dict[str, jnp.ndarray]):
+        # games make a single observation at a time, but the network expects a batch.
+        return {
+            "registers": observation["registers"][None, ...],
+            "memory": observation["memory"][None, ...],
+            "register_mask": observation["register_mask"][None, ...],
+            "memory_mask": observation["memory_mask"][None, ...],
+            "program": jnp.pad(observation["program"],((0, self.task_spec.max_program_size - observation["program"].shape[0]), (0, 0)))[None, ...],
+            "program_length": observation["program_length"][None, ...],
+        }
+
     def make_observation(self, state_index: int):
         logger.debug("Game.make_observation: state_index %d", state_index)
         # NOTE: returns the observation corresponding to the last action
         if state_index == -1:
-            return self.environment.observation()
+            observation = self.environment.observation()
+            return self._batch_observation(observation)
         # re-play the game from the initial state.
         if state_index > len(self.history):
             state_index = len(self.history) # for safety
@@ -1793,7 +1810,8 @@ class Game(object):
         for action in self.history[:state_index]:
             _, _ = env.step(action)
         observation = env.observation()
-        return observation
+        
+        return self._batch_observation(observation)
 
     def make_target(
         # pylint: disable-next=unused-argument
@@ -2136,6 +2154,7 @@ def play_game(config: AlphaDevConfig, network: Network, params) -> Game:
         current_observation = game.make_observation(-1)
         state = CPUState(**current_observation) # easier to create a new one
         action_space = game.action_space_storage.get_space(state)
+        logger.debug("play_game: action space actions %s", action_space._actions)
         network_output = network.inference(params, current_observation, action_space)
         _expand_node( # expand current root
             root, game.to_play(), game.legal_actions(), network_output, reward=0
@@ -2313,6 +2332,7 @@ def _expand_node(
     node.reward = reward
     # Masked softmax. actions() are the legal actions and network output is the prior
     # TODO: use a more efficient softmax instead of the lines below.
+    logger.debug("_expand_node: policy logits keys %s", network_output.policy_logits.keys())
     policy = {a: math.exp(network_output.policy_logits[a]) for a in actions} # softmax
     policy_sum = sum(policy.values())
     for action, p in policy.items():
