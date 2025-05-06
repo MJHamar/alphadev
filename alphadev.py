@@ -721,28 +721,10 @@ class Network(object):
     def __init__(self, hparams: ml_collections.ConfigDict, task_spec: TaskSpec):
         self.hparams = hparams
         self.task_spec = task_spec
-        self.training_steps = 0
-        self.representation = None
-        self.prediction = None
-        self.params = None
-    
-    def init_network(self, action_space: ActionSpace) -> None:
-        hparams = self.hparams
-        task_spec = self.task_spec
-        def representation_fn(*a, **k):
-            return RepresentationNet(hparams, task_spec, hparams.embedding_dim)(*a, **k)
-        
-        def prediction_fn(*a, **k):
-            return PredictionNet(
-                task_spec=task_spec,
-                value_max=hparams.value.max,
-                value_num_bins=hparams.value.num_bins,
-                embedding_dim=hparams.embedding_dim,
-            )(*a, **k)
         
         # Transform the functions that build and apply modules
-        self.representation = hk.transform(representation_fn)
-        self.prediction = hk.transform(prediction_fn)
+        self.representation = hk.transform(self._representation_fn)
+        self.prediction = hk.transform(self._prediction_fn)
         if self.hparams.use_jit:
             self.representation = collections.namedtuple(
                 'jitted_representation', ('apply', 'init')
@@ -756,49 +738,59 @@ class Network(object):
                 apply=jax.jit(self.prediction.apply, static_argnums=(3,)),
                 init=jax.jit(self.prediction.init, static_argnums=(2,)),
             )
+
+    def _representation_fn(self, *a, **k):
+        return RepresentationNet(self.hparams, self.task_spec, self.hparams.embedding_dim)(*a, **k)
+    
+    def _prediction_fn(self, *a, **k):
+        return PredictionNet(
+            task_spec=self.task_spec,
+            value_max=self.hparams.value.max,
+            value_num_bins=self.hparams.value.num_bins,
+            embedding_dim=self.hparams.embedding_dim,
+        )(*a, **k)
+    
+    def init_params(self, key: jax.random.PRNGKey, action_space: ActionSpace) -> None:
+        """Initialize the network with the given parameters."""
+        rep_key, pred_key = jax.random.split(key, 2)
+        dummy_obs = self._make_dummy_observation()
         
-        # Initialize parameters using PRNGKeys
-        rep_key, pred_key = jax.random.split(jax.random.PRNGKey(42), 2)
-        # We need dummy inputs to initialize the networks
+        return {
+            'representation': self.representation.init(rep_key, dummy_obs),
+            'prediction': self.prediction.init(
+                pred_key, 
+                jnp.zeros((1, self.hparams.embedding_dim)), 
+                action_space
+            ),
+            'steps': 0  # Store training steps in params
+        }
+    
+    def _make_dummy_observation(self):
         # Observation has four fields:
         #    - program: shape (1, max_program_size, 3) -- opcode, arg1, arg2 in range [0, num_regs + num_mem)] # TODO: ensure memory offset
         #    - program_length: shape (num_inputs,) -- can be used to maks the program
         #    - registers: shape (1, num_inputs, num_regs)
         #    - memory: shape (1, num_inputs, num_mem)
-        dummy_obs = {
-            'program': jnp.zeros((1, task_spec.max_program_size, 3), dtype=jnp.int32),
-            'program_length': jnp.zeros((1,task_spec.num_inputs,), dtype=jnp.int32) + 3,
-            'registers': jnp.zeros((1, task_spec.num_inputs, task_spec.num_regs), dtype=jnp.int32),
-            'memory': jnp.zeros((1, task_spec.num_inputs, task_spec.num_mem), dtype=jnp.int32),
-        }
-        logger.debug("init_params: dummy_obs %s", str({k:v.shape for k,v in dummy_obs.items()}))
-        self.params = {
-            'representation': self.representation.init(rep_key, dummy_obs),
-            'prediction': self.prediction.init(pred_key, jnp.zeros((1, hparams.embedding_dim)), action_space),
+        return {
+            'program': jnp.zeros((1, self.task_spec.max_program_size, 3), dtype=jnp.int32),
+            'program_length': jnp.zeros((1,self.task_spec.num_inputs,), dtype=jnp.int32) + 3,
+            'registers': jnp.zeros((1, self.task_spec.num_inputs, self.task_spec.num_regs), dtype=jnp.int32),
+            'memory': jnp.zeros((1, self.task_spec.num_inputs, self.task_spec.num_mem), dtype=jnp.int32),
         }
 
     def inference(self, params: Any, observation: Dict, action_space: ActionSpace) -> NetworkOutput:
-        if self.representation is None or self.prediction is None:
-            raise ValueError("Network not initialized. Call init_network() first.")
         embedding = self.representation.apply(params['representation'], None, observation)
         return self.prediction.apply(params['prediction'], None, embedding, action_space)
 
-    def get_params(self):
-        # Returns the weights of this network.
-        return self.params
+    def update_params(self, params, updates: Any) -> None:
+        new_params = jax.tree.map(lambda p, u: p + u, params, updates)
+        # Increment step count
+        new_params['steps'] = params.get('steps', 0) + 1
+        return new_params
 
-    def update_params(self, updates: Any) -> None:
-        # Update network weights internally.
-        self.params = jax.tree.map(lambda p, u: p + u, self.params, updates)
-
-    def copy(self):
-        # Returns a copy of the network.
-        net = Network(self.hparams, self.task_spec)
-        net.representation = self.representation
-        net.prediction = self.prediction
-        net.params = jax.tree.map(lambda p: p.copy(), self.params)
-        return net
-
+    def copy_params(self, params: Any) -> Any:
+        # Copy the parameters of the network
+        return jax.tree_map(lambda p: p.copy(), params)
 
 class UniformNetwork(object):
     """Network representation that returns uniform output."""
@@ -816,18 +808,9 @@ class UniformNetwork(object):
                 for a in action_space._actions.values()},
         )
 
-    def get_params(self):
-        # Returns the weights of this network.
-        return {}
-
-    def update_params(self, updates: Any) -> None:
+    def update_params(self, params, updates: Any) -> None:
         # Update network weights internally.
         pass
-
-    @property
-    def training_steps(self) -> int:
-        # How many steps / batches the network has been trained for.
-        return 0
 
 
 ######## 2.2 Representation Network ########
@@ -2061,7 +2044,7 @@ class SharedStorage(object):
             # Set the latest network
             self.client.set(self.LATEST_NETWORK, new_network)
             print("SharedStorage.save_network: set latest netwrork to %d" % new_network)
-    
+
 ##### End Helpers ########
 ##########################
 
@@ -2136,15 +2119,16 @@ def alphadev(config: AlphaDevConfig):
 def run_selfplay(
     config: AlphaDevConfig, storage: SharedStorage, replay_buffer: ReplayBuffer
 ):
+    network = Network(config.hparams, config.task_spec)
     while True:
-        network = storage.latest_network()
-        game = play_game(config, network)
+        network_params = storage.latest_network()
+        game = play_game(config, network, network_params)
         replay_buffer.save_game(game)
         logger.debug("Self-play game finished. Game length: %d", len(game.history))
         break
 
 
-def play_game(config: AlphaDevConfig, network: Network) -> Game:
+def play_game(config: AlphaDevConfig, network: Network, params) -> Game:
     """Plays an AlphaDev game. 
     NOTE: i.e. an episode
 
@@ -2170,7 +2154,7 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
         current_observation = game.make_observation(-1)
         state = CPUState(**current_observation) # easier to create a new one
         action_space = game.action_space_storage.get_space(state)
-        network_output = network.inference(current_observation, action_space)
+        network_output = network.inference(params, current_observation, action_space)
         _expand_node( # expand current root
             root, game.to_play(), game.legal_actions(), network_output, reward=0
         )
@@ -2194,11 +2178,12 @@ def play_game(config: AlphaDevConfig, network: Network) -> Game:
             game.action_history(), # newly initialized action history at the current root
             game.action_space_storage, # action space storage
             network,
+            params,
             min_max_stats,
             game.environment,
         )
         # NOTE: make a move after the MCTS policy improvement step
-        action = _select_action(config, len(game.history), root, network, game.action_space_storage)
+        action = _select_action(config, len(game.history), root, params['steps'], game.action_space_storage)
         logger.debug("play_game: selected action %s", action)
         game.apply(action) # step the environment
         game.store_search_statistics(root)
@@ -2211,6 +2196,7 @@ def run_mcts(
     action_history: ActionHistory,
     action_space_storage: x86ActionSpaceStorage, # NOTE: added this. also, type should be the superclass
     network: Network,
+    params,
     min_max_stats: MinMaxStats,
     env: AssemblyGame,
 ):
@@ -2251,7 +2237,7 @@ def run_mcts(
         observation, reward = sim_env.observation(), sim_env.correctness_reward()
         action_space = action_space_storage.get_space(CPUState(**observation))
         # get the priors
-        network_output = network.inference(observation, action_space)
+        network_output = network.inference(params, observation, action_space)
         _expand_node( # expand the leaf node
             # here, game is not available. I suppose we do not perform action pruning.
             # instead, the history should be initialized either 
@@ -2277,7 +2263,8 @@ def run_mcts(
 
 def _select_action(
     # pylint: disable-next=unused-argument
-    config: AlphaDevConfig, num_moves: int, node: Node, network: Network,
+    config: AlphaDevConfig, num_moves: int, node: Node,
+    training_steps: int,
     action_space_storage: x86ActionSpaceStorage,
 ) -> Action:
     # logger.debug("select_action at node %s", node)
@@ -2285,7 +2272,7 @@ def _select_action(
         (child.visit_count, action.index) for action, child in node.children.items()
     ])
     t = config.visit_softmax_temperature_fn(
-        steps=network.training_steps
+        steps=training_steps
     )
     _, action = softmax_sample(visit_counts, t)
     # i.e. posterior probability based on the visit counts
@@ -2405,25 +2392,30 @@ def train_network(
 
     logger.info("Initializing network")
     network = Network(config.hparams, config.task_spec) # the one we train
-    network.init_network(action_space) # initialize the network
-    target_network = network.copy() # copy the network for bootstrapping
+    key = jax.random.PRNGKey(0)
+    network_params = network.init_params(key, action_space) # initialize the network
+    target_params = network.copy_params(network_params)
     
     # init optimizer
     logger.info("Initializing optimizer")
     optimizer = optax.sgd(config.lr_init, config.momentum)
-    optimizer_state = optimizer.init(network.get_params())
+    optimizer_state = optimizer.init(network_params)
 
     for i in tqdm(range(config.training_steps), desc="Training Loop"): # insertion point for training pipeline
         network.training_steps = i # increment the training steps
+        # store the current parameters
         if i % config.checkpoint_interval == 0:
             logger.info("Pushing network to storage at step %d", i)
-            storage.save_network(i, network) # save the current network
+            storage.save_network(i, network_params) # save the current network
+        # update the target network sometimes
         if i % config.target_network_interval == 0:
             logger.info("Updating target network at step %d", i)
-            target_network = network.copy() # update the bootstrap network
+            target_params = network.copy_params(network_params) # update the bootstrap network
+        # sample a batch
         batch = replay_buffer.sample_batch(config.td_steps)
-        optimizer_state = _update_weights(
-            optimizer, optimizer_state, network, target_network, batch,
+        # run inference and update the parameters
+        network_params, optimizer_state = _update_weights(
+            optimizer, optimizer_state, network, network_params, target_params, batch,
             action_space_storage)
     storage.save_network(config.training_steps, network)
 
@@ -2435,7 +2427,6 @@ def _loss_fn(
     network_params: jnp.array,
     target_network_params: jnp.array,
     network: Network,
-    target_network: Network,
     batch: SampleBatch,
     action_space_storage: x86ActionSpaceStorage
 ) -> float:
@@ -2456,7 +2447,7 @@ def _loss_fn(
     # TODO: understand the impact of having potentially
     # different action spaces for network and target network.
     bootstrap_space = action_space_storage.get_space(CPUState(**bootstrap_obs))
-    bootstrap_predictions = target_network.inference(
+    bootstrap_predictions = network.inference(
         target_network_params, bootstrap_obs, bootstrap_space)
     target_correctness, target_latency, target_policy, bootstrap_discount = (
         target
@@ -2495,22 +2486,22 @@ def _update_weights(
     optimizer: optax.GradientTransformation,
     optimizer_state: Any,
     network: Network,
-    target_network: Network,
+    network_params,
+    target_params,
     batch: SampleBatch,
     action_space_storage: ActionSpaceStorage,
 ) -> Any:
     """Updates the weight of the network."""
     updates = _loss_grad(
-        network.get_params(),
-        target_network.get_params(),
+        network_params,
+        target_params,
         network,
-        target_network,
         batch,
         action_space_storage)
 
     optim_updates, new_optim_state = optimizer.update(updates, optimizer_state)
-    network.update_params(optim_updates)
-    return new_optim_state
+    new_params = network.update_params(network_params, optim_updates)
+    return new_params, new_optim_state
 
 
 def scalar_loss(prediction:jnp.ndarray, target:jnp.ndarray, network:Network) -> float:
