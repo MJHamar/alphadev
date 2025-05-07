@@ -721,6 +721,9 @@ class NetworkOutput(NamedTuple):
     latency_value_logits: jnp.ndarray
     policy_logits: Dict[Action, float]
 
+class NetworkState(NamedTuple):
+    params: Dict[str, Any]
+    steps: int
 
 class Network(object):
     """Wrapper around Representation and Prediction networks."""
@@ -757,19 +760,20 @@ class Network(object):
             embedding_dim=self.hparams.embedding_dim,
         )(*a, **k)
     
-    def init_params(self, key: jax.random.PRNGKey) -> None:
+    def init_params(self, key: jax.random.PRNGKey) -> NetworkState:
         """Initialize the network with the given parameters."""
         rep_key, pred_key = jax.random.split(key, 2)
         dummy_obs = self._make_dummy_observation()
         
-        return {
+        return NetworkState(
+            params={
             'representation': self.representation.init(rep_key, dummy_obs),
             'prediction': self.prediction.init(
                 pred_key, 
                 jnp.zeros((1, self.hparams.embedding_dim)),
-            ),
-            'steps': 0  # Store training steps in params
-        }
+            )},
+            steps= 0
+        )
     
     def _make_dummy_observation(self):
         # Observation has four fields:
@@ -788,15 +792,20 @@ class Network(object):
         embedding = self.representation.apply(params['representation'], None, observation)
         return self.prediction.apply(params['prediction'], None, embedding)
 
-    def update_params(self, params, updates: Any) -> None:
-        new_params = jax.tree.map(lambda p, u: p + u, params, updates)
-        # Increment step count
-        new_params['steps'] = params.get('steps', 0) + 1
-        return new_params
+    def update_params(self, state: NetworkState, updates: Any) -> None:
+        new_state = NetworkState(
+            params=jax.tree.map(lambda p, u: p + u, state.params, updates),
+            steps=state.steps + 1
+            )
+        return new_state
 
-    def copy_params(self, params: Any) -> Any:
+    def copy_state(self, state: NetworkState) -> NetworkState:
         # Copy the parameters of the network
-        return jax.tree.map(lambda p: p.copy(), params)
+        new_state = NetworkState(
+            params=jax.tree.map(lambda p: (p.copy() if hasattr(p, 'copy') else p), state.params),
+            steps=state.steps
+            )
+        return new_state
 
 
 ######## 2.2 Representation Network ########
@@ -1766,7 +1775,7 @@ class Game(object):
         # NOTE: returns the observation corresponding to the last action
         if state_index == -1:
             observation = self.environment.observation()
-            return _batch_observation(self.task_spec.max_program_size, observation)
+            return observation
         # re-play the game from the initial state.
         if state_index > len(self.history):
             state_index = len(self.history) # for safety
@@ -1775,7 +1784,7 @@ class Game(object):
             _, _ = env.step(action)
         observation = env.observation()
         
-        return _batch_observation(self.task_spec.max_program_size, observation)
+        return observation
 
     def make_target(
         # pylint: disable-next=unused-argument
@@ -1816,7 +1825,7 @@ class Game(object):
 
 def _batch_observation(max_program_size: int, observation: Dict[str, jnp.ndarray]):
     # games make a single observation at a time, but the network expects a batch.
-    logger.info("_batch_observation: program shape %s", observation["program"].shape)
+    logger.debug("_batch_observation: program shape %s", observation["program"].shape)
     
     return {
         "registers": observation["registers"][None, ...],
@@ -1881,6 +1890,7 @@ class ReplayBuffer(object):
             logger.debug("ReplayBuffer._process_observation: empty program")
             program = jnp.zeros((0, 3), dtype=jnp.int32) * self.padding_token
         # program shape is p x 3, we want to return P x 3, where P is the max program size and p is the current proogram length
+        logger.debug("ReplayBuffer._process_observation: program shape %s", program.shape)
         padded_program = jnp.pad(
             program, ((0, self.max_program_size - program.shape[0]), (0, 0)),
             mode='constant', constant_values=self.padding_token
@@ -1937,8 +1947,9 @@ class SharedReplayBuffer(ReplayBuffer):
         self._write_lock = multiprocessing.Lock()
         
         # delete the client so it doesn't get pickled
-        self.client.close()
-        self._client = None
+        self.disconnect()
+        
+        logger.debug("SharedReplayBuffer: finished initialising. Write head %s list name %s", self.WRITE_HEAD, self.LIST_NAME)
         
     @property
     def client(self) -> redis.Redis:
@@ -1950,33 +1961,51 @@ class SharedReplayBuffer(ReplayBuffer):
             raise RuntimeError(f"Could not connect to Redis server at {self.redis_config.host}:{self.redis_config.port}.")
         return self._client
     
+    def disconnect(self):
+        # disconnect the client
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+    
     def save_game(self, game):
         game_bin = pickle.dumps(game) # serialize the game
+        logger.debug("SharedReplayBuffer.save_game: game size %d", len(game_bin))
         with self._write_lock:
             # get the write head
             write_head = self.client.get(self.WRITE_HEAD)
             write_head = int(write_head) if write_head is not None else 0
+            logger.debug("SharedReplayBuffer.save_game: [locked 1] write head %s", self.WRITE_HEAD)
             # increment the write head and num_items
             write_head = (write_head + 1) % self.window_size
+            logger.debug("SharedReplayBuffer.save_game: [locked 2] incremented write head %s", write_head)
             self.client.set(self.WRITE_HEAD, write_head)
             # write the game to the shared memory
             self.client.rpush(self.LIST_NAME, game_bin)
+            logger.debug("SharedReplayBuffer.save_game: [locked 3] game saved to %s at index %s", self.LIST_NAME, write_head)
             # if the buffer is full, remove the oldest game
-            if self.client.llen(self.LIST_NAME) > self.window_size:
+            length = self.client.llen(self.LIST_NAME)
+            logger.debug("SharedReplayBuffer.save_game: [locked 4] buffer length %d", length)
+            if  length > self.window_size:
                 self.client.lpop(self.LIST_NAME)
+                logger.debug("SharedReplayBuffer.save_game: [locked 5] popped oldest game from %s", self.LIST_NAME)
         # release lock
     
     def sample_game(self):
         # uniformly sample an index
         list_len = self.client.llen(self.LIST_NAME) # <= self.window_size
+        logger.debug("SharedReplayBuffer.sample_game: list length %d", list_len)
         if list_len == 0:
+            logger.debug("SharedReplayBuffer.sample_game: empty buffer")
             return None
         list_len = min(list_len, self.window_size) # to be safe
         idx = int(numpy.random.uniform(0, list_len))
         # get the given index from the list
+        logger.debug("SharedReplayBuffer.sample_game: index %d", idx)
         game_bin = self.client.lindex(self.LIST_NAME, idx)
         # deserialize the game
+        logger.debug("SharedReplayBuffer.sample_game: game_bin size %d", len(game_bin))
         game = pickle.loads(game_bin)
+        logger.debug("SharedReplayBuffer.sample_game: game loaded")
         # if the game is empty, return a new game
         return game
 
@@ -2000,8 +2029,7 @@ class SharedStorage(object):
         self.client.delete(self.LATEST_NETWORK)
         self.client.delete(self.STORAGE_NAME)
         # delete the client so it doesn't get pickled
-        self.client.close()
-        self._client = None
+        self.disconnect()
         
         # write lock, althogh only a single process writes
         self._write_lock = multiprocessing.Lock()
@@ -2015,20 +2043,30 @@ class SharedStorage(object):
         if not self._client.ping():
             raise RuntimeError(f"Could not connect to Redis server at {self.redis_config.host}:{self.redis_config.port}.")
         return self._client
-        
-    def latest_network(self) -> Network:
+    
+    def disconnect(self):
+        # disconnect the client
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+    
+    def latest_network(self) -> NetworkState:
         latest_network = self.client.get(self.LATEST_NETWORK)
         if latest_network is None:
-            return UniformNetwork()
+            assert False, "SharedStorage: No network found in shared storage." 
         latest_network = int(latest_network)
         # deserialize the network
+        logger.debug("SharedStorage.latest_network: getting latest network %d", latest_network)
         network_bin = self.client.hget(self.STORAGE_NAME, latest_network)
+        logger.debug("SharedStorage.latest_network: network_bin size %d", len(network_bin))
         network = pickle.loads(network_bin)
+        logger.debug("SharedStorage.latest_network: network loaded")
         return network
 
-    def save_network(self, step: int, parameters: Dict[str, jnp.ndarray]):
+    def save_network(self, step: int, state: NetworkState):
         # Serialize parameters
-        serialized = pickle.dumps(parameters)
+        serialized = pickle.dumps(state)
+        logger.debug("SharedStorage.save_network: step %d, serialized size %d", step, len(serialized))
         # set the new network
         self.client.hset(self.STORAGE_NAME, step, serialized)
         # Set the latest network
@@ -2037,6 +2075,7 @@ class SharedStorage(object):
         # it can happen that the latest network (step number) is decremented.
         # we only train on a single process tho so this should be fine.
         self.client.set(self.LATEST_NETWORK, step)
+        logger.debug("SharedStorage.save_network: latest network set to %d", step)
 
 ##### End Helpers ########
 ##########################
@@ -2052,13 +2091,15 @@ def alphadev(config: AlphaDevConfig):
     replay_buffer = SharedReplayBuffer(config)
 
     # initialize the network by playing a game
-    game, network, network_params = run_once(config)
+    game, network, network_state = run_once(config)
     logger.info("Initial game finished, storing the network parameters and the game.")
     replay_buffer.save_game(game)
-    storage.save_network(0, network_params)
+    storage.save_network(0, network_state)
     logger.info("Game and parameters stored")
 
     actors = []
+    
+    storage.disconnect(); replay_buffer.disconnect() # close the redis connections
 
     logger.info("Starting %d self-play jobs", config.num_actors)
     for _ in range(config.num_actors):
@@ -2069,7 +2110,7 @@ def alphadev(config: AlphaDevConfig):
     logger.info("Self-play jobs started, start training")
     
     # start training
-    train_network(config, storage, replay_buffer, network, network_params)
+    train_network(config, storage, replay_buffer, network, network_state)
     
     # wait for all actors to finish
     logger.info("Training fisihed, terminating self-play jobs")
@@ -2128,7 +2169,7 @@ def run_selfplay(
         break
 
 
-def play_game(config: AlphaDevConfig, network: Network, params) -> Game:
+def play_game(config: AlphaDevConfig, network: Network, state: NetworkState) -> Game:
     """Plays an AlphaDev game. 
     NOTE: i.e. an episode
 
@@ -2151,9 +2192,9 @@ def play_game(config: AlphaDevConfig, network: Network, params) -> Game:
 
         # Initialisation of the root node and addition of exploration noise
         root = Node(0) # NOTE: a dummy root
-        current_observation = game.make_observation(-1)
+        current_observation = _batch_observation(game.task_spec.max_program_size, game.make_observation(-1))
 
-        network_output = network.inference(params, current_observation)
+        network_output = network.inference(state.params, current_observation)
         _expand_node( # expand current root
             root, game.to_play(), game.legal_actions(), network_output, reward=0
         )
@@ -2177,13 +2218,13 @@ def play_game(config: AlphaDevConfig, network: Network, params) -> Game:
             game.action_history(), # newly initialized action history at the current root
             game.action_space_storage, # action space storage
             network,
-            params,
+            state.params,
             min_max_stats,
             game.environment,
         )
         # NOTE: make a move after the MCTS policy improvement step
-        action = _select_action(config, len(game.history), root, params['steps'], game.action_space_storage)
-        logger.info("play_game: selected action %s. current length %s", action, len(game.history))
+        action = _select_action(config, len(game.history), root, state.steps, game.action_space_storage)
+        logger.debug("play_game: selected action %s. current length %s", action, len(game.history))
         game.apply(action) # step the environment
         game.store_search_statistics(root)
     return game
@@ -2227,7 +2268,7 @@ def run_mcts(
         while node.expanded():
             action, node = _select_child(config, node, min_max_stats) # based on UCB
             action = action_space_storage.actions[action] # convert from int to Action
-            logger.info("run_mcts: expanded_node selected action %s", action)
+            logger.debug("run_mcts: expanded_node selected action %s", action)
             sim_env.step(action) # step the environment
             history.add_action(action) # update history 
             search_path.append(node) # append to the current trajectory
@@ -2244,7 +2285,7 @@ def run_mcts(
             action_space = action_space_storage.get_space(CPUState(**observation))
             # get the priors
             network_output = network.inference(params, observation)
-            logger.info("run_mcts: selecting new node")
+            logger.debug("run_mcts: selecting new node")
             _expand_node( # expand the leaf node
                 # here, game is not available. I suppose we do not perform action pruning.
                 # instead, the history should be initialized either 
@@ -2391,32 +2432,32 @@ def _add_exploration_noise(config: AlphaDevConfig, node: Node):
 
 def train_network(
     config: AlphaDevConfig, storage: SharedStorage, replay_buffer: ReplayBuffer,
-    network: Network, network_params
+    network: Network, network_state: NetworkState
 ):
     """Trains the network on data stored in the replay buffer."""
-    target_params = network.copy_params(network_params)
+    target_state = network.copy_state(network_state)
     
     # init optimizer
     logger.info("Initializing optimizer")
     optimizer = optax.sgd(config.lr_init, config.momentum)
-    optimizer_state = optimizer.init(network_params)
+    optimizer_state = optimizer.init(network_state.params)
 
     for i in tqdm(range(config.training_steps), desc="Training Loop"): # insertion point for training pipeline
         network.training_steps = i # increment the training steps
         # store the current parameters
         if i % config.checkpoint_interval == 0:
             logger.info("Pushing network to storage at step %d", i)
-            storage.save_network(i, network_params) # save the current network
+            storage.save_network(i, network_state) # save the current network
         # update the target network sometimes
         if i % config.target_network_interval == 0:
             logger.info("Updating target network at step %d", i)
-            target_params = network.copy_params(network_params) # update the bootstrap network
+            target_state = network.copy_state(network_state) # update the bootstrap network
         # sample a batch
         batch = replay_buffer.sample_batch(config.td_steps)
         # run inference and update the parameters
-        network_params, optimizer_state = _update_weights(
-            optimizer, optimizer_state, network, network_params, target_params, batch)
-    storage.save_network(config.training_steps, network)
+        network_state, optimizer_state = _update_weights(
+            optimizer, optimizer_state, network, network_state, target_state, batch)
+    storage.save_network(config.training_steps, network_state)
 
 def scale_gradient(tensor: Any, scale):
     """Scales the gradient for the backward pass."""
@@ -2475,20 +2516,21 @@ def _update_weights(
     optimizer: optax.GradientTransformation,
     optimizer_state: Any,
     network: Network,
-    network_params,
-    target_params,
+    network_state: NetworkState,
+    target_state: NetworkState,
     batch: SampleBatch,
 ) -> Any:
     """Updates the weight of the network."""
+    
     updates = _loss_grad(
-        network_params,
-        target_params,
+        network_state.params,
+        target_state.params,
         network,
         batch)
 
     optim_updates, new_optim_state = optimizer.update(updates, optimizer_state)
-    new_params = network.update_params(network_params, optim_updates)
-    return new_params, new_optim_state
+    new_state = network.update_params(network_state, optim_updates)
+    return new_state, new_optim_state
 
 
 def scalar_loss(prediction:jnp.ndarray, target:jnp.ndarray, network:Network) -> float:
@@ -2519,10 +2561,10 @@ def run_once(
     network = Network(config.hparams, config.task_spec)
     key = jax.random.PRNGKey(0) # TODO: pass this as an argument
     logger.info("Initializing network")
-    network_params = network.init_params(key)
+    network_state = network.init_params(key)
     logger.info("Playing a single game")
-    game = play_game(config, network, network_params)
-    return game, network, network_params
+    game = play_game(config, network, network_state)
+    return game, network, network_state
 
 
 ################################################################################
@@ -2547,6 +2589,7 @@ def terminate_job(process:multiprocessing.Process):
     # NOTE: a simple wrapper to terminate a job in a separate thread.
     process.terminate()
     process.join()
+    logger.debug("Job %s terminated", process)
     return process
 
 def generate_sort_inputs(
@@ -2754,7 +2797,7 @@ def generate_sort_inputs(
 #         time.sleep(1)
 
 logging.basicConfig(level=logging.INFO)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 if __name__ == '__main__':
     config = AlphaDevConfig()
     alphadev(config)
