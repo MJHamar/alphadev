@@ -2499,9 +2499,11 @@ def _loss_fn(
     )
     # NOTE: latency target is 0 unless the game reached a terminal state.
     l_latency = scalar_loss(predictions.latency_value_logits, target_latency, network)
-    # logger.debug("loss_fn: policy loss %s", l_policy)
-    # logger.debug("loss_fn: correctness loss %s", l_correctness)
-    # logger.debug("loss_fn: latency loss %s", l_latency)
+    
+    logger.debug("_loss_fn: l_policy %s", l_policy)
+    logger.debug("_loss_fn: l_correctness %s", l_correctness)
+    logger.debug("_loss_fn: l_latency %s", l_latency)
+    
     loss = l_policy + l_correctness + l_latency
     # loss is of shape B x 1, we take the mean over the batch
     loss = jnp.mean(loss)
