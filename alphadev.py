@@ -2178,7 +2178,7 @@ def play_game(config: AlphaDevConfig, network: Network, params) -> Game:
         )
         # NOTE: make a move after the MCTS policy improvement step
         action = _select_action(config, len(game.history), root, params['steps'], game.action_space_storage)
-        logger.debug("play_game: selected action %s", action)
+        logger.info("play_game: selected action %s. current length %s", action, len(game.history))
         game.apply(action) # step the environment
         game.store_search_statistics(root)
     return game
@@ -2222,7 +2222,7 @@ def run_mcts(
         while node.expanded():
             action, node = _select_child(config, node, min_max_stats) # based on UCB
             action = action_space_storage.actions[action] # convert from int to Action
-            logger.debug("run_mcts: selected action %s", action)
+            logger.info("run_mcts: expanded_node selected action %s", action)
             sim_env.step(action) # step the environment
             history.add_action(action) # update history 
             search_path.append(node) # append to the current trajectory
@@ -2235,6 +2235,7 @@ def run_mcts(
         action_space = action_space_storage.get_space(CPUState(**observation))
         # get the priors
         network_output = network.inference(params, observation)
+        logger.info("run_mcts: selecting new node")
         _expand_node( # expand the leaf node
             # here, game is not available. I suppose we do not perform action pruning.
             # instead, the history should be initialized either 
