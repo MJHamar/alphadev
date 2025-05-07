@@ -1678,7 +1678,6 @@ class Sample(NamedTuple):
 class SampleBatch(Sample): # type hinting
     pass
 
-
 class Game(object):
     """A single episode of interaction with the environment."""
 
@@ -1743,6 +1742,9 @@ class Game(object):
         self.history.append(action)
         if self.terminal() and self.is_correct():
             self.latency_reward = self.environment.latency_reward()
+        else: # make sure latency reward doesn't leak.
+            # TODO: another reason why Game should be pure with an explicit state.
+            self.latency_reward = 0
 
     def store_search_statistics(self, root: Node):
         # NOTE: this function is used to store statistics about the observed trajectory (outside of MCTS)
@@ -2232,33 +2234,34 @@ def run_mcts(
         
         # check if the game is over
         if sim_env.terminal():
-            # TODO
-            pass
+            # copied from `acme.agents.tf.mcts`
+            value = 0.0
+        else:
+            # Inside the search tree we use the environment to obtain the next
+            # observation and reward given an action.
+            observation, reward = sim_env.observation(), sim_env.correctness_reward()
+            observation = _batch_observation(env.task_spec.max_program_size, observation)
+            action_space = action_space_storage.get_space(CPUState(**observation))
+            # get the priors
+            network_output = network.inference(params, observation)
+            logger.info("run_mcts: selecting new node")
+            _expand_node( # expand the leaf node
+                # here, game is not available. I suppose we do not perform action pruning.
+                # instead, the history should be initialized either 
+                #   with the game's current legal actions. -- UPDATE: this is stupid. The game will never find a solution
+                #   or with the action space of the environment.
+                # using current legal actions is bad, since as used memory grows we need to allocate new locations
+                # using the action space of the environment is also not great because it would allow many illegal actions.
+                # pruning the action space during MCTS might entail a big overhead.
+                # we need to experiment with this.
+                # NOTE: for now, we go with AlphaDev's implementation of returning all actions.
+                node, history.to_play(), jnp.asarray(action_space.actions), network_output, reward
+            )
+            value = network_output.value
         
-        #   logger.debug("mcts: at leaf. Action: %s, Node: %s", action, node)
-        # Inside the search tree we use the environment to obtain the next
-        # observation and reward given an action.
-        observation, reward = sim_env.observation(), sim_env.correctness_reward()
-        observation = _batch_observation(env.task_spec.max_program_size, observation)
-        action_space = action_space_storage.get_space(CPUState(**observation))
-        # get the priors
-        network_output = network.inference(params, observation)
-        logger.info("run_mcts: selecting new node")
-        _expand_node( # expand the leaf node
-            # here, game is not available. I suppose we do not perform action pruning.
-            # instead, the history should be initialized either 
-            #   with the game's current legal actions. -- UPDATE: this is stupid. The game will never find a solution
-            #   or with the action space of the environment.
-            # using current legal actions is bad, since as used memory grows we need to allocate new locations
-            # using the action space of the environment is also not great because it would allow many illegal actions.
-            # pruning the action space during MCTS might entail a big overhead.
-            # we need to experiment with this.
-            # NOTE: for now, we go with AlphaDev's implementation of returning all actions.
-            node, history.to_play(), jnp.asarray(action_space.actions), network_output, reward
-        )
         _backpropagate(
             search_path,
-            network_output.value,
+            value, # the prior value. 0 if terminal, otherwise the predicted value
             history.to_play(),
             config.discount,
             min_max_stats,
@@ -2453,6 +2456,7 @@ def _loss_fn(
     l_correctness = scalar_loss(
         predictions.correctness_value_logits, target_correctness, network
     )
+    # NOTE: latency target is 0 unless the game reached a terminal state.
     l_latency = scalar_loss(predictions.latency_value_logits, target_latency, network)
     # logger.debug("loss_fn: policy loss %s", l_policy)
     # logger.debug("loss_fn: correctness loss %s", l_correctness)
@@ -2544,9 +2548,6 @@ def terminate_job(process:multiprocessing.Process):
     process.terminate()
     process.join()
     return process
-
-def make_uniform_network():
-    return UniformNetwork()
 
 def generate_sort_inputs(
     items_to_sort: int, max_len:int, num_samples: int=None, rnd_key:int=42) -> IOExample:
