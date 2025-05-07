@@ -697,7 +697,11 @@ class AssemblyGame(object):
         return ret
 
     def terminal(self) -> bool:
-        return self.simulator.invalid() or self.correct()
+        toolong = len(self.program) >= self.task_spec.max_program_size
+        invalid = self.simulator.invalid()
+        correct = self.correct()
+        logger.debug("AssemblyGame: terminality check toolong %s invalid %s correct %s", toolong, invalid, correct)
+        return toolong or invalid or correct
 
     def correct(self) -> bool:
         state = self.state()
@@ -1704,9 +1708,8 @@ class Game(object):
         # Game specific termination rules.
         # For sorting, a game is terminal if we sort all sequences correctly or
         # we reached the end of the buffer.
-        toolong = len(self.history) >= self.task_spec.max_program_size
-        iscorrect = self.is_correct()
-        return toolong or iscorrect
+        terminal = self.environment.terminal()
+        return terminal
 
     def is_correct(self) -> bool:
         # Whether the current algorithm solves the game.
@@ -2226,6 +2229,11 @@ def run_mcts(
             sim_env.step(action) # step the environment
             history.add_action(action) # update history 
             search_path.append(node) # append to the current trajectory
+        
+        # check if the game is over
+        if sim_env.terminal():
+            # TODO
+            pass
         
         #   logger.debug("mcts: at leaf. Action: %s, Node: %s", action, node)
         # Inside the search tree we use the environment to obtain the next
