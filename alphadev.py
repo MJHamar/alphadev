@@ -537,7 +537,7 @@ class AssemblyGame(object):
         def measure_latency(self) -> float:
             """Measure the latency of a program."""
             latencies = jnp.asarray(self.emulator.measure_latency(), dtype=jnp.float32)
-            logger.debug(f"measure_latency: {latencies}")
+            # logger.debug(f"measure_latency: {latencies}")
             return latencies
         
         def invalid(self) -> bool:
@@ -700,7 +700,7 @@ class AssemblyGame(object):
         toolong = len(self.program) >= self.task_spec.max_program_size
         invalid = self.simulator.invalid()
         correct = self.correct()
-        logger.debug("AssemblyGame: terminality check toolong %s invalid %s correct %s", toolong, invalid, correct)
+        # logger.debug("AssemblyGame: terminality check toolong %s invalid %s correct %s", toolong, invalid, correct)
         return toolong or invalid or correct
 
     def correct(self) -> bool:
@@ -862,25 +862,25 @@ class MultiQueryAttentionBlock(hk.Module):
         K = self._linear_projection(inputs, 1, self.head_depth, name='P_k') # B x M x K
         V = self._linear_projection(inputs, 1, self.head_depth, name='P_v') # B x M x V
         
-        logger.debug("MQAB: logits einsum Q (bnhk) %s, K (bmk) %s -> bhnm", Q.shape, K.shape)
+        # logger.debug("MQAB: logits einsum Q (bnhk) %s, K (bmk) %s -> bhnm", Q.shape, K.shape)
         logits = jnp.einsum("bnhk,bmk->bhnm", Q, K) # B x N x H x M
-        logger.debug("MQAB: logits shape (bhnm) %s", logits.shape)
+        # logger.debug("MQAB: logits shape (bhnm) %s", logits.shape)
         weights = jax.nn.softmax(logits) # NOTE: no causal masking, this is an encoder block
-        logger.debug("MQAB: weights shape (bhnm) %s", weights.shape)
+        # logger.debug("MQAB: weights shape (bhnm) %s", weights.shape)
         if self.attention_dropout: # boolean
-            logger.debug("MQAB: applying attention dropout %s", self.attention_dropout)
+            # logger.debug("MQAB: applying attention dropout %s", self.attention_dropout)
             weights = hk.dropout(hk.next_rng_key(), self.attention_dropout, weights)
-        logger.debug("MQAB: output projection einsum weights (bhnm) %s, V (bmv) %s -> bhnv", weights.shape, V.shape)
+        # logger.debug("MQAB: output projection einsum weights (bhnm) %s, V (bmv) %s -> bhnv", weights.shape, V.shape)
         O = jnp.einsum("bhnm,bmv->bhnv", weights, V) # B x N x H x V
-        logger.debug("MQAB: O shape (bhnv) %s", O.shape)
+        # logger.debug("MQAB: O shape (bhnv) %s", O.shape)
         B, _, N, _ = O.shape # B x H x N x V
         # reshape O to B x N x (H*V)
         O = O.reshape((B, N, -1)) # B x N x (H*V)
-        logger.debug("MQAB: O reshaped to %s", O.shape)
+        # logger.debug("MQAB: O reshaped to %s", O.shape)
         # apply the output projection
-        logger.debug("MQAB: aggregate head projection bn[h*v] %s to bnd %s ", O.shape, inputs.shape)
+        # logger.debug("MQAB: aggregate head projection bn[h*v] %s to bnd %s ", O.shape, inputs.shape)
         Y = self._linear_projection(O, 1, inputs.shape[-1], name='P_o') # B x N x V
-        logger.debug("MQAB: output shape (bnd) %s", Y.shape)
+        # logger.debug("MQAB: output shape (bnd) %s", Y.shape)
         assert Y.shape == inputs.shape, f"Output shape {Y.shape} does not match input shape {inputs.shape}."
         
         return Y # B x N x D
@@ -901,7 +901,7 @@ class MultiQueryAttentionBlock(hk.Module):
         *leading_dims, _ = x.shape # [B, N, D]
         # split last dimension (H*K) into H, K
         new_shape = (*leading_dims, num_heads, head_size) if num_heads > 1 else (*leading_dims, head_size)
-        logger.debug("linear_projection, reshaping y from %s to %s", y.shape, new_shape)
+        # logger.debug("linear_projection, reshaping y from %s to %s", y.shape, new_shape)
         return y.reshape(new_shape) # [B, N, H, K] or [B, N, K]
 
     def sinusoid_position_encoding(seq_size, feat_size):
@@ -987,7 +987,7 @@ class ResBlockV2(hk.Module):
 
     def __call__(self, inputs, is_training=True, test_local_stats=False):
         # FIXME: figure out what to do with the is_training and test_local_stats
-        logger.debug("ResBlockV2: inputs shape %s", inputs.shape)
+        # logger.debug("ResBlockV2: inputs shape %s", inputs.shape)
         x = shortcut = inputs
 
         for i, (conv_i, ln_i) in enumerate(self.layers):
@@ -1046,7 +1046,7 @@ class RepresentationNet(hk.Module):
         self._embedding_dim = embedding_dim
 
     def __call__(self, inputs):
-        logger.debug("representation_net program shape %s", inputs['program'].shape)
+        # logger.debug("representation_net program shape %s", inputs['program'].shape)
         # inputs is the observation dict
         batch_size = inputs['program'].shape[0]
 
@@ -1083,7 +1083,7 @@ class RepresentationNet(hk.Module):
         )
 
     def _encode_program(self, inputs, batch_size):
-        logger.debug("encode_program shape %s", inputs['program'].shape)
+        # logger.debug("encode_program shape %s", inputs['program'].shape)
         program = inputs['program']
         max_program_size = inputs['program'].shape[1] # TODO: this might not be a constant
         program_length = inputs['program_length'].astype(jnp.int32)
@@ -1119,35 +1119,35 @@ class RepresentationNet(hk.Module):
 
         # locations_encoding.shape == [B, P, D] so map embedder across locations to
         # share weights
-        logger.debug("locations_encoding shape %s", locations_encoding.shape)
+        # logger.debug("aggregate_locations_program: locations_encoding shape %s", locations_encoding.shape)
         
         locations_embedding = hk.vmap(
             locations_embedder, in_axes=1, out_axes=1, split_rng=False
         )(locations_encoding)
-        logger.debug("locations_embedding shape %s", locations_embedding.shape)
+        # logger.debug("aggregate_locations_program: locations_embedding shape %s", locations_embedding.shape)
 
         # broadcast the program encoding for each example.
         # this way, it matches the size of the observations.
-        logger.debug("program_encoding shape %s", program_encoding.shape)
+        # logger.debug("aggregate_locations_program: program_encoding shape %s", program_encoding.shape)
         program_encoded_repeat = self.repeat_program_encoding(
             program_encoding, batch_size
         )
-        logger.debug("program_encoded_repeat shape %s", program_encoded_repeat.shape)
+        # logger.debug("aggregate_locations_program: program_encoded_repeat shape %s", program_encoded_repeat.shape)
 
         grouped_representation = jnp.concatenate( # concat the CPU state and the program.
             [locations_embedding, program_encoded_repeat], axis=-1
         )
-        logger.debug("grouped_representation shape %s", grouped_representation.shape)
+        # logger.debug("aggregate_locations_program: grouped_representation shape %s", grouped_representation.shape)
 
         return self.apply_joint_embedder(grouped_representation, batch_size)
 
     def repeat_program_encoding(self, program_encoding, batch_size):
-        logger.debug("repeat_program_encoding pre shape %s", program_encoding.shape)
+        # logger.debug("aggregate_locations_program: repeat_program_encoding pre shape %s", program_encoding.shape)
         program_encoding = jnp.broadcast_to(
             program_encoding,
             [batch_size, self._task_spec.num_inputs, program_encoding.shape[-1]],
         )
-        logger.debug("repeat_program_encoding post shape %s", program_encoding.shape)
+        # logger.debug("aggregate_locations_program: repeat_program_encoding post shape %s", program_encoding.shape)
         return program_encoding
 
     def apply_joint_embedder(self, grouped_representation, batch_size):
@@ -1177,38 +1177,38 @@ class RepresentationNet(hk.Module):
         chex.assert_shape(
             grouped_representation, (batch_size, self._task_spec.num_inputs, None)
         )
-        logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
+        # logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
         # apply MLP to the combined program and locations embedding
         permutations_encoded = all_locations_net(grouped_representation)
-        logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
+        # logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
         # Combine all permutations into a single vector using a ResNetV2
         joint_encoding = joint_locations_net(jnp.mean(permutations_encoded, axis=1))
-        logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
+        # logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
         for net in joint_resnet:
             joint_encoding = net(joint_encoding)
         return joint_encoding
 
     def make_program_onehot(self, program, batch_size, max_program_size):
-        logger.debug("make_program_onehot shape %s", program.shape)
+        # logger.debug("make_program_onehot shape %s", program.shape)
         func = program[:, :, 0] # the opcode -- int
         arg1 = program[:, :, 1] # the first operand -- int 
         arg2 = program[:, :, 2] # the second operand -- int
         func_onehot = jax.nn.one_hot(func, self._task_spec.num_funcs)
         arg1_onehot = jax.nn.one_hot(arg1, self._task_spec.num_locations)
         arg2_onehot = jax.nn.one_hot(arg2, self._task_spec.num_locations)
-        logger.debug("func %s, arg1 %s, arg2 %s", func_onehot.shape, arg1_onehot.shape, arg2_onehot.shape)
+        # logger.debug("func %s, arg1 %s, arg2 %s", func_onehot.shape, arg1_onehot.shape, arg2_onehot.shape)
         program_onehot = jnp.concatenate(
             [func_onehot, arg1_onehot, arg2_onehot], axis=-1
         )
         chex.assert_shape(program_onehot, (batch_size, max_program_size, None))
-        logger.debug("program_onehot shape %s", program_onehot.shape)
+        # logger.debug("program_onehot shape %s", program_onehot.shape)
         return program_onehot
 
     def pad_program_encoding(
         self, program_encoding, batch_size, program_length, max_program_size
     ):
         """Pads the program encoding to account for state-action stagger."""
-        logger.debug("pad_program_encoding shape %s", program_encoding.shape)
+        # logger.debug("pad_program_encoding shape %s", program_encoding.shape)
         chex.assert_shape(program_encoding, (batch_size, max_program_size, None))
         chex.assert_shape(program_length, (batch_size, self._task_spec.num_inputs))
 
@@ -1220,8 +1220,8 @@ class RepresentationNet(hk.Module):
         )
 
         program_length_onehot = jax.nn.one_hot(program_length, max_program_size + 1)
-        logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
-        logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
+        # logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
+        # logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
         # two cases here:
         # - program length is a batch of scalars corr. to the program length
         # - program length is a batch of vectors (of len num_inputs) corr. to the state of the program counters
@@ -1233,7 +1233,7 @@ class RepresentationNet(hk.Module):
             program_encoding = jnp.einsum(
                 'bnd,bn->bd', program_encoding, program_length_onehot
             )
-        logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
+        # logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
 
         return program_encoding
 
@@ -1241,7 +1241,7 @@ class RepresentationNet(hk.Module):
         # input: B x P x (num_funcs + 2 * num_locations)
         # output: B x P x embedding_dim
         # P is the program length
-        logger.debug("apply_program_mlp_embedder program shape %s, embedding_dim %s", program_encoding.shape, self._embedding_dim)
+        # logger.debug("apply_program_mlp_embedder program shape %s, embedding_dim %s", program_encoding.shape, self._embedding_dim)
         program_embedder = hk.Sequential(
             [
                 hk.Linear(self._embedding_dim), # (nF + 2*nL) x D -- input size is decided automatically
@@ -1251,14 +1251,14 @@ class RepresentationNet(hk.Module):
             ],
             name='per_instruction_program_embedder',
         )
-        logger.debug("program.shape %s -->", program_encoding.shape)
-        logger.debug("  program_embedder %s", program_embedder)
+        # logger.debug("program.shape %s -->", program_encoding.shape)
+        # logger.debug("  program_embedder %s", program_embedder)
         program_encoding = program_embedder(program_encoding)
-        logger.debug("program_encoding shape %s <--", program_encoding.shape)
+        # logger.debug("program_encoding shape %s <--", program_encoding.shape)
         return program_encoding
 
     def apply_program_attention_embedder(self, program_encoding):
-        logger.debug("apply_program_attention_embedder program shape %s", program_encoding.shape)
+        # logger.debug("apply_program_attention_embedder program shape %s", program_encoding.shape)
         # input is B x P x D (batch, program length, embedding dim)
         # output is B x P x D
         _, program_length, d = program_encoding.shape
@@ -1289,15 +1289,15 @@ class RepresentationNet(hk.Module):
         program_encoding += position_encodings
 
         for e in attention_encoders:
-            logger.debug("apply_program_attention_embedder layer %s", e.name)
+            # logger.debug("apply_program_attention_embedder layer %s", e.name)
             program_encoding = e(program_encoding, encoded_state=None)
-        logger.debug("apply_program_attention_embedder post MQAB %s", program_encoding.shape)
+        # logger.debug("apply_program_attention_embedder post MQAB %s", program_encoding.shape)
 
         return program_encoding
 
     def _make_locations_encoding_onehot(self, inputs, batch_size):
         """Creates location encoding using onehot representation."""
-        logger.debug("make_locations_encoding_onehot shapes %s", str({k:v.shape for k,v in inputs.items()}))
+        # logger.debug("make_locations_encoding_onehot shapes %s", str({k:v.shape for k,v in inputs.items()}))
         memory = inputs['memory'] # B x E x M (batch, num_inputs, memory size)
         registers = inputs['registers'] # B x E x R (batch, num_inputs, register size)
         # NOTE: originall implementation suggests the shape [B, H, P, D]
@@ -1311,7 +1311,7 @@ class RepresentationNet(hk.Module):
         # instead of the whole sequence of states,
         # that the CPU has seen while executing the program.
         locations = jnp.concatenate([registers, memory], axis=-1) # B x E x (R + M)
-        logger.debug("locations shape %s", locations.shape)
+        # logger.debug("locations shape %s", locations.shape)
         # to support inputs with sequences of states, we conditinally transpose
         # the locations tensor to have the shape [B, P, H, D]
         if len(locations.shape) == 4:
@@ -1324,11 +1324,11 @@ class RepresentationNet(hk.Module):
         locations_onehot = jax.nn.one_hot( # shape is now B x E x num_locations x num_locations
             locations, self._task_spec.num_locations, dtype=jnp.float32
         )
-        logger.debug("locations_onehot shape %s", locations_onehot.shape)
+        # logger.debug("locations_onehot shape %s", locations_onehot.shape)
         locations_onehot = locations_onehot.reshape(
             [batch_size, self._task_spec.num_inputs, -1]
         )
-        logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
+        # logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
         return locations_onehot
 
     def _make_locations_encoding_binary(self, inputs, batch_size):
@@ -1373,7 +1373,7 @@ class DistributionSupport(object):
 
     def mean(self, logits: jnp.ndarray) -> float:
         # logits has shape B x num_bins
-        logger.debug("DistSup.mean compute twohot logits for %s", logits.shape)
+        # logger.debug("DistSup.mean compute twohot logits for %s", logits.shape)
         chex.assert_shape(logits, (logits.shape[0], self.num_bins))
         # compute the mean of the logits
         mean = logits @ self.value_support # (B, num_bins) * (num_bins,) = (B,)
@@ -1431,7 +1431,7 @@ class CategoricalHead(hk.Module):
         # For training returns the logits, for inference the mean.
         logits = self._head(x) # project the embedding to the value support's numbeer of bins 
         probs = jax.nn.softmax(logits) # take softmax -- probabilities over the bins
-        logger.debug("CategoricalHead: logits shape %s, probs shape %s", logits.shape, probs.shape)
+        # logger.debug("CategoricalHead: logits shape %s, probs shape %s", logits.shape, probs.shape)
         mean = self._value_support.mean(probs) # compute the mean, which is probs * [0, max_val/num_bins, 2max_val/num_bins, max_val]
         return dict(logits=logits, mean=mean)
 
@@ -1454,21 +1454,43 @@ class PredictionNet(hk.Module):
         self.embedding_dim = embedding_dim
 
     def __call__(self, embedding: jnp.ndarray):
-        logger.debug("PredictionNet: embedding shape %s", embedding.shape)
+        # logger.debug("PredictionNet: embedding shape %s", embedding.shape)
         policy_head = make_head_network(
             self.embedding_dim, self.task_spec.num_actions
         )
-        logger.debug("PredictionNet: policy_head %s", policy_head)
+        # logger.debug("PredictionNet: policy_head %s", policy_head)
         value_head = CategoricalHead(self.embedding_dim, self.support)
-        logger.debug("PredictionNet: value_head %s", value_head)
+        # logger.debug("PredictionNet: value_head %s", value_head)
         latency_value_head = CategoricalHead(self.embedding_dim, self.support)
-        logger.debug("PredictionNet: latency_value_head %s", latency_value_head)
+        # logger.debug("PredictionNet: latency_value_head %s", latency_value_head)
         correctness_value = value_head(embedding)
-        logger.debug("PredictionNet: correctness_value shape %s", str({k:v.shape for k, v in correctness_value.items()}))
+        # logger.debug("PredictionNet: correctness_value shape %s", str({k:v.shape for k, v in correctness_value.items()}))
         latency_value = latency_value_head(embedding)
-        logger.debug("PredictionNet: latency_value shape %s", str({k:v.shape for k, v in latency_value.items()}))
+        # logger.debug("PredictionNet: latency_value shape %s", str({k:v.shape for k, v in latency_value.items()}))
 
+        # embedding is B x embedding_dim
+        # with an uninitialised network, its distribution should be close to
+        # a standard normal distribution with mean 0 
+        
+        # for debugging, we can check the distribution of the embedding
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     embedding_mean = jnp.mean(embedding)
+        #     embedding_std = jnp.std(embedding)
+        #     embedding_min = jnp.min(embedding)
+        #     embedding_max = jnp.max(embedding)
+        #     logger.debug("PredictionNet.distr_check: embedding min %s, max %s mean %s std %s", embedding_min, embedding_max, embedding_mean, embedding_std)
+        
         policy = policy_head(embedding) # B x num_actions
+        
+        # similarly, the policy should be close to a uniform distribution
+        # with a mean of 1/num_actions
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     policy_mean = jnp.mean(policy)
+        #     policy_std = jnp.std(policy)
+        #     policy_min = jnp.min(policy)
+        #     policy_max = jnp.max(policy)
+        #     logger.debug("PredictionNet.distr_check: policy min %s, max %s mean %s std %s", policy_min, policy_max, policy_mean, policy_std)
+        
         
         output = NetworkOutput(
             value=correctness_value['mean'] + latency_value['mean'],
@@ -1476,7 +1498,7 @@ class PredictionNet(hk.Module):
             latency_value_logits=latency_value['logits'],
             policy_logits=policy,
         )
-        logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items() if isinstance(v, jnp.ndarray)}))
+        # logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items() if isinstance(v, jnp.ndarray)}))
         return output
 
 
@@ -1742,7 +1764,7 @@ class Game(object):
         #         if actions_mask[i]:
         #                 logger.debug("  %s", space.get(action))
         
-        logger.debug("legal_actions: pruned_actions shape %s", pruned_actions.shape)
+        # logger.debug("legal_actions: pruned_actions shape %s", pruned_actions.shape)
         return pruned_actions
 
     def apply(self, action: Action):
@@ -1771,7 +1793,7 @@ class Game(object):
         self.root_values.append(root.value())
 
     def make_observation(self, state_index: int):
-        logger.debug("Game.make_observation: state_index %d", state_index)
+        # logger.debug("Game.make_observation: state_index %d", state_index)
         # NOTE: returns the observation corresponding to the last action
         if state_index == -1:
             observation = self.environment.observation()
@@ -1825,7 +1847,7 @@ class Game(object):
 
 def _batch_observation(max_program_size: int, observation: Dict[str, jnp.ndarray]):
     # games make a single observation at a time, but the network expects a batch.
-    logger.debug("_batch_observation: program shape %s", observation["program"].shape)
+    # logger.debug("_batch_observation: program shape %s", observation["program"].shape)
     
     return {
         "registers": observation["registers"][None, ...],
@@ -1885,12 +1907,12 @@ class ReplayBuffer(object):
     def _process_observation(self, observation: Dict[str, jnp.ndarray]) -> Dict[str, jnp.ndarray]:
         # pad the program encoding to the max program length
         program = observation['program']
-        logger.debug("ReplayBuffer._process_observation: program shape %s", program.shape)
+        # logger.debug("ReplayBuffer._process_observation: program shape %s", program.shape)
         if program.shape == () or program.shape == (0,): # empty program
-            logger.debug("ReplayBuffer._process_observation: empty program")
+            # logger.debug("ReplayBuffer._process_observation: empty program")
             program = jnp.zeros((0, 3), dtype=jnp.int32) * self.padding_token
         # program shape is p x 3, we want to return P x 3, where P is the max program size and p is the current proogram length
-        logger.debug("ReplayBuffer._process_observation: program shape %s", program.shape)
+        # logger.debug("ReplayBuffer._process_observation: program shape %s", program.shape)
         padded_program = jnp.pad(
             program, ((0, self.max_program_size - program.shape[0]), (0, 0)),
             mode='constant', constant_values=self.padding_token
@@ -1949,7 +1971,7 @@ class SharedReplayBuffer(ReplayBuffer):
         # delete the client so it doesn't get pickled
         self.disconnect()
         
-        logger.debug("SharedReplayBuffer: finished initialising. Write head %s list name %s", self.WRITE_HEAD, self.LIST_NAME)
+        # logger.debug("SharedReplayBuffer: finished initialising. Write head %s list name %s", self.WRITE_HEAD, self.LIST_NAME)
         
     @property
     def client(self) -> redis.Redis:
@@ -1969,43 +1991,43 @@ class SharedReplayBuffer(ReplayBuffer):
     
     def save_game(self, game):
         game_bin = pickle.dumps(game) # serialize the game
-        logger.debug("SharedReplayBuffer.save_game: game size %d", len(game_bin))
+        # logger.debug("SharedReplayBuffer.save_game: game size %d", len(game_bin))
         with self._write_lock:
             # get the write head
             write_head = self.client.get(self.WRITE_HEAD)
             write_head = int(write_head) if write_head is not None else 0
-            logger.debug("SharedReplayBuffer.save_game: [locked 1] write head %s", self.WRITE_HEAD)
+            # logger.debug("SharedReplayBuffer.save_game: [locked 1] write head %s", self.WRITE_HEAD)
             # increment the write head and num_items
             write_head = (write_head + 1) % self.window_size
-            logger.debug("SharedReplayBuffer.save_game: [locked 2] incremented write head %s", write_head)
+            # logger.debug("SharedReplayBuffer.save_game: [locked 2] incremented write head %s", write_head)
             self.client.set(self.WRITE_HEAD, write_head)
             # write the game to the shared memory
             self.client.rpush(self.LIST_NAME, game_bin)
-            logger.debug("SharedReplayBuffer.save_game: [locked 3] game saved to %s at index %s", self.LIST_NAME, write_head)
+            # logger.debug("SharedReplayBuffer.save_game: [locked 3] game saved to %s at index %s", self.LIST_NAME, write_head)
             # if the buffer is full, remove the oldest game
             length = self.client.llen(self.LIST_NAME)
-            logger.debug("SharedReplayBuffer.save_game: [locked 4] buffer length %d", length)
+            # logger.debug("SharedReplayBuffer.save_game: [locked 4] buffer length %d", length)
             if  length > self.window_size:
                 self.client.lpop(self.LIST_NAME)
-                logger.debug("SharedReplayBuffer.save_game: [locked 5] popped oldest game from %s", self.LIST_NAME)
+                # logger.debug("SharedReplayBuffer.save_game: [locked 5] popped oldest game from %s", self.LIST_NAME)
         # release lock
     
     def sample_game(self):
         # uniformly sample an index
         list_len = self.client.llen(self.LIST_NAME) # <= self.window_size
-        logger.debug("SharedReplayBuffer.sample_game: list length %d", list_len)
+        # logger.debug("SharedReplayBuffer.sample_game: list length %d", list_len)
         if list_len == 0:
-            logger.debug("SharedReplayBuffer.sample_game: empty buffer")
+            # logger.debug("SharedReplayBuffer.sample_game: empty buffer")
             return None
         list_len = min(list_len, self.window_size) # to be safe
         idx = int(numpy.random.uniform(0, list_len))
         # get the given index from the list
-        logger.debug("SharedReplayBuffer.sample_game: index %d", idx)
+        # logger.debug("SharedReplayBuffer.sample_game: index %d", idx)
         game_bin = self.client.lindex(self.LIST_NAME, idx)
         # deserialize the game
-        logger.debug("SharedReplayBuffer.sample_game: game_bin size %d", len(game_bin))
+        # logger.debug("SharedReplayBuffer.sample_game: game_bin size %d", len(game_bin))
         game = pickle.loads(game_bin)
-        logger.debug("SharedReplayBuffer.sample_game: game loaded")
+        # logger.debug("SharedReplayBuffer.sample_game: game loaded")
         # if the game is empty, return a new game
         return game
 
@@ -2056,17 +2078,17 @@ class SharedStorage(object):
             assert False, "SharedStorage: No network found in shared storage." 
         latest_network = int(latest_network)
         # deserialize the network
-        logger.debug("SharedStorage.latest_network: getting latest network %d", latest_network)
+        # logger.debug("SharedStorage.latest_network: getting latest network %d", latest_network)
         network_bin = self.client.hget(self.STORAGE_NAME, latest_network)
-        logger.debug("SharedStorage.latest_network: network_bin size %d", len(network_bin))
+        # logger.debug("SharedStorage.latest_network: network_bin size %d", len(network_bin))
         network = pickle.loads(network_bin)
-        logger.debug("SharedStorage.latest_network: network loaded")
+        # logger.debug("SharedStorage.latest_network: network loaded")
         return network
 
     def save_network(self, step: int, state: NetworkState):
         # Serialize parameters
         serialized = pickle.dumps(state)
-        logger.debug("SharedStorage.save_network: step %d, serialized size %d", step, len(serialized))
+        # logger.debug("SharedStorage.save_network: step %d, serialized size %d", step, len(serialized))
         # set the new network
         self.client.hset(self.STORAGE_NAME, step, serialized)
         # Set the latest network
@@ -2075,7 +2097,7 @@ class SharedStorage(object):
         # it can happen that the latest network (step number) is decremented.
         # we only train on a single process tho so this should be fine.
         self.client.set(self.LATEST_NETWORK, step)
-        logger.debug("SharedStorage.save_network: latest network set to %d", step)
+        # logger.debug("SharedStorage.save_network: latest network set to %d", step)
 
 ##### End Helpers ########
 ##########################
@@ -2163,9 +2185,11 @@ def run_selfplay(
     network = Network(config.hparams, config.task_spec)
     while True:
         network_params = storage.latest_network()
+        start = time.time()
         game = play_game(config, network, network_params)
+        elapsed = time.time() - start
         replay_buffer.save_game(game)
-        logger.debug("Self-play game finished. Game length: %d", len(game.history))
+        logger.debug("Self-play game finished. Game length: %d time %.3f ", len(game.history), elapsed)
         break
 
 
@@ -2224,7 +2248,7 @@ def play_game(config: AlphaDevConfig, network: Network, state: NetworkState) -> 
         )
         # NOTE: make a move after the MCTS policy improvement step
         action = _select_action(config, len(game.history), root, state.steps, game.action_space_storage)
-        logger.debug("play_game: selected action %s. current length %s", action, len(game.history))
+        # logger.debug("play_game: selected action %s. current length %s", action, len(game.history))
         game.apply(action) # step the environment
         game.store_search_statistics(root)
     return game
@@ -2268,7 +2292,7 @@ def run_mcts(
         while node.expanded():
             action, node = _select_child(config, node, min_max_stats) # based on UCB
             action = action_space_storage.actions[action] # convert from int to Action
-            logger.debug("run_mcts: expanded_node selected action %s", action)
+            # logger.debug("run_mcts: expanded_node selected action %s", action)
             sim_env.step(action) # step the environment
             history.add_action(action) # update history 
             search_path.append(node) # append to the current trajectory
@@ -2285,7 +2309,7 @@ def run_mcts(
             action_space = action_space_storage.get_space(CPUState(**observation))
             # get the priors
             network_output = network.inference(params, observation)
-            logger.debug("run_mcts: selecting new node")
+            # logger.debug("run_mcts: selecting new node")
             _expand_node( # expand the leaf node
                 # here, game is not available. I suppose we do not perform action pruning.
                 # instead, the history should be initialized either 
@@ -2334,14 +2358,17 @@ def _select_child(
     config: AlphaDevConfig, node: Node, min_max_stats: MinMaxStats
 ):
     """Selects the child with the highest UCB score."""
-    scores = [(_ucb_score(config, node, child, min_max_stats), action, child)
-        for action, child in node.children.items()]
+    scores = [(_ucb_score(config, node, child, min_max_stats), action, child, idx)
+        for idx, (action, child) in enumerate(node.children.items())]
     # unique_scores, unique_indices = numpy.unique(
     #     [s[0] for s in scores], return_index=True
     # )
     #   logger.debug("select_child: unique scores: %s", unique_scores)
     #   logger.debug("select_child: unique indices: %s", unique_indices)
-    _, action, child = max(scores)
+    score, action, child, idx = max(scores, key=lambda s: s[0]) # NOTE: this is a random argmax as in acme
+    
+    # logger.debug("mcts._select_child: act %s, score %s", action, score)
+    
     return action, child
 
 
@@ -2367,6 +2394,21 @@ def _ucb_score(
         value_score = 0
     return prior_score + value_score
 
+argmax_key = jax.random.PRNGKey(0)
+# NOTE: unsolicited copy-paste from acme
+def argmax(values: jnp.ndarray) -> int:
+    """Argmax with random tie-breaking."""
+    check_numerics(values)
+    max_value = jnp.max(values)
+    return jnp.int32(jax.random.choice(argmax_key, jnp.flatnonzero(values == max_value)))
+
+# NOTE: unsolicited copy-paste from acme
+def check_numerics(values: jnp.ndarray):
+    """Raises a ValueError if any of the inputs are NaN or Inf."""
+    if not jnp.isfinite(values).all():
+        raise ValueError('check_numerics failed. Inputs: {}. '.format(values))
+
+
 
 def _expand_node(
     node: Node,
@@ -2377,24 +2419,24 @@ def _expand_node(
 ):
     """Expands the node using value, reward and policy predictions from the NN."""
     node.to_play = to_play
-    # node.hidden_state = network_output.hidden_state
+    # NOTE: this is different from the acme implementaation, where the reward is unobserved during mcts
     node.reward = reward
     # Masked softmax. actions() are the legal actions and network output is the prior
     # TODO: use a more efficient softmax instead of the lines below.
-    logger.debug("_expand_node: policy logits shape %s", network_output.policy_logits.shape)
     policy_logits = network_output.policy_logits # B x A with B = 1 or not included. we first average
     if len(policy_logits.shape) > 1:
         policy_logits = jnp.mean(policy_logits, axis=0)
     # select the logits that correspond to the (legal) actions
     # take softmax over the logits
     policy = jax.nn.softmax(policy_logits)
-    logger.debug("_expand_node: indexing policy %s with actions %s", policy.shape, actions.shape)
+    # logger.debug("mcts._expand_node: policy priors min %s, max %s, mean %s, std %s", policy.min(), policy.max(), policy.mean(), policy.std())
     policy = policy[actions]
-    assert len(policy) == len(actions), \
-        f"Expected {len(actions)} actions, got {len(policy)}"
+    
+    assert len(policy) == len(actions), f"Expected {len(actions)} actions, got {len(policy)}"
+    
     for action, p in zip(actions.tolist(), policy.tolist()):
         node.children[action] = Node(p)
-    
+
 
 def _backpropagate(
     search_path: Sequence[Node],
@@ -2500,9 +2542,9 @@ def _loss_fn(
     # NOTE: latency target is 0 unless the game reached a terminal state.
     l_latency = scalar_loss(predictions.latency_value_logits, target_latency, network)
     
-    logger.debug("_loss_fn: l_policy %s", l_policy)
-    logger.debug("_loss_fn: l_correctness %s", l_correctness)
-    logger.debug("_loss_fn: l_latency %s", l_latency)
+    # logger.debug("_loss_fn: l_policy %s", l_policy)
+    # logger.debug("_loss_fn: l_correctness %s", l_correctness)
+    # logger.debug("_loss_fn: l_latency %s", l_latency)
     
     loss = l_policy + l_correctness + l_latency
     # loss is of shape B x 1, we take the mean over the batch
@@ -2799,7 +2841,7 @@ def generate_sort_inputs(
 #         time.sleep(1)
 
 logging.basicConfig(level=logging.INFO)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 if __name__ == '__main__':
     config = AlphaDevConfig()
     alphadev(config)
