@@ -33,14 +33,17 @@ from .mcts_distributed import DistributedMCTS # copied from github (not in the d
 # #################
 
 class ActionSpace:
-    def __init__(self, actions: Dict[int, Any], asm: Dict[int, Any]):
+    def __init__(self, actions: Dict[int, Any], asm: Dict[int, Any], nump:Dict[int, Any]):
         """Immutable action space."""
         self.actions = actions
         self.asm = asm
+        self.np = nump
     
-    def __getitem__(self, index):
+    def get(self, index):
         """
         Get the action at the given index.
+        
+        Returns a tuple of the form (opcode, operands).
         """
         return self.actions[index]
     
@@ -49,6 +52,14 @@ class ActionSpace:
         Get the action at the given index.
         """
         return self.asm[index]
+    
+    def get_np(self, index):
+        """
+        Get the action at the given index.
+        
+        Returns a numpy array of the form [opcode, reg1, reg2].
+        """
+        return self.np[index]
     
     def __len__(self):
         """
@@ -109,6 +120,10 @@ x86_signatures = {
     # skip jump instructions, they are not used in the published sort algorithms
     }
 
+x86_opcode2int = {
+    k: i for i, k in enumerate(x86_signatures.keys())
+}
+
 def x86_enumerate_actions(max_reg: int, max_mem: int) -> Dict[Tuple[str, Tuple[int, int]]]:
     def apply_opcode(opcode: str, operands: Tuple[int, int, int]) -> List[Tuple[str, Tuple[int, int]]]:
         # operands is a triple (reg1, reg2, mem)
@@ -164,6 +179,10 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # pre-compute the assembly representation of the actions
         self.asm_actions = {
             i: x86_to_riscv(action[0], action[1], self.max_reg) for i, action in self.actions.items()
+        }
+        self.np_actions = {
+            i: np.array([x86_opcode2int[action[0]], action[1][0], action[1][1]])
+            for i, action in self.actions.items()
         }
         # there is a single action space for the given task
         self.action_space_cls = ActionSpace # these are still x86 instructions
@@ -342,7 +361,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         return tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask)
 
     def get_space(self) -> ActionSpace:
-        return self.action_space_cls(self.actions, self.asm_actions)
+        return self.action_space_cls(self.actions, self.asm_actions, self.np_actions)
 
 # #################
 # Environment definition
@@ -374,6 +393,13 @@ class IOExample(NamedTuple):
     outputs: tf.Tensor # num_inputs x <num_mem>
     output_mask: tf.Tensor # num_inputs x <num_mem> boolean array masking irrelevant parts of the output
 
+class Program(NamedTuple):
+    npy_program: tf.Tensor # <max_program_size> x 3 (opcode, op1, op2)
+    asm_program: List[Callable[[int], Any]] # list of pseudo-asm instructions
+    
+    def __len__(self):
+        return len(self.asm_program)
+
 class AssemblyGame(Environment):
     def __init__(self, task_spec: TaskSpec, inputs: IOExample, action_space_storage: ActionSpaceStorage):
         """
@@ -387,10 +413,22 @@ class AssemblyGame(Environment):
         self._output_mask = inputs.output_mask
         self._outputs = tf.boolean_mask(inputs.outputs, self._output_mask)
         self._max_num_hits = tf.reduce_sum(self._output_mask)
+        
         self._emulator = multi_machine(
             mem_size=task_spec.num_mem*4, # 4 bytes per memory location
             num_machines=task_spec.num_inputs,
             initial_state=self._inputs
+        )
+        self._action_space_storage = action_space_storage
+        self.reset()
+
+    def _reset_program(self):
+        self._program = Program(
+            npy_program=tf.Variable(
+                initial_value=tf.zeros((self._task_spec.max_program_size, 3), dtype=tf.int32),
+                trainable=False,
+                name="program"),
+            asm_program=[],
         )
     
     def _eval_output(self, output: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
@@ -400,32 +438,146 @@ class AssemblyGame(Environment):
         all_hits = tf.equal(num_hits, self._max_num_hits)
         return all_hits, num_hits
     
-    def _convert_instruction(self, instruction: tf.Tensor) -> tf.Tensor:
-        """
-        Instruction is a scalar int32 value. We translate it to an assembly pseudo-op.
-        in RISC-V.
-        """
-        return self._asm_lookup[instruction][1]
+    def _eval_latency(self) -> tf.Tensor:
+        """Returns a scalar latency for the program."""
+        latencies = tf.constant([
+            self._emulator.measure_latency(self._program.asm_program)
+            for _ in range(self._task_spec.num_inputs)], dtype=tf.float32
+        )
+        return latencies
     
+    def _compute_reward(self, include_latency: float) -> float:
+        # compute the reward based on the latency and correctness
+        correctness_reward = self.task_spec.correctness_reward_weight * (
+            self._num_hits - self.previous_correct_items
+        )
+        correctness_reward += self.task_spec.correct_reward * self._is_correct
+        # update the previous correct items
+        if include_latency: # cannot be <0 btw
+            latencies = self._eval_latency()
+            latency_reward = np.quantile(
+                latencies, self.task_spec.latency_quantile
+                ) * self._task_spec.latency_reward_weight
+        reward = correctness_reward + latency_reward
+        
+        return reward
+    
+    def _make_observation(self) -> CPUState:
+        # get the current state of the CPU
+        return CPUState(
+            registers=tf.constant(self._emulator.registers),
+            active_registers=tf.constant(self._emulator.register_mask),
+            memory=tf.constant(self._emulator.memory),
+            active_memory=tf.constant(self._emulator.memory_mask),
+            program=tf.constant(self.program.npy_program),
+            program_length=tf.constant(len(self._program), dtype=tf.int32),
+            program_counter=tf.constant(self._emulator.program_counter, dtype=tf.int32)
+        )
+    
+    def _check_invalid(self) -> bool:
+        # either too long or the emulator is in an invalid state
+        return len(self._program) > self._task_spec.max_program_size or \
+            False # TODO: self._emulator.invalid()
+    
+    def _update_state(self):
+        # first we make an observation
+        observation = self._make_observation()
+        # then we check if the program is correct
+        self._is_invalid = self._check_invalid()
+        if self._is_invalid:
+            self._is_correct = False; self._num_hits = 0
+        else:
+            self._is_correct, self._num_hits = self._eval_output(self._emulator.memory)
+        # terminality check
+        is_terminal = self._is_correct or self._is_invalid
+        
+        # we can now compute the reward
+        reward = self._compute_reward(include_latency=is_terminal)
+        
+        ts = TimeStep(
+            step_type=StepType.MID if not is_terminal else StepType.LAST,
+            reward=reward,
+            discount=1.0, # NOTE: discount in this context is not used TODO: check this
+            observation=observation
+        )
+        self._last_ts = ts
+        return ts
+        
     def reset(self) -> TimeStep:
-        pass
-    def step(self, action) -> TimeStep:
-        pass
-    def reward_spec(self):
-        pass
-    def discount_spec(self):
-        pass
-    def observation_spec(self):
-        pass
-    def action_spec(self):
-        pass
-    def close(self):
-        pass
-    def __enter__(self):
-        pass
-    def __exit__(self, exc_type, exc_value, traceback):
-        pass
+        # deletes the program and resets the 
+        # CPU state to the original inputs
+        self._emulator.reset_state()
+        self._reset_program()
+        
+        ts = TimeStep(
+            step_type=StepType.FIRST,
+            reward=0.0,
+            discount=1.0,
+            observation=CPUState(
+                registers=self._emulator.registers,
+                active_registers=self._emulator.register_mask,
+                memory=self._emulator.memory,
+                active_memory=self._emulator.memory_mask,
+                program=self._emulator.program_counter,
+                program_length=tf.constant(0, dtype=tf.int32),
+                program_counter=tf.constant(0, dtype=tf.int32)
+            )
+        )
+        self._last_ts = ts # contains observation, reward, discount
+        self._is_correct = False # these three need \
+        self._num_hits = 0       # some effort to computed \
+        self._is_invalid = False # so we cache them
+        
+        return ts
     
+    def step(self, action:int) -> TimeStep:
+        action_space = self._action_space_storage.get_space()
+        # append the action to the program
+        action_np = action_space.get_np(action)
+        action_asm = action_space.get_asm(action)
+        
+        self._program = Program(
+            npy_program=tf.tensor_scatter_nd_update(
+                self._program.npy_program, [[self._program_length]], [action_np]
+            ),
+            asm_program=self._program.asm_program + [action_asm]
+        )
+        # reset the emulator
+        self._emulator.reset_state()
+        # execute the program
+        self._emulator.exe(program=self._program.asm_program)
+        # update observation and cached values
+        self._update_state()
+        # return the updated timestep
+        return self._last_ts
+    
+    def reward_spec(self):
+        return Array(shape=(), dtype=tf.float32)
+    def discount_spec(self):
+        return Array(shape=(), dtype=tf.float32)
+    def observation_spec(self):
+        return CPUState(
+            registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=tf.float32),
+            active_registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=tf.bool),
+            memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=tf.float32),
+            active_memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=tf.bool),
+            program=Array(shape=(self._task_spec.max_program_size, 3), dtype=tf.int32),
+            program_length=Array(shape=(), dtype=tf.int32),
+            program_counter=Array(shape=(self._task_spec.num_inputs,), dtype=tf.int32)
+        )
+    def action_spec(self):
+        # TODO: this won't work for dynamic action spaces
+        return DiscreteArray(num_values=len(self._action_space_storage.actions))
+    def close(self):
+        del self._emulator
+        del self._program
+        del self._last_ts
+        
+    def __enter__(self):
+        return super().__enter__()
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+
 
 
 # #################
