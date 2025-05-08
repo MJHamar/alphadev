@@ -1,11 +1,14 @@
 """
 Main script for running AlphaDev with an ACME and reverb backend.
 """
-from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Generator
+from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Generator, Sequence, Mapping
+import functools
 
 import sonnet as snn
 import tensorflow as tf
+import tensorflow_probability as tfp
 import numpy as np
+import ml_collections
 
 from acme.specs import EnvironmentSpec, Array, BoundedArray, DiscreteArray
 from dm_env import Environment, TimeStep, StepType
@@ -44,6 +47,7 @@ class ActionSpace:
         Get the action at the given index.
         
         Returns a tuple of the form (opcode, operands).
+        We can use this for printing the action.
         """
         return self.actions[index]
     
@@ -66,7 +70,6 @@ class ActionSpace:
         Get the number of actions in the action space.
         """
         return len(self.actions)
-
 
 X0 = 0 # hard-wired zero register
 X1 = 1 # reserved for comparison ops
@@ -189,7 +192,6 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # TODO: make sure we don't flood the memory with this
         self.masks = {}
         # for pruning the action space (one read and one write per memory location)
-        self._history_cache = None
         self._mems_read = set()
         self._mems_written = set()
         # build mask lookup tables
@@ -245,8 +247,12 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
                 else:
                     mem_write_actions.scatter_nd_update([[i]], [True])
         
-        assert tf.reduce_any(tf.logical_and(tf.logical_and(reg_only_actions, mem_read_actions), mem_write_actions)) == False, \
-            "Action space was not partitioned correctly"
+        assert not tf.reduce_any(tf.logical_and(reg_only_actions, mem_read_actions)), \
+            "Action in both reg_only and mem_read"
+        assert not tf.reduce_any(tf.logical_and(reg_only_actions, mem_write_actions)), \
+            "Action in both reg_only and mem_write"
+        assert not tf.reduce_any(tf.logical_and(mem_read_actions, mem_write_actions)), \
+            "Action in both mem_read and mem_write"
         assert tf.reduce_all(tf.logical_or(tf.logical_or(reg_only_actions, mem_read_actions), mem_write_actions)), \
             "Action space was not partitioned correctly"
         
@@ -448,16 +454,17 @@ class AssemblyGame(Environment):
     
     def _compute_reward(self, include_latency: float) -> float:
         # compute the reward based on the latency and correctness
-        correctness_reward = self.task_spec.correctness_reward_weight * (
-            self._num_hits - self.previous_correct_items
+        correctness_reward = self._task_spec.correctness_reward_weight * (
+            self._num_hits - self._num_hits # NOTE: num_hits here **is** from the previous iteration.
         )
-        correctness_reward += self.task_spec.correct_reward * self._is_correct
+        correctness_reward += self._task_spec.correct_reward * self._is_correct
         # update the previous correct items
+        latency_reward = 0.0
         if include_latency: # cannot be <0 btw
             latencies = self._eval_latency()
-            latency_reward = np.quantile(
-                latencies, self.task_spec.latency_quantile
-                ) * self._task_spec.latency_reward_weight
+            latency_reward = tfp.stats(
+                latencies, self._task_spec.latency_quantile * 100
+            ) * self._task_spec.latency_reward_weight
         reward = correctness_reward + latency_reward
         
         return reward
@@ -502,7 +509,7 @@ class AssemblyGame(Environment):
         )
         self._last_ts = ts
         return ts
-        
+    
     def reset(self) -> TimeStep:
         # deletes the program and resets the 
         # CPU state to the original inputs
@@ -513,15 +520,7 @@ class AssemblyGame(Environment):
             step_type=StepType.FIRST,
             reward=0.0,
             discount=1.0,
-            observation=CPUState(
-                registers=self._emulator.registers,
-                active_registers=self._emulator.register_mask,
-                memory=self._emulator.memory,
-                active_memory=self._emulator.memory_mask,
-                program=self._emulator.program_counter,
-                program_length=tf.constant(0, dtype=tf.int32),
-                program_counter=tf.constant(0, dtype=tf.int32)
-            )
+            observation=self._make_observation()
         )
         self._last_ts = ts # contains observation, reward, discount
         self._is_correct = False # these three need \
@@ -538,9 +537,9 @@ class AssemblyGame(Environment):
         
         self._program = Program(
             npy_program=tf.tensor_scatter_nd_update(
-                self._program.npy_program, [[self._program_length]], [action_np]
+                self._program.npy_program, [[len(self._program)]], [action_np]
             ),
-            asm_program=self._program.asm_program + [action_asm]
+            asm_program=self._program.asm_program + [action_asm] # preserves immutability
         )
         # reset the emulator
         self._emulator.reset_state()
@@ -572,17 +571,557 @@ class AssemblyGame(Environment):
         del self._emulator
         del self._program
         del self._last_ts
-        
+
     def __enter__(self):
         return super().__enter__()
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
 
-
-
 # #################
 # network definition
 # #################
+
+
+class MultiQueryAttentionBlock(snn.Module):
+    """Attention with multiple query heads and a single shared key and value head.
+
+    Implementation of "Fast Transformer Decoding: One Write-Head is All You Need",
+    see https://arxiv.org/abs/1911.02150.
+    """
+    def __init__(self,
+            attention_params: ml_collections.ConfigDict,
+            name: str | None = None,
+        ):
+        super().__init__(name=name)
+        self.head_depth = attention_params.head_depth
+        self.num_heads = attention_params.num_heads
+        self.attention_dropout = attention_params.attention_dropout
+        self.position_encoding = attention_params.position_encoding
+    
+    def __call__(self, inputs, encoded_state=None):
+        """
+        Tensoflow implementation from the paper:
+        def MultiqueryAttentionBatched(X, M, mask , P_q, P_k, P_v, P_o) :
+            \""" Multi-Query Attention.
+            Args :
+                X: Inputs (queries    shape [ b, n, d] 
+                M: other inputs (k/v) shape [ b, m, d]
+                mask : a tensor with  shape [ b, h, n , m]
+                P_q: Query proj mat   shape [ h, d, k]
+                P_k: Key proj mat     shape [    d, k]
+                P_v: Value proj mat   shape [    d, v]
+                P_o: Output proj mat  shape [ h, d, v]
+            where 
+                'h' is the number of heads, 
+                'm' is the number of input vectors,
+                'n' is the number of inputs, for which we want to compute the attention
+                'd' is the dimension of the input vectors,
+            Returns :
+                Y: a tensor with shape [ b , n , d ]
+            \"""
+            Q = tf.einsum ( "bnd, hdk->bhnk " , X, P_q)
+            K = tf.einsum ( "bmd, dk->bmk" , M, P_k)
+            V = tf.einsum ( "bmd, dv->bmv" , M, P_v)
+            logits = tf.einsum ( " bhnk , bmk->bhnm " , Q, K)
+            weights = tf.softmax ( logits + mask )
+            O = tf.einsum ( "bhnm, bmv->bhnv " , weights , V)
+            Y = tf.einsum ( "bhnv , hdv->bnd " , O, P_o)
+            return Y
+        """
+        # P_q, P_k, P_v, P_o are parameters, which we declare here
+        Q = self._linear_projection(inputs, self.num_heads, self.head_depth, name='P_q') # B x N x H x K
+        K = self._linear_projection(inputs, 1, self.head_depth, name='P_k') # B x M x K
+        V = self._linear_projection(inputs, 1, self.head_depth, name='P_v') # B x M x V
+        
+        # logger.debug("MQAB: logits einsum Q (bnhk) %s, K (bmk) %s -> bhnm", Q.shape, K.shape)
+        logits = tf.einsum("bnhk,bmk->bhnm", Q, K) # B x N x H x M
+        # logger.debug("MQAB: logits shape (bhnm) %s", logits.shape)
+        weights = tf.nn.softmax(logits) # NOTE: no causal masking, this is an encoder block
+        # logger.debug("MQAB: weights shape (bhnm) %s", weights.shape)
+        if self.attention_dropout: # boolean
+            # logger.debug("MQAB: applying attention dropout %s", self.attention_dropout)
+            weights = snn.Dropout(self.attention_dropout, name='attn_dropout')(weights)
+        # logger.debug("MQAB: output projection einsum weights (bhnm) %s, V (bmv) %s -> bhnv", weights.shape, V.shape)
+        O = tf.einsum("bhnm,bmv->bhnv", weights, V) # B x N x H x V
+        # logger.debug("MQAB: O shape (bhnv) %s", O.shape)
+        B, _, N, _ = O.shape # B x H x N x V
+        # reshape O to B x N x (H*V)
+        O = O.reshape((B, N, -1)) # B x N x (H*V)
+        # logger.debug("MQAB: O reshaped to %s", O.shape)
+        # apply the output projection
+        # logger.debug("MQAB: aggregate head projection bn[h*v] %s to bnd %s ", O.shape, inputs.shape)
+        Y = self._linear_projection(O, 1, inputs.shape[-1], name='P_o') # B x N x V
+        # logger.debug("MQAB: output shape (bnd) %s", Y.shape)
+        assert Y.shape == inputs.shape,\
+            f"Output shape {Y.shape} does not match input shape {inputs.shape}."
+        
+        return Y # B x N x D
+    
+    def _linear_projection(
+        self,
+        x: tf.Tensor, # [B, N, D] (batch, seqence length, embedding dim)
+        num_heads: int,
+        head_size: int,
+        name: str | None = None,
+    ) -> tf.Tensor:
+        """Copy-paste from hk.MultiHeadAttention."""
+        y = tf.Linear(num_heads * head_size, name=name)(x) # proj mat. D x (H*K) 
+        # y should be [B, N, H*K]
+        assert y.ndim == 3, f"y should be 3D, but got {y.ndim}D"
+        assert y.shape[-1] == num_heads * head_size, f"y should be of shape [B, N, H*K], but got {y.shape}"
+        *leading_dims, _ = x.shape # [B, N, D]
+        # split last dimension (H*K) into H, K
+        new_shape = (*leading_dims, num_heads, head_size) if num_heads > 1 else (*leading_dims, head_size)
+        # logger.debug("linear_projection, reshaping y from %s to %s", y.shape, new_shape)
+        return y.reshape(new_shape) # [B, N, H, K] or [B, N, K]
+
+    def sinusoid_position_encoding(seq_size, feat_size):
+        """Compute sinusoid absolute position encodings, 
+        given a sequence size and feature dimensionality"""
+        # SOURCE: https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/JAX/tutorial6/Transformers_and_MHAttention.html
+        pe = tf.zeros((seq_size, feat_size))
+        position = tf.cast(tf.range(0, seq_size), dtype=tf.float32)[:,None]
+        div_term = tf.exp(tf.range(0, feat_size, 2) * (-tf.math.log(10000.0) / feat_size))
+        pe = tf.tensor_scatter_nd_update(pe, indices=tf.stack([tf.range(seq_size), tf.zeros(seq_size, dtype=tf.int32)], axis=1), updates=tf.sin(position * div_term))
+        pe = tf.tensor_scatter_nd_update(pe, indices=tf.stack([tf.range(seq_size), tf.ones(seq_size, dtype=tf.int32)], axis=1), updates=tf.cos(position * div_term))
+        pe = tf.reshape(pe, (1, seq_size, feat_size))
+        return pe
+
+class ResBlockV2(snn.Module):
+    """Layer-normed variant of the block from https://arxiv.org/abs/1603.05027.
+    Implementation based on dm-haiku's ResNetBlockV2.
+    """
+    def __init__(
+        self,
+        channels: int,
+        stride: int | Sequence[int] = 1,
+        use_projection: bool = False,
+        ln_config: Mapping[str, Any] = {},
+        bottleneck: bool = False,
+        name: str | None = None,
+    ):
+        super().__init__(name=name)
+        self.use_projection = use_projection
+
+        ln_config = dict(ln_config)
+        ln_config.setdefault("axis", -1)
+        ln_config.setdefault("create_scale", True)
+        ln_config.setdefault("create_offset", True)
+        
+        if self.use_projection:
+            self.proj_conv = snn.Conv1D(
+                output_channels=channels,
+                kernel_shape=1,
+                stride=stride,
+                with_bias=False,
+                padding="SAME",
+                name="shortcut_conv")
+
+        channel_div = 4 if bottleneck else 1
+        conv_0 = snn.Conv1D(
+            output_channels=channels // channel_div,
+            kernel_shape=1 if bottleneck else 3,
+            stride=1 if bottleneck else stride,
+            with_bias=False,
+            padding="SAME",
+            name="conv_0")
+
+        ln_0 = snn.LayerNorm(name="LayerNorm_0", **ln_config)
+
+        conv_1 = snn.Conv1D(
+            output_channels=channels // channel_div,
+            kernel_shape=3,
+            stride=stride if bottleneck else 1,
+            with_bias=False,
+            padding="SAME",
+            name="conv_1")
+
+        ln_1 = snn.LayerNorm(name="LayerNorm_1", **ln_config)
+        layers = ((conv_0, ln_0), (conv_1, ln_1))
+
+        if bottleneck:
+            conv_2 = snn.Conv1D(
+                output_channels=channels,
+                kernel_shape=1,
+                stride=1,
+                with_bias=False,
+                padding="SAME",
+                name="conv_2")
+
+            # NOTE: Some implementations of ResNet50 v2 suggest initializing
+            # gamma/scale here to zeros.
+            ln_2 = snn.LayerNorm(name="LayerNorm_2", **ln_config)
+            layers = layers + ((conv_2, ln_2),)
+
+        self.layers = layers
+
+    def __call__(self, inputs):
+        # FIXME: figure out what to do with the is_training and test_local_stats
+        # logger.debug("ResBlockV2: inputs shape %s", inputs.shape)
+        x = shortcut = inputs
+
+        for i, (conv_i, ln_i) in enumerate(self.layers):
+            x = ln_i(x)
+            x = tf.nn.relu(x)
+        if i == 0 and self.use_projection:
+            shortcut = self.proj_conv(x)
+        x = conv_i(x)
+
+        return x + shortcut
+
+
+def int2bin(integers_array: tf.Tensor) -> tf.Tensor:
+    """Converts an array of integers to an array of its 32bit representation bits.
+
+    Conversion goes from array of shape (S1, S2, ..., SN) to (S1, S2, ..., SN*32),
+    i.e. all binary arrays are concatenated. Also note that the single 32-long
+    binary sequences are reversed, i.e. the number 1 will be converted to the
+    binary 1000000... . This is irrelevant for ML problems.
+
+    Args:
+        integers_array: array of integers to convert.
+
+    Returns:
+        array of bits (on or off) in boolean type.
+    """
+    flat_arr = tf.reshape(tf.cast(integers_array, dtype=tf.int32), (-1, 1))
+    # bin_mask = jnp.tile(2 ** jnp.arange(32), (flat_arr.shape[0], 1))
+    bin_mask = tf.tile(tf.reshape(tf.pow(2, tf.range(32)), (1,32)), [tf.shape(flat_arr)[0], 1])
+    masked = (flat_arr & bin_mask) != 0
+    return tf.reshape(masked, (*integers_array.shape[:-1], integers_array.shape[-1] * 32))
+
+def bin2int(binary_array: tf.Tensor) -> tf.Tensor:
+    """Reverses operation of int2bin."""
+    # reshape the binary array to be of shape (S1, S2, ..., SN, 32)
+    # i.e. all 32-long binary sequences are separated
+    u_binary_array = tf.reshape(binary_array, (*binary_array.shape[:-1], binary_array.shape[-1] // 32, 32)
+    )
+    # calculate the exponents for each bit
+    exponents = tf.pow(2, tf.range(32))
+    result = tf.tensordot(tf.cast(u_binary_array, tf.int32), exponents, axes=1)
+    print(result)
+    return tf.cast(result, dtype=tf.int32)
+
+class RepresentationNet(snn.Module):
+    """
+    Implemementation of the RepresentationNet based on the AlphaDev pseudocode
+    
+    https://github.com/google-deepmind/alphadev
+    """
+
+    def __init__(
+        self,
+        hparams: ml_collections.ConfigDict,
+        task_spec: TaskSpec,
+        embedding_dim: int,
+        name: str = 'representation',
+    ):
+        super().__init__(name=name)
+        self._hparams = hparams
+        self._task_spec = task_spec
+        self._embedding_dim = embedding_dim
+
+    def __call__(self, inputs: CPUState):
+        # logger.debug("representation_net program shape %s", inputs['program'].shape)
+        # inputs is the observation dict
+        batch_size = inputs['program'].shape[0]
+
+        program_encoding = None
+        if self._hparams.representation.use_program:
+            program_encoding = self._encode_program(inputs, batch_size)
+
+        if (
+            self._hparams.representation.use_locations # i.e. CPU state
+            and self._hparams.representation.use_locations_binary
+        ):
+            raise ValueError(
+                'only one of `use_locations` and `use_locations_binary` may be used.'
+            )
+        # encode the locations (registers and memory) in the CPU state
+        locations_encoding = None
+        if self._hparams.representation.use_locations:
+            locations_encoding = self._make_locations_encoding_onehot(
+                inputs, batch_size
+            )
+        elif self._hparams.representation.use_locations_binary:
+            locations_encoding = self._make_locations_encoding_binary(
+                inputs, batch_size
+            )
+
+        # NOTE: this is not used.
+        permutation_embedding = None
+        if self._hparams.representation.use_permutation_embedding:
+            raise NotImplementedError(
+                'permutation embedding is not implemented and will not be. keeping for completeness.')
+        # aggregate the locations and the program to produce a single output vector
+        return self.aggregate_locations_program(
+            locations_encoding, permutation_embedding, program_encoding, batch_size
+        )
+
+    def _encode_program(self, inputs: CPUState, batch_size):
+        # logger.debug("encode_program shape %s", inputs['program'].shape)
+        program = inputs.program
+        max_program_size = inputs.program.shape[1] # TODO: this might not be a constant
+        program_length = tf.cast(inputs.program_length, tf.int32)
+        program_onehot = self.make_program_onehot(
+            program, batch_size, max_program_size
+        )
+        program_encoding = self.apply_program_mlp_embedder(program_onehot)
+        program_encoding = self.apply_program_attention_embedder(program_encoding)
+        # select the embedding corresponding to the current instruction in the corr. CPU state
+        return self.pad_program_encoding( # size B x num_inputs x embedding_dim
+            program_encoding, batch_size, program_length, max_program_size
+        )
+
+    def aggregate_locations_program(
+        self,
+        locations_encoding,
+        unused_permutation_embedding,
+        program_encoding,
+        batch_size,
+    ):
+        # note that Haiku passes the parameters to the entire class
+        # when apply() is called on it. So don't look for parameters here.
+        locations_embedder = snn.Sequential(
+            [
+                # input is embedding_dim size, because we already encoded in either one-hot or binary
+                snn.Linear(self._embedding_dim),
+                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+                tf.nn.relu,
+                snn.Linear(self._embedding_dim),
+            ],
+            name='per_locations_embedder',
+        )
+
+        # locations_encoding.shape == [B, P, D] so map embedder across locations to
+        # share weights
+        # logger.debug("aggregate_locations_program: locations_encoding shape %s", locations_encoding.shape)
+        
+        locations_embedding = tf.vectorized_map(locations_embedder, locations_encoding)
+        # logger.debug("aggregate_locations_program: locations_embedding shape %s", locations_embedding.shape)
+
+        # broadcast the program encoding for each example.
+        # this way, it matches the size of the observations.
+        # logger.debug("aggregate_locations_program: program_encoding shape %s", program_encoding.shape)
+        program_encoded_repeat = self.repeat_program_encoding(
+            program_encoding, batch_size
+        )
+        # logger.debug("aggregate_locations_program: program_encoded_repeat shape %s", program_encoded_repeat.shape)
+
+        grouped_representation = tf.concat( # concat the CPU state and the program.
+            [locations_embedding, program_encoded_repeat], axis=-1
+        )
+        # logger.debug("aggregate_locations_program: grouped_representation shape %s", grouped_representation.shape)
+
+        return self.apply_joint_embedder(grouped_representation, batch_size)
+
+    def repeat_program_encoding(self, program_encoding, batch_size):
+        # logger.debug("aggregate_locations_program: repeat_program_encoding pre shape %s", program_encoding.shape)
+        program_encoding = tf.broadcast_to(
+            program_encoding,
+            [batch_size, self._task_spec.num_inputs, program_encoding.shape[-1]],
+        )
+        # logger.debug("aggregate_locations_program: repeat_program_encoding post shape %s", program_encoding.shape)
+        return program_encoding
+
+    def apply_joint_embedder(self, grouped_representation, batch_size):
+        all_locations_net = snn.Sequential(
+            [
+                snn.Linear(self._embedding_dim),
+                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+                tf.nn.relu,
+                snn.Linear(self._embedding_dim),
+            ],
+            name='per_element_embedder',
+        )
+        joint_locations_net = snn.Sequential(
+            [
+                snn.Linear(self._embedding_dim),
+                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+                tf.nn.relu,
+                snn.Linear(self._embedding_dim),
+            ],
+            name='joint_embedder',
+        )
+        joint_resnet = [
+            ResBlockV2(self._embedding_dim, name=f'joint_resblock_{i}')
+            for i in range(self._hparams.representation.repr_net_res_blocks)
+        ]
+
+        assert grouped_representation[:2], (batch_size, self._task_spec.num_inputs), \
+            f"grouped_representation shape {grouped_representation.shape} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
+        # logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
+        # apply MLP to the combined program and locations embedding
+        permutations_encoded = all_locations_net(grouped_representation)
+        # logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
+        # Combine all permutations into a single vector using a ResNetV2
+        joint_encoding = joint_locations_net(tf.reduce_mean(permutations_encoded, axis=1))
+        # logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
+        for net in joint_resnet:
+            joint_encoding = net(joint_encoding)
+        return joint_encoding
+
+    def make_program_onehot(self, program, batch_size, max_program_size):
+        # logger.debug("make_program_onehot shape %s", program.shape)
+        func = program[:, :, 0] # the opcode -- int
+        arg1 = program[:, :, 1] # the first operand -- int 
+        arg2 = program[:, :, 2] # the second operand -- int
+        func_onehot = tf.one_hot(func, self._task_spec.num_funcs)
+        arg1_onehot = tf.one_hot(arg1, self._task_spec.num_locations)
+        arg2_onehot = tf.one_hot(arg2, self._task_spec.num_locations)
+        # logger.debug("func %s, arg1 %s, arg2 %s", func_onehot.shape, arg1_onehot.shape, arg2_onehot.shape)
+        program_onehot = tf.concat(
+            [func_onehot, arg1_onehot, arg2_onehot], axis=-1
+        )
+        assert program_onehot.shape[:2] == (batch_size, max_program_size, None), \
+            f"program_onehot shape {program_onehot.shape} does not match expected shape {(batch_size, max_program_size, None)}"
+        # logger.debug("program_onehot shape %s", program_onehot.shape)
+        return program_onehot
+
+    def pad_program_encoding(
+        self, program_encoding, batch_size, program_length, max_program_size
+    ):
+        """Pads the program encoding to account for state-action stagger."""
+        # logger.debug("pad_program_encoding shape %s", program_encoding.shape)
+        assert program_encoding.shape[:2] == (batch_size, max_program_size),\
+            f"program_encoding shape {program_encoding.shape} does not match expected shape {(batch_size, max_program_size)}"
+        assert program_length.shape[:2] == (batch_size, self._task_spec.num_inputs),\
+            f"program_length shape {program_length.shape} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
+
+        empty_program_output = tf.zeros(
+            [batch_size, program_encoding.shape[-1]],
+        )
+        program_encoding = tf.concat(
+            [empty_program_output[:, None, :], program_encoding], axis=1
+        )
+
+        program_length_onehot = tf.one_hot(program_length, max_program_size + 1)
+        # logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
+        # logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
+        # two cases here:
+        # - program length is a batch of scalars corr. to the program length
+        # - program length is a batch of vectors (of len num_inputs) corr. to the state of the program counters
+        if len(program_length_onehot.shape) == 3:
+            program_encoding = tf.einsum(
+                'bnd,bNn->bNd', program_encoding, program_length_onehot
+            )
+        else:
+            program_encoding = tf.einsum(
+                'bnd,bn->bd', program_encoding, program_length_onehot
+            )
+        # logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
+
+        return program_encoding
+
+    def apply_program_mlp_embedder(self, program_encoding):
+        # input: B x P x (num_funcs + 2 * num_locations)
+        # output: B x P x embedding_dim
+        # P is the program length
+        # logger.debug("apply_program_mlp_embedder program shape %s, embedding_dim %s", program_encoding.shape, self._embedding_dim)
+        program_embedder = snn.Sequential(
+            [
+                snn.Linear(self._embedding_dim), # (nF + 2*nL) x D -- input size is decided automatically
+                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+                tf.nn.relu,
+                snn.Linear(self._embedding_dim), # D x D
+            ],
+            name='per_instruction_program_embedder',
+        )
+        # logger.debug("program.shape %s -->", program_encoding.shape)
+        # logger.debug("  program_embedder %s", program_embedder)
+        program_encoding = program_embedder(program_encoding)
+        # logger.debug("program_encoding shape %s <--", program_encoding.shape)
+        return program_encoding
+
+    def apply_program_attention_embedder(self, program_encoding):
+        # logger.debug("apply_program_attention_embedder program shape %s", program_encoding.shape)
+        # input is B x P x D (batch, program length, embedding dim)
+        # output is B x P x D
+        _, program_length, d = program_encoding.shape
+        assert program_length == self._task_spec.max_program_size, (
+            f"program length {program_length} does not match max program size "
+            f"{self._task_spec.max_program_size}"
+        )
+        assert d == self._embedding_dim, (
+            f"program encoding dim {d} does not match embedding dim {self._embedding_dim}"
+        ) 
+        attention_params = self._hparams.representation.attention
+        make_attention_block = functools.partial(
+            MultiQueryAttentionBlock, attention_params
+        )
+        attention_encoders = [
+            make_attention_block(name=f'attention_program_sequencer_{i}')
+            for i in range(self._hparams.representation.attention_num_layers)
+        ]
+
+        *_, seq_size, feat_size = program_encoding.shape
+
+        position_encodings = tf.broadcast_to(
+            MultiQueryAttentionBlock.sinusoid_position_encoding(
+                seq_size, feat_size
+            ),
+            program_encoding.shape,
+        )
+        program_encoding = tf.add(program_encoding, position_encodings)
+
+        for e in attention_encoders:
+            # logger.debug("apply_program_attention_embedder layer %s", e.name)
+            program_encoding = e(program_encoding, encoded_state=None)
+        # logger.debug("apply_program_attention_embedder post MQAB %s", program_encoding.shape)
+
+        return program_encoding
+
+    def _make_locations_encoding_onehot(self, inputs: CPUState, batch_size):
+        """Creates location encoding using onehot representation."""
+        # logger.debug("make_locations_encoding_onehot shapes %s", str({k:v.shape for k,v in inputs.items()}))
+        memory = inputs.memory # B x E x M (batch, num_inputs, memory size)
+        registers = inputs.registers # B x E x R (batch, num_inputs, register size)
+        # NOTE: originall implementation suggests the shape [B, H, P, D]
+        # where we can only assume that 
+        #   B - batch,
+        #   H - num_inputs,
+        #   P - program length,
+        #   D - num_locations
+        # this goes against what the paper suggests (although very vaguely)
+        # that only the current state is passed to the network as input,
+        # instead of the whole sequence of states,
+        # that the CPU has seen while executing the program.
+        locations = tf.concat([registers, memory], axis=-1) # B x E x (R + M)
+        # logger.debug("locations shape %s", locations.shape)
+        # to support inputs with sequences of states, we conditinally transpose
+        # the locations tensor to have the shape [B, P, H, D]
+        if len(locations.shape) == 4:
+            # in this case, locations is [B, H, P, D]
+            # and we need to transpose it to [B, P, H, D]
+            locations = tf.transpose(locations, [0, 2, 1, 3])  # [B, P, H, D]
+
+        # One-hot encode the values in the memory and average everything across
+        # permutations.
+        locations_onehot = tf.one_hot( # shape is now B x E x num_locations x num_locations
+            locations, self._task_spec.num_locations, dtype=tf.float32
+        )
+        # logger.debug("locations_onehot shape %s", locations_onehot.shape)
+        locations_onehot = locations_onehot.reshape(
+            [batch_size, self._task_spec.num_inputs, -1]
+        )
+        # logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
+        return locations_onehot
+
+    def _make_locations_encoding_binary(self, inputs, batch_size):
+        """Creates location encoding using binary representation."""
+
+        memory_binary = int2bin(inputs['memory']).astype(tf.float32)
+        registers_binary = int2bin(inputs['registers']).astype(tf.float32)
+        # Note the extra I dimension for the length of the binary integer (32)
+        locations = tf.concat(
+            [memory_binary, registers_binary], axis=-1
+        )  # [B, H, P, D*I]
+        locations = tf.transpose(locations, [0, 2, 1, 3])  # [B, P, H, D*I]
+
+        locations = locations.reshape([batch_size, self._task_spec.num_inputs, -1])
+
+        return locations
+
 
 class AlphaDevNetwork(snn.Module):
     # NOTE: this won't work :( need to convert from jax/haiku to tf/sonnet
