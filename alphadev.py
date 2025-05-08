@@ -1525,7 +1525,7 @@ class AlphaDevConfig(object):
     ):
         self.experiment_name = 'AlphaDev-test'
         ### Self-Play
-        self.num_actors = 3  # TPU actors
+        self.num_actors = 1 # TPU actors
         # pylint: disable-next=g-long-lambda
         self.max_moves = jnp.inf
         self.num_simulations = 5
@@ -1550,7 +1550,7 @@ class AlphaDevConfig(object):
 
         # Environment: spec of the Variable Sort 3 task
         self.task_spec = TaskSpec(
-            max_program_size=10,
+            max_program_size=100,
             num_inputs=17,
             num_funcs=len(x86_opcode2int),
             num_locations=19,
@@ -1587,11 +1587,11 @@ class AlphaDevConfig(object):
         self.hparams.use_jit = False # no jit for now
 
         ### Training
-        self.training_steps = 10 #int(1000e3)
-        self.checkpoint_interval = 500
-        self.target_network_interval = 100
-        self.window_size = int(1e6)
-        self.batch_size = 2
+        self.training_steps = 1000 #int(1000e3)
+        self.checkpoint_interval = 50 # used to be 500
+        self.target_network_interval = 10 # used to be 100
+        self.window_size = int(1e3) # 1e6 originally
+        self.batch_size = 8
         self.td_steps = 5
         self.lr_init = 2e-4
         self.momentum = 0.9
@@ -1949,12 +1949,14 @@ class SharedReplayBuffer(ReplayBuffer):
     """
     WRITE_HEAD = 'write_head'
     LIST_NAME = 'replay_buffer'
+    CORRECT_GAMES = 'correct_games'
     
     def __init__(self, config: AlphaDevConfig):
         super().__init__(config)
         # names
         self.WRITE_HEAD = f"{self.WRITE_HEAD}_{config.experiment_name}"
         self.LIST_NAME = f"{self.LIST_NAME}_{config.experiment_name}"
+        self.CORRECT_GAMES = f"{self.CORRECT_GAMES}_{config.experiment_name}"
         
         self.redis_config = config.redis
         self._client = None
@@ -1989,6 +1991,10 @@ class SharedReplayBuffer(ReplayBuffer):
             self._client.close()
             self._client = None
     
+    def save_correct_game(self, game):
+        game_bin = pickle.dumps(game) # serialize the game
+        self.client.rpush(self.CORRECT_GAMES, game_bin)
+    
     def save_game(self, game):
         game_bin = pickle.dumps(game) # serialize the game
         # logger.debug("SharedReplayBuffer.save_game: game size %d", len(game_bin))
@@ -2006,7 +2012,7 @@ class SharedReplayBuffer(ReplayBuffer):
             # logger.debug("SharedReplayBuffer.save_game: [locked 3] game saved to %s at index %s", self.LIST_NAME, write_head)
             # if the buffer is full, remove the oldest game
             length = self.client.llen(self.LIST_NAME)
-            # logger.debug("SharedReplayBuffer.save_game: [locked 4] buffer length %d", length)
+            logger.debug("SharedReplayBuffer.save_game: [locked 4] buffer length %d/%d", length, self.window_size)
             if  length > self.window_size:
                 self.client.lpop(self.LIST_NAME)
                 # logger.debug("SharedReplayBuffer.save_game: [locked 5] popped oldest game from %s", self.LIST_NAME)
@@ -2180,17 +2186,20 @@ def alphadev(config: AlphaDevConfig):
 # NOTE: runs in parallel with the training job.
 # TODO: we should make sure that training and self-play somewhat synchronized
 def run_selfplay(
-    config: AlphaDevConfig, storage: SharedStorage, replay_buffer: ReplayBuffer
+    config: AlphaDevConfig, storage: SharedStorage, replay_buffer: SharedReplayBuffer
 ):
     network = Network(config.hparams, config.task_spec)
     while True:
-        network_params = storage.latest_network()
+        network_state = storage.latest_network()
         start = time.time()
-        game = play_game(config, network, network_params)
+        game = play_game(config, network, network_state)
         elapsed = time.time() - start
         replay_buffer.save_game(game)
-        logger.debug("Self-play game finished. Game length: %d time %.3f ", len(game.history), elapsed)
-        break
+        # check if the resulting program is correct
+        if game.is_correct():
+            logging.info("%s: correct program with checkpoint %d", time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()), network_state.step)
+            replay_buffer.save_correct_game(game)
+        logger.info("Self-play game finished. Ckpt %s Game length: %d time %.3f ", network_state.steps, len(game.history), elapsed)
 
 
 def play_game(config: AlphaDevConfig, network: Network, state: NetworkState) -> Game:
@@ -2841,7 +2850,7 @@ def generate_sort_inputs(
 #         time.sleep(1)
 
 logging.basicConfig(level=logging.INFO)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 if __name__ == '__main__':
     config = AlphaDevConfig()
     alphadev(config)
