@@ -1,0 +1,17 @@
+chex
+dm-acme
+dm-env
+dm-haiku
+dm-reverb
+dm-sonnet
+dm-tree
+flax
+jax
+launchpad
+ml-collections
+ml-dtypes
+numpy
+pyyaml
+tensorboard
+tensorflow
+tensorflow_probability
