@@ -177,6 +177,9 @@ class ActionSpaceStorage:
         """
         raise NotImplementedError()
 
+    def npy_to_asm(self, npy_program: tf.Tensor) -> List[Callable[[int], Any]]:
+        raise NotImplementedError()
+
 class x86ActionSpaceStorage(ActionSpaceStorage):
     def __init__(self, max_reg: int, max_mem: int):
         self.max_reg = max_reg
@@ -190,6 +193,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self.np_actions = {
             i: np.array([x86_opcode2int[action[0]], action[1][0], action[1][1]])
             for i, action in self.actions.items()
+        }
+        self._npy_reversed = {
+            tuple(v): k for k, v in self.np_actions.items()
         }
         # there is a single action space for the given task
         self.action_space_cls = ActionSpace # these are still x86 instructions
@@ -373,6 +379,24 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
     def get_space(self) -> ActionSpace:
         return self.action_space_cls(self.actions, self.asm_actions, self.np_actions)
 
+    def npy_to_asm(self, npy_program):
+        """
+        Convert a numpy program to a list of assembly instructions.
+        
+        Args:
+            npy_program: numpy array of shape (max_program_size, 3) containing
+            the program instructions.
+        
+        Returns:
+            A list of assembly instructions.
+        """
+        # convert the numpy program to a list of assembly instructions
+        asm_program = []
+        for insn in npy_program:
+            asm_insn = self._npy_reversed.get(tuple(insn))
+            asm_program.append(asm_insn)
+        return asm_program
+
 # #################
 # Environment definition
 # #################
@@ -419,7 +443,8 @@ class DualValueTimeStep(TimeStep):
     correctness: Any # correctness of the program
 
 class AssemblyGame(Environment):
-    def __init__(self, task_spec: TaskSpec, inputs: IOExample, action_space_storage: ActionSpaceStorage):
+    def __init__(self, task_spec: TaskSpec, inputs: IOExample,
+                 action_space_storage: ActionSpaceStorage, observe_reward_components: bool = False):
         """
         Create an AssemblyGame environment.
         Args:
@@ -431,6 +456,10 @@ class AssemblyGame(Environment):
         self._output_mask = inputs.output_mask
         self._outputs = tf.boolean_mask(inputs.outputs, self._output_mask)
         self._max_num_hits = tf.reduce_sum(self._output_mask)
+        
+        # whether to return the correctness and latency components of the reward
+        # in the TimeSteps
+        self._observe_reward_components = observe_reward_components
         
         self._emulator = multi_machine(
             mem_size=task_spec.num_mem*4, # 4 bytes per memory location
@@ -513,38 +542,56 @@ class AssemblyGame(Environment):
         # we can now compute the reward
         reward, latency, correctness = self._compute_reward(include_latency=is_terminal)
         
-        ts = DualValueTimeStep(
-            step_type=StepType.MID if not is_terminal else StepType.LAST,
-            reward=reward,
-            discount=1.0, # NOTE: discount in this context is not used TODO: check this
-            observation=observation,
-            latency=latency,
-            correctness=correctness,
-        )
+        if self._observe_reward_components:
+            ts = DualValueTimeStep(
+                step_type=StepType.MID if not is_terminal else StepType.LAST,
+                reward=reward,
+                discount=1.0, # NOTE: discount in this context is not used TODO: check this
+                observation=observation,
+                latency=latency,
+                correctness=correctness,
+            )
+        else:
+            ts = TimeStep(
+                step_type=StepType.MID if not is_terminal else StepType.LAST,
+                reward=reward,
+                discount=1.0, # NOTE: discount in this context is not used TODO: check this
+                observation=observation,
+                # skip latency and correctness
+            )
         self._last_ts = ts
         return ts
     
-    def reset(self) -> TimeStep:
-        # deletes the program and resets the 
+    def reset(self, timestep: TimeStep) -> TimeStep:
+        # deletes the program and resets the
         # CPU state to the original inputs
-        self._emulator.reset_state()
-        self._reset_program()
-        
-        ts = DualValueTimeStep(
-            step_type=StepType.FIRST,
-            reward=0.0,
-            discount=1.0,
-            observation=self._make_observation(),
-            latency=0.0,
-            correctness=0.0,
-        )
-        self._last_ts = ts # contains observation, reward, discount
-        self._is_correct = False # these three need \
-        self._num_hits = 0       # some effort to computed \
-        self._is_invalid = False # so we cache them
-        
-        return ts
-    
+        if timestep is not None:
+            self._emulator.reset_state()
+            self._reset_program()
+        else:
+            # decode the program and execute it.
+            # basically the same overhead as copying everything
+            # but copying is also not fully possible
+            # and program numpy -> asm is unavoidable anyway
+            ts_program = timestep.observation['program']
+            # either B x num_inputs x 3 or no batch dimension
+            if len(ts_program.shape) > 2:
+                # we need to remove the batch dimension
+                assert ts_program.shape[0] == 1, "Batch dimension is not 1, resetting is ambigouous."
+                ts_program = tf.squeeze(ts_program, axis=0)
+
+            # convert the numpy program to a list of assembly instructions
+            asm_program = self._action_space_storage.npy_to_asm(ts_program)
+            self._program = Program(
+                npy_program=tf.Variable(ts_program, trainable=False, name="program"),
+                asm_program=asm_program,
+            )
+            self._emulator.reset_state()
+            # execute the program
+            self._emulator.exe(program=self._program.asm_program)
+            # update the state
+        return self._update_state()
+            
     def step(self, action:int) -> TimeStep:
         action_space = self._action_space_storage.get_space()
         # append the action to the program
@@ -562,9 +609,8 @@ class AssemblyGame(Environment):
         # execute the program
         self._emulator.exe(program=self._program.asm_program)
         # update observation and cached values
-        self._update_state()
-        # return the updated timestep
-        return self._last_ts
+        # and return the updated timestep
+        return self._update_state()
     
     def reward_spec(self):
         return Array(shape=(), dtype=tf.float32)
@@ -579,7 +625,7 @@ class AssemblyGame(Environment):
             program=Array(shape=(self._task_spec.max_program_size, 3), dtype=tf.int32),
             program_length=Array(shape=(), dtype=tf.int32),
             program_counter=Array(shape=(self._task_spec.num_inputs,), dtype=tf.int32)
-        )
+        )#._asdict()
     def action_spec(self):
         # TODO: this won't work for dynamic action spaces
         return DiscreteArray(num_values=len(self._action_space_storage.actions))
@@ -605,7 +651,7 @@ class AssemblyGame(Environment):
         # copy the two mutable parts of the state
         new_game._emulator = self._emulator.copy()
         new_game._program = self._program.copy()
-        # these are also immmutable
+        # these are also 'immmutable'
         new_game._last_ts = self._last_ts
         new_game._is_correct = self._is_correct
         new_game._num_hits = self._num_hits
@@ -1272,7 +1318,24 @@ class AlphaDevNetwork(snn.Module):
     prediction_net = PredictionNet
     representation_net = RepresentationNet
     
-    def __init__(self, hparams, task_spec, name: str = 'AlphaDevNetwork'):
+    @staticmethod
+    def _return_with_reward_logits(prediction: NetworkOutput) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        return (
+            prediction.policy_logits,
+            prediction.value,
+            prediction.correctness_value_logits,
+            prediction.latency_value_logits,
+        )
+    @staticmethod
+    def _return_without_reward_logits(prediction: NetworkOutput) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        return (
+            prediction.policy_logits,
+            prediction.value,
+        )
+    
+    def __init__(self, hparams, task_spec,
+                 return_reward_logits: bool = False,
+                 name: str = 'AlphaDevNetwork'):
         super().__init__(name=name)
         self._hparams = hparams
         self._task_spec = task_spec
@@ -1289,6 +1352,11 @@ class AlphaDevNetwork(snn.Module):
             embedding_dim=hparams.embedding_dim,
             name=f'{name}_representation_net',
         )
+        self._return_fn = (
+            self._return_with_reward_logits
+            if return_reward_logits else
+            self._return_without_reward_logits
+        )
     
     def __call__(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
         """Computes and returns the policy and value logits for the AZLearner."""
@@ -1298,9 +1366,7 @@ class AlphaDevNetwork(snn.Module):
         # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
         prediction: NetworkOutput = self._prediction_net(embedding)
         # logger.debug("AlphaDevNetwork: prediction shape %s", str({k:v.shape for k,v in prediction.items()}))
-        return (prediction.policy_logits, prediction.value,
-                prediction.correctness_value_logits,
-                prediction.latency_value_logits)
+        return self._return_fn(prediction)
 
 
 # #################
@@ -1330,14 +1396,44 @@ class AssemblyGameModel(models.Model):
 
     def update(
         self,
-        timestep: TimeStep,
+        timestep: TimeStep, # prior to executing the action
         action: tf.Tensor, # opcode, operands
-        next_timestep: TimeStep,
+        next_timestep: TimeStep, # after executing the action
     ) -> TimeStep:
-        """Updates the model given an observation, action, reward, and discount."""
+        """
+        Updates the model given an observation, action, reward, and discount.
+        
+        This is called in the EnvironmentLoop and is used to keep the 
+        model and the environment in sync.
+        Args:
+            timestep: the current timestep
+            action: the action taken
+            next_timestep: the next timestep after taking the action
+            
+        Returns:
+            next_timestep
+        Raises:
+            assertion error is the timestep is not aligned with what the model
+            expects.
+        """
         # environment will change here, so we might want to reset it.
         self._needs_reset = True
-
+        def assert_timestep():
+            # to save time, we only compare the program.
+            # it deterministically defines the rest.
+            tf.assert_equal(
+                timestep.observation['program'],
+                self._environment._last_ts.observation['program'],
+                message=(
+                    f"timestep {timestep.observation['program']} does not match "
+                    f"environment {self._environment._last_ts.observation['program']}"
+                ),
+            )
+        if assert_timestep():
+            self._environment.step(action)
+        else:
+            self._environment.reset(next_timestep)
+        
     def reset(self, initial_state: Optional[CPUState] = None):
         """Resets the model, optionally to an initial state."""
         if initial_state is not None:
