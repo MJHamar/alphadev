@@ -12,6 +12,8 @@ import numpy as np
 import ml_collections
 
 from acme.specs import EnvironmentSpec, Array, BoundedArray, DiscreteArray
+from acme.agents.tf.mcts import models
+from acme.agents.tf.mcts import types
 from dm_env import Environment, TimeStep, StepType
 # from acme.agents.tf.mcts
 # from acme.agents.tf.mcts.agent_distributed import DistributedMCTS
@@ -590,6 +592,25 @@ class AssemblyGame(Environment):
         return super().__enter__()
     def __exit__(self, exc_type, exc_value, traceback):
         super().__exit__(exc_type, exc_value, traceback)
+
+    def copy(self):
+        new_game = object.__new__(self.__class__)
+        # copy the immutable parts of the state
+        new_game._task_spec = self._task_spec
+        new_game._inputs = self._inputs
+        new_game._output_mask = self._output_mask
+        new_game._outputs = self._outputs
+        new_game._max_num_hits = self._max_num_hits
+        new_game._action_space_storage = self._action_space_storage
+        # copy the two mutable parts of the state
+        new_game._emulator = self._emulator.copy()
+        new_game._program = self._program.copy()
+        # these are also immmutable
+        new_game._last_ts = self._last_ts
+        new_game._is_correct = self._is_correct
+        new_game._num_hits = self._num_hits
+        new_game._is_invalid = self._is_invalid
+        return new_game
 
 # #################
 # network definition
@@ -1286,6 +1307,48 @@ class AlphaDevNetwork(snn.Module):
 # model definition 
 # #################
 # wrapper for AlphaGame
+class AssemblyGameModel(models.Model):
+    def __init__(
+        self,
+        task_spec: TaskSpec,
+        environment: AssemblyGame,
+        name: str = 'AssemblyGameModel',
+    ):
+        super().__init__(name=name)
+        self._environment = environment
+        self._task_spec = task_spec
+        self._needs_reset = False
+    
+    def load_checkpoint(self):
+        """Loads a saved model state, if it exists."""
+        self.needs_reset = False
+        return self._ckpt
+
+    def save_checkpoint(self):
+        """Saves the model state so that we can reset it after a rollout."""
+        self._ckpt = self._environment.copy() # TODO: implement
+
+    def update(
+        self,
+        timestep: TimeStep,
+        action: tf.Tensor, # opcode, operands
+        next_timestep: TimeStep,
+    ) -> TimeStep:
+        """Updates the model given an observation, action, reward, and discount."""
+        # environment will change here, so we might want to reset it.
+        self._needs_reset = True
+
+    def reset(self, initial_state: Optional[CPUState] = None):
+        """Resets the model, optionally to an initial state."""
+        if initial_state is not None:
+            self._environment.reset(initial_state) #TODO
+        else:
+            self._environment.reset()
+
+    @property
+    def needs_reset(self) -> bool:
+        """Returns whether or not the model needs to be reset."""
+        return self._needs_reset
 
 # predictor net from JEPA
 
