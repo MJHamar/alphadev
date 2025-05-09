@@ -7,6 +7,7 @@ import functools
 import sonnet as snn
 import tensorflow as tf
 import tensorflow_probability as tfp
+
 import numpy as np
 import ml_collections
 
@@ -18,6 +19,7 @@ from dm_env import Environment, TimeStep, StepType
 from .alphadev import PredictionNet, RepresentationNet
 from .tinyfive.multi_machine import multi_machine
 from .mcts_distributed import DistributedMCTS # copied from github (not in the dm-acme package)
+from .distribution import DistributionSupport
 
 # #################
 # Type definitions
@@ -406,6 +408,14 @@ class Program(NamedTuple):
     def __len__(self):
         return len(self.asm_program)
 
+class DualValueTimeStep(TimeStep):
+    step_type: Any
+    reward: Any
+    discount: Any
+    observation: Any
+    latency: Any # latency of the program
+    correctness: Any # correctness of the program
+
 class AssemblyGame(Environment):
     def __init__(self, task_spec: TaskSpec, inputs: IOExample, action_space_storage: ActionSpaceStorage):
         """
@@ -467,7 +477,7 @@ class AssemblyGame(Environment):
             ) * self._task_spec.latency_reward_weight
         reward = correctness_reward + latency_reward
         
-        return reward
+        return reward, latency_reward, correctness_reward
     
     def _make_observation(self) -> CPUState:
         # get the current state of the CPU
@@ -499,13 +509,15 @@ class AssemblyGame(Environment):
         is_terminal = self._is_correct or self._is_invalid
         
         # we can now compute the reward
-        reward = self._compute_reward(include_latency=is_terminal)
+        reward, latency, correctness = self._compute_reward(include_latency=is_terminal)
         
-        ts = TimeStep(
+        ts = DualValueTimeStep(
             step_type=StepType.MID if not is_terminal else StepType.LAST,
             reward=reward,
             discount=1.0, # NOTE: discount in this context is not used TODO: check this
-            observation=observation
+            observation=observation,
+            latency=latency,
+            correctness=correctness,
         )
         self._last_ts = ts
         return ts
@@ -516,11 +528,13 @@ class AssemblyGame(Environment):
         self._emulator.reset_state()
         self._reset_program()
         
-        ts = TimeStep(
+        ts = DualValueTimeStep(
             step_type=StepType.FIRST,
             reward=0.0,
             discount=1.0,
-            observation=self._make_observation()
+            observation=self._make_observation(),
+            latency=0.0,
+            correctness=0.0,
         )
         self._last_ts = ts # contains observation, reward, discount
         self._is_correct = False # these three need \
@@ -947,7 +961,7 @@ class RepresentationNet(snn.Module):
             for i in range(self._hparams.representation.repr_net_res_blocks)
         ]
 
-        assert grouped_representation[:2], (batch_size, self._task_spec.num_inputs), \
+        assert grouped_representation[:2] == (batch_size, self._task_spec.num_inputs), \
             f"grouped_representation shape {grouped_representation.shape} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
         # logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
         # apply MLP to the combined program and locations embedding
@@ -1135,71 +1149,6 @@ def make_head_network(
     )
 
 
-class DistributionSupport(object):
-
-    def __init__(self, value_max: float, num_bins: int):
-        self.value_max = value_max
-        self.num_bins = num_bins
-        self.value_support = tf.cast(
-            tf.linspace(0, value_max, num_bins), tf.float32)
-
-    def mean(self, logits: tf.Tensor) -> float:
-        # logits has shape B x num_bins
-        # logger.debug("DistSup.mean compute twohot logits for %s", logits.shape)
-        assert logits.shape[1] == self.num_bins, \
-            f"Logits shape {logits.shape} does not match num_bins {self.num_bins}"
-        # compute the mean of the logits
-        mean = tf.tensordot(logits, self.value_support, axes=1) # (B, num_bins) * (num_bins,) = (B,)
-        assert mean.shape == (logits.shape[0],), \
-            f"Mean shape {mean.shape} does not match logits shape {logits.shape}"
-        return mean
-
-    def scalar_to_two_hot(self, scalar: tf.Tensor) -> tf.Tensor:
-        """
-        Converts a scalar to a two-hot encoding.
-        Finds the two closest bins to the scalar (lower and upper) and
-        sets these indices to 1. All other indices are set to 0.
-        """
-        # Bins are -probably- a linear interpolation between 0 and value_max
-        # and we need to assign non-zero values to the two closest bins
-        # based on proximity to the scalar.
-        # input is B x 1
-        # output needs to be B x num_bins
-        
-        # first, calculate the steep size
-        step = self.value_max / self.num_bins # scalar step size
-        # find the two closest bins
-        scalar = tf.constant(scalar)
-        low_bin = tf.cast(tf.floor(scalar / step), tf.int32) # B x 1
-        high_bin = low_bin + 1 # B x 1
-        # find prroximity to the bins
-        low_bin_proximity = tf.abs(scalar - low_bin * step)
-        high_bin_proximity = tf.abs(scalar - high_bin * step)
-        # weights are the inverse of the proximity
-        low_bin_weight = high_bin * step - low_bin_proximity
-        high_bin_weight = low_bin * step - high_bin_proximity
-        # create the two-hot encoding
-        # which is a B x num_bins tensor of 0s except for locations
-        # low_bin and high_bin, which are both vectors of (num_bins,) dimensions
-        # and index the second dimension of the output. 
-        # the value of the output at these indices is defined by the low/high_bin_weight
-        # vectors, which are also (num_bins,) in size.
-        
-        two_hot = tf.zeros((scalar.shape[0], self.num_bins), dtype=tf.float32)
-        two_hot = tf.tensor_scatter_nd_update(
-            two_hot,
-            tf.stack([tf.range(scalar.shape[0]), low_bin], axis=1),
-            tf.cast(low_bin_weight, tf.float32),
-        )
-        two_hot = tf.tensor_scatter_nd_update(
-            two_hot,
-            tf.stack([tf.range(scalar.shape[0]), high_bin], axis=1),
-            tf.cast(high_bin_weight, tf.float32),
-        )
-        
-        # set the two closest bins to 1
-        return two_hot
-
 class CategoricalHead(snn.Module):
     """A head that represents continuous values by a categorical distribution."""
 
@@ -1302,6 +1251,36 @@ class AlphaDevNetwork(snn.Module):
     prediction_net = PredictionNet
     representation_net = RepresentationNet
     
+    def __init__(self, hparams, task_spec, name: str = 'AlphaDevNetwork'):
+        super().__init__(name=name)
+        self._hparams = hparams
+        self._task_spec = task_spec
+        self._prediction_net = self.prediction_net(
+            task_spec=task_spec,
+            value_max=hparams.value_max,
+            value_num_bins=hparams.value_num_bins,
+            embedding_dim=hparams.embedding_dim,
+            name=f'{name}_prediction_net',
+        )
+        self._representation_net = self.representation_net(
+            hparams=hparams,
+            task_spec=task_spec,
+            embedding_dim=hparams.embedding_dim,
+            name=f'{name}_representation_net',
+        )
+    
+    def __call__(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Computes and returns the policy and value logits for the AZLearner."""
+        # logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
+        # inputs is the observation dict
+        embedding: tf.Tensor = self._representation_net(inputs)
+        # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
+        prediction: NetworkOutput = self._prediction_net(embedding)
+        # logger.debug("AlphaDevNetwork: prediction shape %s", str({k:v.shape for k,v in prediction.items()}))
+        return (prediction.policy_logits, prediction.value,
+                prediction.correctness_value_logits,
+                prediction.latency_value_logits)
+
 
 # #################
 # model definition 
