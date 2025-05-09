@@ -1,7 +1,7 @@
 """
 Main script for running AlphaDev with an ACME and reverb backend.
 """
-from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Generator, Sequence, Mapping
+from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Generator, Sequence, Mapping, Optional
 import functools
 
 import sonnet as snn
@@ -799,7 +799,6 @@ def bin2int(binary_array: tf.Tensor) -> tf.Tensor:
     # calculate the exponents for each bit
     exponents = tf.pow(2, tf.range(32))
     result = tf.tensordot(tf.cast(u_binary_array, tf.int32), exponents, axes=1)
-    print(result)
     return tf.cast(result, dtype=tf.int32)
 
 class RepresentationNet(snn.Module):
@@ -1121,6 +1120,181 @@ class RepresentationNet(snn.Module):
         locations = locations.reshape([batch_size, self._task_spec.num_inputs, -1])
 
         return locations
+
+
+def make_head_network(
+    embedding_dim: int,
+    output_size: int,
+    num_hidden_layers: int = 2,
+    name: Optional[str] = None,
+) -> Callable[[tf.Tensor,], tf.Tensor]:
+    return snn.Sequential(
+        [ResBlockV2(embedding_dim) for _ in range(num_hidden_layers)]
+        + [snn.Linear(output_size)],
+        name=name,
+    )
+
+
+class DistributionSupport(object):
+
+    def __init__(self, value_max: float, num_bins: int):
+        self.value_max = value_max
+        self.num_bins = num_bins
+        self.value_support = tf.cast(
+            tf.linspace(0, value_max, num_bins), tf.float32)
+
+    def mean(self, logits: tf.Tensor) -> float:
+        # logits has shape B x num_bins
+        # logger.debug("DistSup.mean compute twohot logits for %s", logits.shape)
+        assert logits.shape[1] == self.num_bins, \
+            f"Logits shape {logits.shape} does not match num_bins {self.num_bins}"
+        # compute the mean of the logits
+        mean = tf.tensordot(logits, self.value_support, axes=1) # (B, num_bins) * (num_bins,) = (B,)
+        assert mean.shape == (logits.shape[0],), \
+            f"Mean shape {mean.shape} does not match logits shape {logits.shape}"
+        return mean
+
+    def scalar_to_two_hot(self, scalar: tf.Tensor) -> tf.Tensor:
+        """
+        Converts a scalar to a two-hot encoding.
+        Finds the two closest bins to the scalar (lower and upper) and
+        sets these indices to 1. All other indices are set to 0.
+        """
+        # Bins are -probably- a linear interpolation between 0 and value_max
+        # and we need to assign non-zero values to the two closest bins
+        # based on proximity to the scalar.
+        # input is B x 1
+        # output needs to be B x num_bins
+        
+        # first, calculate the steep size
+        step = self.value_max / self.num_bins # scalar step size
+        # find the two closest bins
+        scalar = tf.constant(scalar)
+        low_bin = tf.cast(tf.floor(scalar / step), tf.int32) # B x 1
+        high_bin = low_bin + 1 # B x 1
+        # find prroximity to the bins
+        low_bin_proximity = tf.abs(scalar - low_bin * step)
+        high_bin_proximity = tf.abs(scalar - high_bin * step)
+        # weights are the inverse of the proximity
+        low_bin_weight = high_bin * step - low_bin_proximity
+        high_bin_weight = low_bin * step - high_bin_proximity
+        # create the two-hot encoding
+        # which is a B x num_bins tensor of 0s except for locations
+        # low_bin and high_bin, which are both vectors of (num_bins,) dimensions
+        # and index the second dimension of the output. 
+        # the value of the output at these indices is defined by the low/high_bin_weight
+        # vectors, which are also (num_bins,) in size.
+        
+        two_hot = tf.zeros((scalar.shape[0], self.num_bins), dtype=tf.float32)
+        two_hot = tf.tensor_scatter_nd_update(
+            two_hot,
+            tf.stack([tf.range(scalar.shape[0]), low_bin], axis=1),
+            tf.cast(low_bin_weight, tf.float32),
+        )
+        two_hot = tf.tensor_scatter_nd_update(
+            two_hot,
+            tf.stack([tf.range(scalar.shape[0]), high_bin], axis=1),
+            tf.cast(high_bin_weight, tf.float32),
+        )
+        
+        # set the two closest bins to 1
+        return two_hot
+
+class CategoricalHead(snn.Module):
+    """A head that represents continuous values by a categorical distribution."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        support: DistributionSupport,
+        name: str = 'CategoricalHead',
+    ):
+        super().__init__(name=name)
+        self._value_support = support
+        self._embedding_dim = embedding_dim
+        self._head = make_head_network(
+            embedding_dim, output_size=self._value_support.num_bins
+        )
+
+    def __call__(self, x: tf.Tensor):
+        # For training returns the logits, for inference the mean.
+        logits = self._head(x) # project the embedding to the value support's numbeer of bins 
+        probs = tf.nn.softmax(logits) # take softmax -- probabilities over the bins
+        # logger.debug("CategoricalHead: logits shape %s, probs shape %s", logits.shape, probs.shape)
+        mean = self._value_support.mean(probs) # compute the mean, which is probs * [0, max_val/num_bins, 2max_val/num_bins, max_val]
+        return dict(logits=logits, mean=mean)
+
+
+class NetworkOutput(NamedTuple):
+    value: float
+    correctness_value_logits: tf.Tensor
+    latency_value_logits: tf.Tensor
+    policy_logits: tf.Tensor
+
+class PredictionNet(snn.Module):
+    """MuZero prediction network."""
+
+    def __init__(
+        self,
+        task_spec: TaskSpec,
+        value_max: float,
+        value_num_bins: int,
+        embedding_dim: int,
+        name: str = 'prediction',
+    ):
+        super().__init__(name=name)
+        self.task_spec = task_spec
+        self.value_max = value_max
+        self.value_num_bins = value_num_bins
+        self.support = DistributionSupport(self.value_max, self.value_num_bins)
+        self.embedding_dim = embedding_dim
+
+    def __call__(self, embedding: tf.Tensor):
+        # logger.debug("PredictionNet: embedding shape %s", embedding.shape)
+        policy_head = make_head_network(
+            self.embedding_dim, self.task_spec.num_actions
+        )
+        # logger.debug("PredictionNet: policy_head %s", policy_head)
+        value_head = CategoricalHead(self.embedding_dim, self.support)
+        # logger.debug("PredictionNet: value_head %s", value_head)
+        latency_value_head = CategoricalHead(self.embedding_dim, self.support)
+        # logger.debug("PredictionNet: latency_value_head %s", latency_value_head)
+        correctness_value = value_head(embedding)
+        # logger.debug("PredictionNet: correctness_value shape %s", str({k:v.shape for k, v in correctness_value.items()}))
+        latency_value = latency_value_head(embedding)
+        # logger.debug("PredictionNet: latency_value shape %s", str({k:v.shape for k, v in latency_value.items()}))
+
+        # embedding is B x embedding_dim
+        # with an uninitialised network, its distribution should be close to
+        # a standard normal distribution with mean 0 
+        
+        # for debugging, we can check the distribution of the embedding
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     embedding_mean = jnp.mean(embedding)
+        #     embedding_std = jnp.std(embedding)
+        #     embedding_min = jnp.min(embedding)
+        #     embedding_max = jnp.max(embedding)
+        #     logger.debug("PredictionNet.distr_check: embedding min %s, max %s mean %s std %s", embedding_min, embedding_max, embedding_mean, embedding_std)
+        
+        policy = policy_head(embedding) # B x num_actions
+        
+        # similarly, the policy should be close to a uniform distribution
+        # with a mean of 1/num_actions
+        # if logger.isEnabledFor(logging.DEBUG):
+        #     policy_mean = jnp.mean(policy)
+        #     policy_std = jnp.std(policy)
+        #     policy_min = jnp.min(policy)
+        #     policy_max = jnp.max(policy)
+        #     logger.debug("PredictionNet.distr_check: policy min %s, max %s mean %s std %s", policy_min, policy_max, policy_mean, policy_std)
+        
+        output = NetworkOutput(
+            value=correctness_value['mean'] + latency_value['mean'],
+            correctness_value_logits=correctness_value['logits'],
+            latency_value_logits=latency_value['logits'],
+            policy_logits=policy,
+        )
+        # logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items() if isinstance(v, jnp.ndarray)}))
+        return output
 
 
 class AlphaDevNetwork(snn.Module):
