@@ -626,6 +626,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # convert the numpy program to a list of assembly instructions
         asm_program = []
         for insn in npy_program:
+            if tf.reduce_all(insn == 0):
+                # reached the end of the program
+                break
             asm_insn = self._npy_reversed.get(tuple(insn))
             asm_program.append(asm_insn)
         return asm_program
@@ -666,10 +669,7 @@ class AssemblyGame(Environment):
 
     def _reset_program(self):
         self._program = Program(
-            npy_program=tf.Variable(
-                initial_value=tf.zeros((self._task_spec.max_program_size, 3), dtype=tf.int32),
-                trainable=False,
-                name="program"),
+            npy_program=np.zeros((self._task_spec.max_program_size, 3), dtype=np.int32),
             asm_program=[],
         )
     
@@ -705,17 +705,17 @@ class AssemblyGame(Environment):
         
         return reward, latency_reward, correctness_reward
     
-    def _make_observation(self) -> CPUState:
+    def _make_observation(self) -> Dict[str, tf.Tensor]:
         # get the current state of the CPU
         return CPUState(
             registers=tf.constant(self._emulator.registers),
             active_registers=tf.constant(self._emulator.register_mask),
             memory=tf.constant(self._emulator.memory),
             active_memory=tf.constant(self._emulator.memory_mask),
-            program=tf.constant(self.program.npy_program),
+            program=tf.constant(self._program.npy_program),
             program_length=tf.constant(len(self._program), dtype=tf.int32),
             program_counter=tf.constant(self._emulator.program_counter, dtype=tf.int32)
-        )
+        )._asdict()
     
     def _check_invalid(self) -> bool:
         # either too long or the emulator is in an invalid state
@@ -763,8 +763,8 @@ class AssemblyGame(Environment):
             # and program numpy -> asm is unavoidable anyway
             if isinstance(state, TimeStep):
                 ts_program = state.observation['program']
-            else:
-                ts_program = state.program
+            else: # then it is a CPUState._asdict()
+                ts_program = state['program']
             
             # either B x num_inputs x 3 or no batch dimension
             if len(ts_program.shape) > 2:
@@ -775,7 +775,7 @@ class AssemblyGame(Environment):
             # convert the numpy program to a list of assembly instructions
             asm_program = self._action_space_storage.npy_to_asm(ts_program)
             self._program = Program(
-                npy_program=tf.Variable(ts_program, trainable=False, name="program"),
+                npy_program=ts_program.numpy(),
                 asm_program=asm_program,
             )
             self._emulator.reset_state()
@@ -790,10 +790,9 @@ class AssemblyGame(Environment):
         action_np = action_space.get_np(action)
         action_asm = action_space.get_asm(action)
         
+        updated_program = self._program.npy_program[len(self._program),:] = action_np
         self._program = Program(
-            npy_program=tf.tensor_scatter_nd_update(
-                self._program.npy_program, [[len(self._program)]], [action_np]
-            ),
+            npy_program=updated_program,
             asm_program=self._program.asm_program + [action_asm] # preserves immutability
         )
         # reset the emulator
@@ -805,7 +804,7 @@ class AssemblyGame(Environment):
         return self._update_state()
     
     def reward_spec(self):
-        return Array(shape=(), dtype=tf.float32)
+        return Array(shape=(), dtype=tf.float32) if not self._observe_reward_components else Array(shape=(3,), dtype=tf.float32)
     def discount_spec(self):
         return Array(shape=(), dtype=tf.float32)
     def observation_spec(self):
@@ -817,7 +816,7 @@ class AssemblyGame(Environment):
             program=Array(shape=(self._task_spec.max_program_size, 3), dtype=tf.int32),
             program_length=Array(shape=(), dtype=tf.int32),
             program_counter=Array(shape=(self._task_spec.num_inputs,), dtype=tf.int32)
-        )#._asdict()
+        )._asdict()
     def action_spec(self):
         # TODO: this won't work for dynamic action spaces
         return DiscreteArray(num_values=len(self._action_space_storage.actions))
@@ -1132,9 +1131,9 @@ class RepresentationNet(snn.Module):
 
     def _encode_program(self, inputs: CPUState, batch_size):
         # logger.debug("encode_program shape %s", inputs['program'].shape)
-        program = inputs.program
-        max_program_size = inputs.program.shape[1] # TODO: this might not be a constant
-        program_length = tf.cast(inputs.program_length, tf.int32)
+        program = inputs['program']
+        max_program_size = inputs['program'].shape[1] # TODO: this might not be a constant
+        program_length = tf.cast(inputs['program_length'], tf.int32)
         program_onehot = self.make_program_onehot(
             program, batch_size, max_program_size
         )
@@ -1345,9 +1344,9 @@ class RepresentationNet(snn.Module):
 
     def _make_locations_encoding_onehot(self, inputs: CPUState, batch_size):
         """Creates location encoding using onehot representation."""
-        # logger.debug("make_locations_encoding_onehot shapes %s", str({k:v.shape for k,v in inputs.items()}))
-        memory = inputs.memory # B x E x M (batch, num_inputs, memory size)
-        registers = inputs.registers # B x E x R (batch, num_inputs, register size)
+        # logger.debug("make_locations_encoding_onehot shapes %s", str({k:v.shape for k,v in inputs['items']()}))
+        memory = inputs['memory'] # B x E x M (batch, num_inputs, memory size)
+        registers = inputs['registers'] # B x E x R (batch, num_inputs, register size)
         # NOTE: originall implementation suggests the shape [B, H, P, D]
         # where we can only assume that 
         #   B - batch,
