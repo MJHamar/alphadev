@@ -3,6 +3,7 @@ Main script for running AlphaDev with an ACME and reverb backend.
 """
 from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Generator, Sequence, Mapping, Optional, Union
 import functools
+import itertools
 
 import sonnet as snn
 import tensorflow as tf
@@ -27,12 +28,243 @@ from .distribution import DistributionSupport
 # Type definitions
 # #################
 
+class TaskSpec(NamedTuple):
+    max_program_size: int
+    num_inputs: int # number of input examples
+    num_funcs: int # number of x86 instructions to consider
+    num_regs: int # number of registers to consider
+    num_mem: int # number of memory locations to consider. num_mem+num_regs = num_locations
+    num_locations: int # memory + register locations to consider
+    num_actions: int # number of actions in the action space
+    correct_reward: float # reward for correct program
+    correctness_reward_weight: float # weight for correctness reward
+    latency_reward_weight: float # weight for latency reward
+    latency_quantile: float # quantile for latency reward
 
+class CPUState(NamedTuple):
+    registers: tf.Tensor # num_inputs x num_regs array of register values
+    active_registers: tf.Tensor # num_inputs x num_regs boolean array of active registers
+    memory: tf.Tensor # num_inputs x num_mem array of memory locations
+    active_memory: tf.Tensor # num_inputs x num_mem boolean array of active memory locations
+    program: tf.Tensor # max_program_size x 1 array of progrram instructions.
+    program_length: tf.Tensor  # scalar length of the program 
+    program_counter: tf.Tensor # num_inputs x 1 array of program counters (in int32)
+
+class IOExample(NamedTuple):
+    inputs: tf.Tensor # num_inputs x <sequence_length>
+    outputs: tf.Tensor # num_inputs x <num_mem>
+    output_mask: tf.Tensor # num_inputs x <num_mem> boolean array masking irrelevant parts of the output
+
+class Program(NamedTuple):
+    npy_program: tf.Tensor # <max_program_size> x 3 (opcode, op1, op2)
+    asm_program: List[Callable[[int], Any]] # list of pseudo-asm instructions
+    
+    def __len__(self):
+        return len(self.asm_program)
+
+class DualValueTimeStep(TimeStep):
+    step_type: Any
+    reward: Any
+    discount: Any
+    observation: Any
+    latency: Any # latency of the program
+    correctness: Any # correctness of the program
+
+
+# #################
+# Input geneerators
+# #################
+
+def generate_sort_inputs(
+    items_to_sort: int, max_len:int, num_samples: int=None, rnd_key:int=42) -> IOExample:
+    """
+    This is equivalent to the C++ code sort_functioons_test.cc:
+    TestCases GenerateSortTestCases(int items_to_sort) {
+        TestCases test_cases;
+        auto add_all_permutations = [&test_cases](const std::vector<int>& initial) {
+            std::vector<int> perm(initial);
+            do {
+            std::vector<int> expected = perm;
+            std::sort(expected.begin(), expected.end());
+            test_cases.push_back({perm, expected});
+            } while (std::next_permutation(perm.begin(), perm.end()));
+        };
+        // Loop over all possible configurations of binary relations on sorted items.
+        // Between each two consecutive items we can insert either '==' or '<'. Then,
+        // for each configuration we generate all possible permutations.
+        for (int i = 0; i < 1 << (items_to_sort - 1); ++i) {
+            std::vector<int> relation = {1};
+            for (int mask = i, j = 0; j < items_to_sort - 1; mask /= 2, ++j) {
+            relation.push_back(mask % 2 == 0 ? relation.back() : relation.back() + 1);
+            }
+            add_all_permutations(relation);
+        }
+        return test_cases;
+        }
+    """
+    # generate all weak orderings
+    io_list = []
+    def generate_testcases(items_to_sort: int) -> List[Tuple[List[int], List[int]]]:
+        #   logger.debug("Generating test cases for %d items to sort", items_to_sort)
+        def add_all_permutations(initial: List[int]) -> List[Tuple[List[int], List[int]]]:
+            for perm in itertools.permutations(initial, len(initial)):
+                expected = np.array(sorted(perm))
+                io_list.append((np.array(perm), expected))
+        for i in range(0, items_to_sort+1):
+            relation = [1]
+            mask = i; j=0
+            while j < items_to_sort - 1: # no idea how to express this more pythonic
+                j += 1
+                relation.append(relation[-1] if mask % 2 == 0 else relation[-1] + 1)
+                mask //= 2
+            add_all_permutations(relation)
+
+    def remap_input(inp: np.ndarray, out: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        mapping = {}
+        prev = 0
+        for o in out.tolist():
+            if o not in mapping:
+                mapping[o] = np.random.randint(prev+1, prev+3) # don't blow it up. 
+                prev = mapping[o]
+        out = np.array([mapping[o] for o in out.tolist()])
+        inp = np.array([mapping[i] for i in inp.tolist()])
+        return inp, out
+
+    generate_testcases(items_to_sort)
+    i_list = np.stack([i for i, _ in io_list])
+    # padded outputs
+    o_list = np.stack([
+        np.pad(o, (0, max_len-len(o)), 'constant', constant_values=0)
+        for _, o in io_list])
+    o_mask = np.stack([
+        [1 for _ in range(len(o))] +\
+        [0 for _ in range(max_len-len(o))]
+        for _, o in io_list])
+    assert o_list.shape[1] == o_mask.shape[1] == max_len, \
+        f"Expected output shape {max_len}, got {o_list.shape[1]}"
+    # remove duplicates
+    _, uidx = np.unique(i_list, axis=0, return_index=True) # remove duplicates
+    i_list = i_list[uidx, :] # shape F(items_to_sort) x items_to_sort
+    o_list = o_list[uidx, :] # shape F(items_to_sort) x max_len
+    o_mask = o_mask[uidx, :] # shape F(items_to_sort) x max_len
+    
+    
+    #   logger.debug("Generated %d test cases", len(io_list))
+    # shuffle the permutations. if num_samples > len(permutations), we set
+    # inputs = permutations + num_samples - len(permutations) random samples from permutations
+    # otherwise, we set inputs = random.sample(permutations, num_samples)
+    new_indices = np.random.permutation(len(i_list))
+    if num_samples is None:
+        pass # select all elements
+    elif num_samples > i_list.shape[0]:
+        new_indices = np.concatenate([new_indices, new_indices[:num_samples - i_list.shape[0]]])
+    else:
+        new_indices = new_indices[:num_samples]
+    
+    i_list = i_list[new_indices]
+    o_list = o_list[new_indices]
+    o_mask = o_mask[new_indices]
+    # add some noise to the inputs
+    for i in range(i_list.shape[0]):
+        i_list[i], o_list[i] = remap_input(i_list[i], o_list[i])
+    
+    # logger.debug("generate_sort_inputs: i_list shape %s", i_list.shape)
+    # logger.debug("generate_sort_inputs: o_list shape %s", o_list.shape)
+    # logger.debug("generate_sort_inputs: o_mask shape %s", o_mask.shape)
+    
+    return IOExample(
+        inputs=i_list,
+        outputs=o_list,
+        output_mask=o_mask,
+    )
 
 # #################
 # Config
 # #################
 
+
+class AlphaDevConfig(object):
+    """AlphaDev configuration."""
+
+    @staticmethod
+    def visit_softmax_temperature_fn(steps): 
+        return 1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
+    
+    def __init__(
+        self,
+    ):
+        self.experiment_name = 'AlphaDev-test'
+        ### Self-Play
+        self.num_actors = 1 # TPU actors
+        # pylint: disable-next=g-long-lambda
+        self.max_moves = np.inf
+        self.num_simulations = 5
+        self.discount = 1.0
+
+        # Root prior exploration noise.
+        self.root_dirichlet_alpha = 0.03
+        self.root_exploration_fraction = 0.25
+
+        # UCB formula
+        self.pb_c_base = 19652
+        self.pb_c_init = 1.25
+
+        # Environment: spec of the Variable Sort 3 task
+        self.task_spec = TaskSpec(
+            max_program_size=100,
+            num_inputs=17,
+            num_funcs=len(x86_opcode2int),
+            num_locations=19,
+            num_regs=5,
+            num_mem=14,
+            num_actions=240, # original value was 271
+            correct_reward=1.0,
+            correctness_reward_weight=2.0,
+            latency_reward_weight=0.5,
+            latency_quantile=0,
+        )
+        # TODO: this assert is stupid.
+        assert self.task_spec.num_locations == self.task_spec.num_regs + self.task_spec.num_mem, \
+            f"number of registers {self.task_spec.num_regs} and memory {self.task_spec.num_mem} do not add up to the number of locations {self.task_spec.num_locations}"
+
+        ### Network architecture
+        self.hparams = ml_collections.ConfigDict()
+        self.hparams.embedding_dim = 512
+        self.hparams.representation = ml_collections.ConfigDict()
+        self.hparams.representation.use_program = True
+        self.hparams.representation.use_locations = True
+        self.hparams.representation.use_locations_binary = False
+        self.hparams.representation.use_permutation_embedding = False
+        self.hparams.representation.repr_net_res_blocks = 8
+        self.hparams.representation.attention = ml_collections.ConfigDict()
+        self.hparams.representation.attention.head_depth = 128
+        self.hparams.representation.attention.num_heads = 4
+        self.hparams.representation.attention.attention_dropout = False
+        self.hparams.representation.attention.position_encoding = 'absolute'
+        self.hparams.representation.attention_num_layers = 6
+        self.hparams.value = ml_collections.ConfigDict()
+        self.hparams.value.max = 3.0  # These two parameters are task / reward-
+        self.hparams.value.num_bins = 301  # dependent and need to be adjusted.
+        self.hparams.use_jit = False # no jit for now
+
+        ### Training
+        self.training_steps = 1000 #int(1000e3)
+        self.checkpoint_interval = 50 # used to be 500
+        self.target_network_interval = 10 # used to be 100
+        self.window_size = int(1e3) # 1e6 originally
+        self.batch_size = 8
+        self.td_steps = 5
+        self.lr_init = 2e-4
+        self.momentum = 0.9
+        
+        self.inputs = generate_sort_inputs(
+            items_to_sort=3,
+            max_len=self.task_spec.num_mem, 
+            num_samples=self.task_spec.num_inputs
+        )
+        #   logger.debug("Inputs: %s", self.inputs)
+        assert self.task_spec.num_inputs == self.inputs.inputs.shape[0],\
+            f"Expected {self.task_spec.num_inputs} inputs, got {self.inputs.inputs.shape[0]}"
 
 # #################
 # Action Spaces 
@@ -400,47 +632,6 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
 # #################
 # Environment definition
 # #################
-class TaskSpec(NamedTuple):
-    max_program_size: int
-    num_inputs: int # number of input examples
-    num_funcs: int # number of x86 instructions to consider
-    num_regs: int # number of registers to consider
-    num_mem: int # number of memory locations to consider. num_mem+num_regs = num_locations
-    num_locations: int # memory + register locations to consider
-    num_actions: int # number of actions in the action space
-    correct_reward: float # reward for correct program
-    correctness_reward_weight: float # weight for correctness reward
-    latency_reward_weight: float # weight for latency reward
-    latency_quantile: float # quantile for latency reward
-
-class CPUState(NamedTuple):
-    registers: tf.Tensor # num_inputs x num_regs array of register values
-    active_registers: tf.Tensor # num_inputs x num_regs boolean array of active registers
-    memory: tf.Tensor # num_inputs x num_mem array of memory locations
-    active_memory: tf.Tensor # num_inputs x num_mem boolean array of active memory locations
-    program: tf.Tensor # max_program_size x 1 array of progrram instructions.
-    program_length: tf.Tensor  # scalar length of the program 
-    program_counter: tf.Tensor # num_inputs x 1 array of program counters (in int32)
-
-class IOExample(NamedTuple):
-    inputs: tf.Tensor # num_inputs x <sequence_length>
-    outputs: tf.Tensor # num_inputs x <num_mem>
-    output_mask: tf.Tensor # num_inputs x <num_mem> boolean array masking irrelevant parts of the output
-
-class Program(NamedTuple):
-    npy_program: tf.Tensor # <max_program_size> x 3 (opcode, op1, op2)
-    asm_program: List[Callable[[int], Any]] # list of pseudo-asm instructions
-    
-    def __len__(self):
-        return len(self.asm_program)
-
-class DualValueTimeStep(TimeStep):
-    step_type: Any
-    reward: Any
-    discount: Any
-    observation: Any
-    latency: Any # latency of the program
-    correctness: Any # correctness of the program
 
 class AssemblyGame(Environment):
     def __init__(self, task_spec: TaskSpec, inputs: IOExample,
@@ -1469,9 +1660,6 @@ def model_factory(env_spec: EnvironmentSpec): # env_spec
 # #################
 # Agent definition
 # #################
-
-# TODO: replace
-from .alphadev import AlphaDevConfig
 config = AlphaDevConfig()
 
 agent = DistributedMCTS(
