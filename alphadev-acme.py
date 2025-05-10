@@ -14,14 +14,13 @@ import ml_collections
 
 from acme.specs import EnvironmentSpec, make_environment_spec, Array, BoundedArray, DiscreteArray
 from acme.agents.tf.mcts import models
-from acme.agents.tf.mcts import types
 from dm_env import Environment, TimeStep, StepType
 # from acme.agents.tf.mcts
 # from acme.agents.tf.mcts.agent_distributed import DistributedMCTS
 
 from .alphadev import PredictionNet, RepresentationNet
 from .tinyfive.multi_machine import multi_machine
-from .mcts_distributed import DistributedMCTS # copied from github (not in the dm-acme package)
+from .agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
 from .distribution import DistributionSupport
 
 # #################
@@ -1669,14 +1668,21 @@ def model_factory(env_spec: EnvironmentSpec): # env_spec
         name='AssemblyGameModel',
     )
 
+def optimizer_factory():
+    return snn.optimizers.SGD(
+        learning_rate=config.learning_rate,
+        momentum=config.hparams.momentum,
+    )
+
 # #################
 # Agent definition
 # #################
 
-agent = DistributedMCTS(
+distributed_agent = DistributedMCTS(
     environment_factory=environment_factory, # AlphaGame environment
     network_factory=network_factory,         # AlphaDev network
     model_factory=model_factory,             # Either a learned model or a wrapper around the environment
+    optimizer_factory=optimizer_factory,     # SGD optimizer
     num_actors=config.num_actors, # number of parallel actors
     num_simulations=config.num_simulations, # number of rollouts per action
     batch_size=config.batch_size,  # batch size used by the learner.
@@ -1687,9 +1693,26 @@ agent = DistributedMCTS(
     max_replay_size=config.max_replay_size, # maximum size of the replay buffer
     importance_sampling_exponent=config.importance_sampling_exponent, # not used
     priority_exponent=config.priority_exponent, # not used
-    n_step=config.n_step, # how many steps to buffer before adding to the replay buffer
+    n_step=config.training_steps, # how many steps to buffer before adding to the replay buffer
     learning_rate=config.learning_rate, # learning rate for the learner
     discount=config.discount, # discount factor for the environment
     environment_spec=config.env_spec, # defines the environment
     save_logs=config.save_logs, # whether to save logs or not
 )
+
+agent = MCTS(
+    network=network_factory(None),
+    model=model_factory(None),
+    optimizer=optimizer_factory(),
+    n_step=config.training_steps,
+    discount=config.discount,
+    replay_capacity=config.td_steps,
+    num_simulations=config.num_simulations,
+    environment_spec=make_environment_spec(AssemblyGame(config.task_spec)),
+    batch_size=config.batch_size,
+    use_dual_value_network=config.hparams.categorical_value_loss
+)
+
+if __name__ == '__main__':
+    # start training
+    pass

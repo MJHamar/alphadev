@@ -20,6 +20,7 @@ import acme
 from acme import datasets
 from acme import specs
 from acme.adders import reverb as adders
+from acme.agents import agent
 from acme.agents.tf.mcts import acting
 from acme.agents.tf.mcts import learning
 from acme.agents.tf.mcts import models
@@ -32,6 +33,87 @@ import launchpad as lp
 import reverb
 import sonnet as snt
 
+from .dual_value_az import DualValueAZLearner
+
+class MCTS(agent.Agent):
+  """A single-process MCTS agent."""
+
+  def __init__(
+      self,
+      network: snt.Module,
+      model: models.Model,
+      optimizer: snt.Optimizer,
+      n_step: int,
+      discount: float,
+      replay_capacity: int,
+      num_simulations: int,
+      environment_spec: specs.EnvironmentSpec,
+      batch_size: int,
+      use_dual_value_network: bool = False,
+  ):
+
+    extra_spec = {
+        'pi':
+            specs.Array(
+                shape=(environment_spec.actions.num_values,), dtype=np.float32)
+    }
+    # Create a replay server for storing transitions.
+    replay_table = reverb.Table(
+        name=adders.DEFAULT_PRIORITY_TABLE,
+        sampler=reverb.selectors.Uniform(),
+        remover=reverb.selectors.Fifo(),
+        max_size=replay_capacity,
+        rate_limiter=reverb.rate_limiters.MinSize(1),
+        signature=adders.NStepTransitionAdder.signature(
+            environment_spec, extra_spec))
+    self._server = reverb.Server([replay_table], port=None)
+
+    # The adder is used to insert observations into replay.
+    address = f'localhost:{self._server.port}'
+    adder = adders.NStepTransitionAdder(
+        client=reverb.Client(address),
+        n_step=n_step,
+        discount=discount)
+
+    # The dataset provides an interface to sample from replay.
+    dataset = datasets.make_reverb_dataset(server_address=address)
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+
+    tf2_utils.create_variables(network, [environment_spec.observations])
+
+    # Now create the agent components: actor & learner.
+    actor = acting.MCTSActor(
+        environment_spec=environment_spec,
+        model=model,
+        network=network,
+        discount=discount,
+        adder=adder,
+        num_simulations=num_simulations,
+    )
+
+    if use_dual_value_network:
+        learner = DualValueAZLearner(
+            network=network,
+            optimizer=optimizer,
+            dataset=dataset,
+            discount=discount,
+        )
+    else:
+        learner = learning.AZLearner(
+            network=network,
+            optimizer=optimizer,
+            dataset=dataset,
+            discount=discount,
+        )
+
+    # The parent class combines these together into one 'agent'.
+    super().__init__(
+        actor=actor,
+        learner=learner,
+        min_observations=10,
+        observations_per_step=1,
+    )
+
 
 class DistributedMCTS:
     """Distributed MCTS agent."""
@@ -41,6 +123,7 @@ class DistributedMCTS:
         environment_factory: Callable[[], dm_env.Environment],
         network_factory: Callable[[specs.DiscreteArray], snt.Module],
         model_factory: Callable[[specs.EnvironmentSpec], models.Model],
+        optimizer_factory: Callable[[], snt.Optimizer],
         num_actors: int,
         num_simulations: int = 50,
         batch_size: int = 256,
@@ -121,7 +204,7 @@ class DistributedMCTS:
             prefetch_size=self._prefetch_size)
 
         # Create the optimizer.
-        optimizer = snt.optimizers.Adam(self._learning_rate)
+        optimizer = self._optimizer_factory()
 
         # Return the learning agent.
         return learning.AZLearner(
