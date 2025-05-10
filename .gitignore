@@ -23,3 +23,7 @@ share/python-wheels/
 *.egg
 MANIFEST
 *.npy
+.venv
+err
+out
+profiling/*
