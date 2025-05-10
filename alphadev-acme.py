@@ -69,7 +69,7 @@ class Program(NamedTuple):
 # #################
 
 def generate_sort_inputs(
-    items_to_sort: int, max_len:int, num_samples: int=None, rnd_key:int=42) -> IOExample:
+    items_to_sort: int, max_len:int, num_samples: int=None) -> IOExample:
     """
     This is equivalent to the C++ code sort_functioons_test.cc:
     TestCases GenerateSortTestCases(int items_to_sort) {
