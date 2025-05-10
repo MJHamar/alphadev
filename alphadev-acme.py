@@ -1,7 +1,7 @@
 """
 Main script for running AlphaDev with an ACME and reverb backend.
 """
-from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Generator, Sequence, Mapping, Optional
+from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Generator, Sequence, Mapping, Optional, Union
 import functools
 
 import sonnet as snn
@@ -562,10 +562,10 @@ class AssemblyGame(Environment):
         self._last_ts = ts
         return ts
     
-    def reset(self, timestep: TimeStep) -> TimeStep:
+    def reset(self, state: Union[TimeStep, CPUState, None]=None) -> TimeStep:
         # deletes the program and resets the
         # CPU state to the original inputs
-        if timestep is not None:
+        if state is None:
             self._emulator.reset_state()
             self._reset_program()
         else:
@@ -573,7 +573,11 @@ class AssemblyGame(Environment):
             # basically the same overhead as copying everything
             # but copying is also not fully possible
             # and program numpy -> asm is unavoidable anyway
-            ts_program = timestep.observation['program']
+            if isinstance(state, TimeStep):
+                ts_program = state.observation['program']
+            else:
+                ts_program = state.program
+            
             # either B x num_inputs x 3 or no batch dimension
             if len(ts_program.shape) > 2:
                 # we need to remove the batch dimension
@@ -591,7 +595,7 @@ class AssemblyGame(Environment):
             self._emulator.exe(program=self._program.asm_program)
             # update the state
         return self._update_state()
-            
+    
     def step(self, action:int) -> TimeStep:
         action_space = self._action_space_storage.get_space()
         # append the action to the program
@@ -1432,8 +1436,9 @@ class AssemblyGameModel(models.Model):
         if assert_timestep():
             self._environment.step(action)
         else:
+            # re-executes the program contained in the timestep
             self._environment.reset(next_timestep)
-        
+    
     def reset(self, initial_state: Optional[CPUState] = None):
         """Resets the model, optionally to an initial state."""
         if initial_state is not None:
