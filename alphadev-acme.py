@@ -64,15 +64,6 @@ class Program(NamedTuple):
     def __len__(self):
         return len(self.asm_program)
 
-class DualValueTimeStep(TimeStep):
-    step_type: Any
-    reward: Any
-    discount: Any
-    observation: Any
-    latency: Any # latency of the program
-    correctness: Any # correctness of the program
-
-
 # #################
 # Input geneerators
 # #################
@@ -746,23 +737,16 @@ class AssemblyGame(Environment):
         # we can now compute the reward
         reward, latency, correctness = self._compute_reward(include_latency=is_terminal)
         
-        if self._observe_reward_components:
-            ts = DualValueTimeStep(
-                step_type=StepType.MID if not is_terminal else StepType.LAST,
-                reward=reward,
-                discount=1.0, # NOTE: discount in this context is not used TODO: check this
-                observation=observation,
-                latency=latency,
-                correctness=correctness,
-            )
-        else:
-            ts = TimeStep(
-                step_type=StepType.MID if not is_terminal else StepType.LAST,
-                reward=reward,
-                discount=1.0, # NOTE: discount in this context is not used TODO: check this
-                observation=observation,
-                # skip latency and correctness
-            )
+        ts = TimeStep(
+            step_type=StepType.MID if not is_terminal else StepType.LAST,
+            # too many components in acme hard-code the structure of TimeStep, and not
+            # everything supports reward to be a dictionary, so we concatenate
+            # the reward components into a single tensor
+            reward=reward if not self._observe_reward_components else tf.constant([reward, correctness, latency], dtype=tf.float32),
+            discount=1.0, # NOTE: not sure what discount here means.
+            observation=observation,
+            # skip latency and correctness
+        )
         self._last_ts = ts
         return ts
     

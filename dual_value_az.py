@@ -41,7 +41,9 @@ class DualValueAZLearner(AZLearner):
 
         inputs = next(self._iterator)
         # added c_t: correctness, l_t: latency reward terms. r_t = c_t*scale + l_t*scale
-        o_t, _, r_t, d_t, o_tp1, c_t, l_t ,extras = inputs.data
+        o_t, _, rcl_t, d_t, o_tp1, extras = inputs.data
+        r_t, c_t, l_t = rcl_t.numpy()
+        
         pi_t = extras['pi']
 
         with tf.GradientTape() as tape:
