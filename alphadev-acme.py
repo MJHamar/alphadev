@@ -12,7 +12,7 @@ import tensorflow_probability as tfp
 import numpy as np
 import ml_collections
 
-from acme.specs import EnvironmentSpec, Array, BoundedArray, DiscreteArray
+from acme.specs import EnvironmentSpec, make_environment_spec, Array, BoundedArray, DiscreteArray
 from acme.agents.tf.mcts import models
 from acme.agents.tf.mcts import types
 from dm_env import Environment, TimeStep, StepType
@@ -28,6 +28,11 @@ from .distribution import DistributionSupport
 # Type definitions
 # #################
 
+class IOExample(NamedTuple):
+    inputs: tf.Tensor # num_inputs x <sequence_length>
+    outputs: tf.Tensor # num_inputs x <num_mem>
+    output_mask: tf.Tensor # num_inputs x <num_mem> boolean array masking irrelevant parts of the output
+
 class TaskSpec(NamedTuple):
     max_program_size: int
     num_inputs: int # number of input examples
@@ -40,6 +45,8 @@ class TaskSpec(NamedTuple):
     correctness_reward_weight: float # weight for correctness reward
     latency_reward_weight: float # weight for latency reward
     latency_quantile: float # quantile for latency reward
+    inputs: IOExample # input examples for the task
+    return_loss_components: bool # whether to return the loss components for the value function (for categorical value loss)
 
 class CPUState(NamedTuple):
     registers: tf.Tensor # num_inputs x num_regs array of register values
@@ -49,11 +56,6 @@ class CPUState(NamedTuple):
     program: tf.Tensor # max_program_size x 1 array of progrram instructions.
     program_length: tf.Tensor  # scalar length of the program 
     program_counter: tf.Tensor # num_inputs x 1 array of program counters (in int32)
-
-class IOExample(NamedTuple):
-    inputs: tf.Tensor # num_inputs x <sequence_length>
-    outputs: tf.Tensor # num_inputs x <num_mem>
-    output_mask: tf.Tensor # num_inputs x <num_mem> boolean array masking irrelevant parts of the output
 
 class Program(NamedTuple):
     npy_program: tf.Tensor # <max_program_size> x 3 (opcode, op1, op2)
@@ -209,20 +211,6 @@ class AlphaDevConfig(object):
         self.pb_c_base = 19652
         self.pb_c_init = 1.25
 
-        # Environment: spec of the Variable Sort 3 task
-        self.task_spec = TaskSpec(
-            max_program_size=100,
-            num_inputs=17,
-            num_funcs=len(x86_opcode2int),
-            num_locations=19,
-            num_regs=5,
-            num_mem=14,
-            num_actions=240, # original value was 271
-            correct_reward=1.0,
-            correctness_reward_weight=2.0,
-            latency_reward_weight=0.5,
-            latency_quantile=0,
-        )
         # TODO: this assert is stupid.
         assert self.task_spec.num_locations == self.task_spec.num_regs + self.task_spec.num_mem, \
             f"number of registers {self.task_spec.num_regs} and memory {self.task_spec.num_mem} do not add up to the number of locations {self.task_spec.num_locations}"
@@ -245,7 +233,7 @@ class AlphaDevConfig(object):
         self.hparams.value = ml_collections.ConfigDict()
         self.hparams.value.max = 3.0  # These two parameters are task / reward-
         self.hparams.value.num_bins = 301  # dependent and need to be adjusted.
-        self.hparams.use_jit = False # no jit for now
+        self.hparams.categorical_value_loss = False # wheether to treat the value functions as a distribution
 
         ### Training
         self.training_steps = 1000 #int(1000e3)
@@ -256,15 +244,37 @@ class AlphaDevConfig(object):
         self.td_steps = 5
         self.lr_init = 2e-4
         self.momentum = 0.9
-        
-        self.inputs = generate_sort_inputs(
-            items_to_sort=3,
-            max_len=self.task_spec.num_mem, 
-            num_samples=self.task_spec.num_inputs
+
+
+        # Environment: spec of the Variable Sort 3 task
+        self.task_spec = TaskSpec(
+            max_program_size=100,
+            num_inputs=17,
+            num_funcs=len(x86_opcode2int),
+            num_locations=19,
+            num_regs=5,
+            num_mem=14,
+            num_actions=240, # original value was 271
+            correct_reward=1.0,
+            correctness_reward_weight=2.0,
+            latency_reward_weight=0.5,
+            latency_quantile=0,
+            inputs=generate_sort_inputs(
+                items_to_sort=3,
+                max_len=self.task_spec.num_mem,
+                num_samples=self.task_spec.num_inputs
+            ),
+            observe_reward_components=self.hparams.categorical_value_loss,
         )
+        
         #   logger.debug("Inputs: %s", self.inputs)
         assert self.task_spec.num_inputs == self.inputs.inputs.shape[0],\
             f"Expected {self.task_spec.num_inputs} inputs, got {self.inputs.inputs.shape[0]}"
+
+    @classmethod
+    def from_yaml(cls, path) -> 'AlphaDevConfig':
+        """Create a config from a ml_collections.ConfigDict."""
+        pass
 
 # #################
 # Action Spaces 
@@ -634,8 +644,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
 # #################
 
 class AssemblyGame(Environment):
-    def __init__(self, task_spec: TaskSpec, inputs: IOExample,
-                 action_space_storage: ActionSpaceStorage, observe_reward_components: bool = False):
+    def __init__(self, task_spec: TaskSpec):
         """
         Create an AssemblyGame environment.
         Args:
@@ -643,21 +652,25 @@ class AssemblyGame(Environment):
             inputs: Inputs to the environment.
         """
         self._task_spec = task_spec
-        self._inputs = inputs.inputs
-        self._output_mask = inputs.output_mask
-        self._outputs = tf.boolean_mask(inputs.outputs, self._output_mask)
+        self._inputs = task_spec.inputs.inputs
+        self._output_mask = task_spec.inputs.output_mask
+        self._outputs = tf.boolean_mask(task_spec.inputs.outputs, self._output_mask)
         self._max_num_hits = tf.reduce_sum(self._output_mask)
         
         # whether to return the correctness and latency components of the reward
         # in the TimeSteps
-        self._observe_reward_components = observe_reward_components
+        self._observe_reward_components = task_spec.observe_reward_components
         
         self._emulator = multi_machine(
             mem_size=task_spec.num_mem*4, # 4 bytes per memory location
             num_machines=task_spec.num_inputs,
             initial_state=self._inputs
         )
-        self._action_space_storage = action_space_storage
+        # TODO: make this distributed
+        self._action_space_storage = x86ActionSpaceStorage(
+            max_reg=task_spec.num_regs,
+            max_mem=task_spec.num_mem
+        )
         self.reset()
 
     def _reset_program(self):
@@ -1529,7 +1542,6 @@ class AlphaDevNetwork(snn.Module):
         )
     
     def __init__(self, hparams, task_spec,
-                 return_reward_logits: bool = False,
                  name: str = 'AlphaDevNetwork'):
         super().__init__(name=name)
         self._hparams = hparams
@@ -1549,7 +1561,7 @@ class AlphaDevNetwork(snn.Module):
         )
         self._return_fn = (
             self._return_with_reward_logits
-            if return_reward_logits else
+            if hparams.categorical_value_loss else
             self._return_without_reward_logits
         )
     
@@ -1572,11 +1584,12 @@ class AssemblyGameModel(models.Model):
     def __init__(
         self,
         task_spec: TaskSpec,
-        environment: AssemblyGame,
         name: str = 'AssemblyGameModel',
     ):
         super().__init__(name=name)
-        self._environment = environment
+        self._environment = AssemblyGame(
+            task_spec=task_spec,
+        )
         self._task_spec = task_spec
         self._needs_reset = False
     
@@ -1632,6 +1645,7 @@ class AssemblyGameModel(models.Model):
     
     def reset(self, initial_state: Optional[CPUState] = None):
         """Resets the model, optionally to an initial state."""
+        self._needs_reset = False
         if initial_state is not None:
             self._environment.reset(initial_state) #TODO
         else:
@@ -1647,20 +1661,34 @@ class AssemblyGameModel(models.Model):
 # #################
 # factory functions
 # #################
+config: AlphaDevConfig = AlphaDevConfig.from_yaml('alphadev_config.yaml')
+
+env_spec = make_environment_spec(AssemblyGame(config.task_spec))
 
 def environment_factory(): # no args
-    pass
+    return AssemblyGameModel(
+        task_spec=config.task_spec,
+        name='AssemblyGameEnvironment',
+    )
 
-def network_factory(env_spec: DiscreteArray): # env_spec
-    pass
+def network_factory(env_spec: DiscreteArray): 
+    # env_spec here is env.actions 
+    # (i.e. enumeration of available actions). we ignore it
+    return AlphaDevNetwork(
+        hparams=config.hparams,
+        task_spec=config.task_spec,
+    )
 
 def model_factory(env_spec: EnvironmentSpec): # env_spec
-    pass
+    # again. we ignore the env_spec.
+    return AssemblyGameModel(
+        task_spec=config.task_spec,
+        name='AssemblyGameModel',
+    )
 
 # #################
 # Agent definition
 # #################
-config = AlphaDevConfig()
 
 agent = DistributedMCTS(
     environment_factory=environment_factory, # AlphaGame environment
