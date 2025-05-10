@@ -1,3 +1,6 @@
 [submodule "tinyfive"]
 	path = tinyfive
 	url = git@github.com:MJHamar/tinyfive.git
+[submodule "acme"]
+	path = acme
+	url = git@github.com:MJHamar/acme.git
