@@ -33,7 +33,11 @@ import launchpad as lp
 import reverb
 import sonnet as snt
 
-from .dual_value_az import DualValueAZLearner
+import numpy as np
+from dual_value_az import DualValueAZLearner
+
+import logging
+logger = logging.getLogger(__name__)
 
 class MCTS(agent.Agent):
   """A single-process MCTS agent."""
@@ -80,6 +84,7 @@ class MCTS(agent.Agent):
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
     tf2_utils.create_variables(network, [environment_spec.observations])
+    logger.debug("Finished creating variables for network")
 
     # Now create the agent components: actor & learner.
     actor = acting.MCTSActor(
@@ -149,6 +154,7 @@ class DistributedMCTS:
         self._environment_factory = environment_factory
         self._network_factory = network_factory
         self._model_factory = model_factory
+        self._optimizer_factory = optimizer_factory
 
         # Internalize hyperparameters.
         self._num_actors = num_actors

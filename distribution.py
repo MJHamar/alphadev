@@ -6,7 +6,7 @@ class DistributionSupport(object):
         self.value_max = value_max
         self.num_bins = num_bins
         self.value_support = tf.cast(
-            tf.linspace(0, value_max, num_bins), tf.float32)
+            tf.linspace(0.0, value_max, num_bins), tf.float32)
 
     def mean(self, logits: tf.Tensor) -> float:
         # logits has shape B x num_bins

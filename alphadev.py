@@ -1182,7 +1182,7 @@ class RepresentationNet(hk.Module):
         permutations_encoded = all_locations_net(grouped_representation)
         # logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
         # Combine all permutations into a single vector using a ResNetV2
-        joint_encoding = joint_locations_net(jnp.mean(permutations_encoded, axis=1))
+        joint_encoding = joint_locations_net(jnp.mean(permutations_encoded, axis=1, keepdims=True))
         # logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
         for net in joint_resnet:
             joint_encoding = net(joint_encoding)

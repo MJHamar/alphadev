@@ -18,10 +18,14 @@ from dm_env import Environment, TimeStep, StepType
 # from acme.agents.tf.mcts
 # from acme.agents.tf.mcts.agent_distributed import DistributedMCTS
 
-from .alphadev import PredictionNet, RepresentationNet
-from .tinyfive.multi_machine import multi_machine
-from .agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
-from .distribution import DistributionSupport
+from tinyfive.multi_machine import multi_machine
+from agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
+from distribution import DistributionSupport
+
+import logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # #################
 # Type definitions
@@ -45,7 +49,7 @@ class TaskSpec(NamedTuple):
     latency_reward_weight: float # weight for latency reward
     latency_quantile: float # quantile for latency reward
     inputs: IOExample # input examples for the task
-    return_loss_components: bool # whether to return the loss components for the value function (for categorical value loss)
+    observe_reward_components: bool # whether to return the reward components for the value function (for categorical value loss)
 
 class CPUState(NamedTuple):
     registers: tf.Tensor # num_inputs x num_regs array of register values
@@ -201,10 +205,6 @@ class AlphaDevConfig(object):
         self.pb_c_base = 19652
         self.pb_c_init = 1.25
 
-        # TODO: this assert is stupid.
-        assert self.task_spec.num_locations == self.task_spec.num_regs + self.task_spec.num_mem, \
-            f"number of registers {self.task_spec.num_regs} and memory {self.task_spec.num_mem} do not add up to the number of locations {self.task_spec.num_locations}"
-
         ### Network architecture
         self.hparams = ml_collections.ConfigDict()
         self.hparams.embedding_dim = 512
@@ -221,8 +221,8 @@ class AlphaDevConfig(object):
         self.hparams.representation.attention.position_encoding = 'absolute'
         self.hparams.representation.attention_num_layers = 6
         self.hparams.value = ml_collections.ConfigDict()
-        self.hparams.value.max = 3.0  # These two parameters are task / reward-
-        self.hparams.value.num_bins = 301  # dependent and need to be adjusted.
+        self.hparams.value_max = 3.0  # These two parameters are task / reward-
+        self.hparams.value_num_bins = 301  # dependent and need to be adjusted.
         self.hparams.categorical_value_loss = False # wheether to treat the value functions as a distribution
 
         ### Training
@@ -237,13 +237,14 @@ class AlphaDevConfig(object):
 
 
         # Environment: spec of the Variable Sort 3 task
+        num_inputs = 17; num_mem = 14; num_regs = 5
         self.task_spec = TaskSpec(
             max_program_size=100,
-            num_inputs=17,
+            num_inputs=num_inputs,
             num_funcs=len(x86_opcode2int),
-            num_locations=19,
-            num_regs=5,
-            num_mem=14,
+            num_locations=num_regs+num_mem,
+            num_regs=num_regs,
+            num_mem=num_mem,
             num_actions=240, # original value was 271
             correct_reward=1.0,
             correctness_reward_weight=2.0,
@@ -251,14 +252,14 @@ class AlphaDevConfig(object):
             latency_quantile=0,
             inputs=generate_sort_inputs(
                 items_to_sort=3,
-                max_len=self.task_spec.num_mem,
-                num_samples=self.task_spec.num_inputs
+                max_len=num_mem,
+                num_samples=num_inputs
             ),
             observe_reward_components=self.hparams.categorical_value_loss,
         )
         
         #   logger.debug("Inputs: %s", self.inputs)
-        assert self.task_spec.num_inputs == self.inputs.inputs.shape[0],\
+        assert self.task_spec.num_inputs == self.task_spec.inputs.inputs.shape[0],\
             f"Expected {self.task_spec.num_inputs} inputs, got {self.inputs.inputs.shape[0]}"
 
     @classmethod
@@ -363,7 +364,7 @@ x86_opcode2int = {
     k: i for i, k in enumerate(x86_signatures.keys())
 }
 
-def x86_enumerate_actions(max_reg: int, max_mem: int) -> Dict[Tuple[str, Tuple[int, int]]]:
+def x86_enumerate_actions(max_reg: int, max_mem: int) -> Dict[int, Tuple[str, Tuple[int, int]]]:
     def apply_opcode(opcode: str, operands: Tuple[int, int, int]) -> List[Tuple[str, Tuple[int, int]]]:
         # operands is a triple (reg1, reg2, mem)
         signature = x86_signatures[opcode]
@@ -453,57 +454,47 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         action_space_size = len(self.actions)
         # table mapping all registers and memory locations to the action space 
         # a cell (i,j) is True if location i is accessed by action j.
-        act_loc_table = tf.Variable(tf.zeros((self.max_reg + self.max_mem, action_space_size), dtype=tf.bool))
+        act_loc_table = np.zeros(((self.max_reg + self.max_mem), action_space_size), dtype=np.bool_)
         # mask for register locations
-        reg_locs = tf.concat([
-            tf.ones(self.max_reg, dtype=tf.bool),
-            tf.zeros(self.max_mem, dtype=tf.bool)
-        ], axis=0)
+        reg_locs = np.zeros((self.max_reg + self.max_mem), dtype=np.bool_)
+        reg_locs[:self.max_reg] = True
         # mask for memory locations
-        mem_locs = tf.concat([
-            tf.zeros(self.max_reg, dtype=tf.bool),
-            tf.ones(self.max_mem, dtype=tf.bool)
-        ], axis=0)
+        mem_locs = np.zeros((self.max_reg + self.max_mem), dtype=np.bool_)
+        mem_locs[self.max_reg:] = True
         # boolean mask for actions that only use register locations
-        reg_only_actions = tf.Variable(tf.zeros(action_space_size, dtype=tf.bool))
+        reg_only_actions = np.zeros((action_space_size,), dtype=np.bool_)
         # boolean mask for actions that read from memory locations
-        mem_read_actions = tf.Variable(tf.zeros(action_space_size, dtype=tf.bool))
+        mem_read_actions = np.zeros((action_space_size,), dtype=np.bool_)
         # boolean mask for actions that write to memory locations
-        mem_write_actions = tf.Variable(tf.zeros(action_space_size, dtype=tf.bool))
-        
+        mem_write_actions = np.zeros((action_space_size,), dtype=np.bool_)
         for i, action in enumerate(self.actions.values()):
             # iterate over the x86 instructions currently under consideration
-            x86_opcode, x86_operands = action # a tuple of (opcode, operands)
+            x86_opcode, x86_operands = action
             signature = x86_signatures[x86_opcode]
             if signature == (REG_T, REG_T):
-                indices = tf.constant([[op, i] for op in x86_operands], dtype=tf.int32)
-                updates = tf.constant([True] * len(x86_operands), dtype=tf.bool)
-                act_loc_table.scatter_nd_update(indices, updates)
-                reg_only_actions.scatter_nd_update([[i]], [True])
+                act_loc_table[x86_operands, i] = True
+                reg_only_actions[i] = True
             else: # action that accesses memory.
                 mem_loc, reg_loc = x86_operands if signature == (MEM_T, REG_T) else reversed(x86_operands)
-                mem_loc += self.max_reg # offset the memory locations
-                act_loc_table.scatter_nd_update([[reg_loc, i], [mem_loc, i]], [True, True])
+                
+                act_loc_table[reg_loc, i] = True
+                act_loc_table[mem_loc, i] = True
                 if x86_opcode.startswith("l"): # load action
-                    mem_read_actions.scatter_nd_update([[i]], [True])
+                    mem_read_actions[i] = True
                 else:
-                    mem_write_actions.scatter_nd_update([[i]], [True])
+                    mem_write_actions[i] = True
         
-        assert not tf.reduce_any(tf.logical_and(reg_only_actions, mem_read_actions)), \
-            "Action in both reg_only and mem_read"
-        assert not tf.reduce_any(tf.logical_and(reg_only_actions, mem_write_actions)), \
-            "Action in both reg_only and mem_write"
-        assert not tf.reduce_any(tf.logical_and(mem_read_actions, mem_write_actions)), \
-            "Action in both mem_read and mem_write"
-        assert tf.reduce_all(tf.logical_or(tf.logical_or(reg_only_actions, mem_read_actions), mem_write_actions)), \
+        assert (reg_only_actions & mem_read_actions & mem_write_actions == 0).any(), \
+            "Action space was not partitioned correctly"
+        assert (reg_only_actions | mem_read_actions | mem_write_actions).all(), \
             "Action space was not partitioned correctly"
         
-        self.act_loc_table = act_loc_table.read_value()
-        self.reg_locs = reg_locs
-        self.mem_locs = mem_locs
-        self.reg_only_actions = reg_only_actions.read_value()
-        self.mem_read_actions = mem_read_actions.read_value()
-        self.mem_write_actions = mem_write_actions.read_value()
+        self.act_loc_table = tf.constant(act_loc_table)
+        self.reg_locs = tf.constant(reg_locs)
+        self.mem_locs = tf.constant(mem_locs)
+        self.reg_only_actions = tf.constant(reg_only_actions)
+        self.mem_read_actions = tf.constant(mem_read_actions)
+        self.mem_write_actions = tf.constant(mem_write_actions)
 
     def get_mask(self, state, history: List[Tuple[str, Tuple[int, int]]]) -> tf.Tensor:
         """
@@ -647,9 +638,8 @@ class AssemblyGame(Environment):
         self._task_spec = task_spec
         self._inputs = task_spec.inputs.inputs
         self._output_mask = task_spec.inputs.output_mask
-        self._outputs = tf.boolean_mask(task_spec.inputs.outputs, self._output_mask)
-        self._max_num_hits = tf.reduce_sum(self._output_mask)
-        
+        self._outputs = tf.cast(tf.boolean_mask(task_spec.inputs.outputs, self._output_mask), tf.int32)
+        self._max_num_hits = tf.math.count_nonzero(self._output_mask)
         # whether to return the correctness and latency components of the reward
         # in the TimeSteps
         self._observe_reward_components = task_spec.observe_reward_components
@@ -675,9 +665,9 @@ class AssemblyGame(Environment):
     def _eval_output(self, output: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
         masked_output = tf.boolean_mask(output, self._output_mask)
         hits = tf.equal(masked_output, self._outputs)
-        num_hits = tf.reduce_sum(hits)
+        num_hits = tf.math.count_nonzero(hits)
         all_hits = tf.equal(num_hits, self._max_num_hits)
-        return all_hits, num_hits
+        return tf.cast(all_hits, dtype=tf.float32), tf.cast(num_hits, dtype=tf.float32)
     
     def _eval_latency(self) -> tf.Tensor:
         """Returns a scalar latency for the program."""
@@ -685,12 +675,12 @@ class AssemblyGame(Environment):
             self._emulator.measure_latency(self._program.asm_program)
             for _ in range(self._task_spec.num_inputs)], dtype=tf.float32
         )
-        return latencies
+        return tf.cast(latencies, dtype=tf.float32)
     
     def _compute_reward(self, include_latency: float) -> float:
         # compute the reward based on the latency and correctness
         correctness_reward = self._task_spec.correctness_reward_weight * (
-            self._num_hits - self._num_hits # NOTE: num_hits here **is** from the previous iteration.
+            self._num_hits - self._prev_num_hits
         )
         correctness_reward += self._task_spec.correct_reward * self._is_correct
         # update the previous correct items
@@ -701,6 +691,8 @@ class AssemblyGame(Environment):
                 latencies, self._task_spec.latency_quantile * 100
             ) * self._task_spec.latency_reward_weight
         reward = correctness_reward + latency_reward
+        
+        self._prev_num_hits = self._num_hits
         
         return reward, latency_reward, correctness_reward
     
@@ -752,6 +744,7 @@ class AssemblyGame(Environment):
     def reset(self, state: Union[TimeStep, CPUState, None]=None) -> TimeStep:
         # deletes the program and resets the
         # CPU state to the original inputs
+        self._prev_num_hits = 0 # in eitheer case we need to reset this
         if state is None:
             self._emulator.reset_state()
             self._reset_program()
@@ -803,18 +796,18 @@ class AssemblyGame(Environment):
         return self._update_state()
     
     def reward_spec(self):
-        return Array(shape=(), dtype=tf.float32) if not self._observe_reward_components else Array(shape=(3,), dtype=tf.float32)
+        return Array(shape=(), dtype=np.float32) if not self._observe_reward_components else Array(shape=(3,), dtype=np.float32)
     def discount_spec(self):
-        return Array(shape=(), dtype=tf.float32)
+        return Array(shape=(), dtype=np.float32)
     def observation_spec(self):
         return CPUState(
-            registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=tf.float32),
-            active_registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=tf.bool),
-            memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=tf.float32),
-            active_memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=tf.bool),
-            program=Array(shape=(self._task_spec.max_program_size, 3), dtype=tf.int32),
-            program_length=Array(shape=(), dtype=tf.int32),
-            program_counter=Array(shape=(self._task_spec.num_inputs,), dtype=tf.int32)
+            registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.float32),
+            active_registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.bool_),
+            memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.float32),
+            active_memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.bool_),
+            program=Array(shape=(self._task_spec.max_program_size, 3), dtype=np.int32),
+            program_length=Array(shape=(), dtype=np.int32),
+            program_counter=Array(shape=(self._task_spec.num_inputs,), dtype=np.int32)
         )._asdict()
     def action_spec(self):
         # TODO: this won't work for dynamic action spaces
@@ -917,7 +910,7 @@ class MultiQueryAttentionBlock(snn.Module):
         # logger.debug("MQAB: O shape (bhnv) %s", O.shape)
         B, _, N, _ = O.shape # B x H x N x V
         # reshape O to B x N x (H*V)
-        O = O.reshape((B, N, -1)) # B x N x (H*V)
+        O = tf.reshape(O, (B, N, -1)) # B x N x (H*V)
         # logger.debug("MQAB: O reshaped to %s", O.shape)
         # apply the output projection
         # logger.debug("MQAB: aggregate head projection bn[h*v] %s to bnd %s ", O.shape, inputs.shape)
@@ -936,7 +929,7 @@ class MultiQueryAttentionBlock(snn.Module):
         name: str | None = None,
     ) -> tf.Tensor:
         """Copy-paste from hk.MultiHeadAttention."""
-        y = tf.Linear(num_heads * head_size, name=name)(x) # proj mat. D x (H*K) 
+        y = snn.Linear(num_heads * head_size, name=name)(x) # proj mat. D x (H*K) 
         # y should be [B, N, H*K]
         assert y.ndim == 3, f"y should be 3D, but got {y.ndim}D"
         assert y.shape[-1] == num_heads * head_size, f"y should be of shape [B, N, H*K], but got {y.shape}"
@@ -944,19 +937,20 @@ class MultiQueryAttentionBlock(snn.Module):
         # split last dimension (H*K) into H, K
         new_shape = (*leading_dims, num_heads, head_size) if num_heads > 1 else (*leading_dims, head_size)
         # logger.debug("linear_projection, reshaping y from %s to %s", y.shape, new_shape)
-        return y.reshape(new_shape) # [B, N, H, K] or [B, N, K]
+        return tf.reshape(y, new_shape) # [B, N, H, K] or [B, N, K]
 
+    @staticmethod
     def sinusoid_position_encoding(seq_size, feat_size):
         """Compute sinusoid absolute position encodings, 
         given a sequence size and feature dimensionality"""
         # SOURCE: https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/JAX/tutorial6/Transformers_and_MHAttention.html
-        pe = tf.zeros((seq_size, feat_size))
-        position = tf.cast(tf.range(0, seq_size), dtype=tf.float32)[:,None]
-        div_term = tf.exp(tf.range(0, feat_size, 2) * (-tf.math.log(10000.0) / feat_size))
-        pe = tf.tensor_scatter_nd_update(pe, indices=tf.stack([tf.range(seq_size), tf.zeros(seq_size, dtype=tf.int32)], axis=1), updates=tf.sin(position * div_term))
-        pe = tf.tensor_scatter_nd_update(pe, indices=tf.stack([tf.range(seq_size), tf.ones(seq_size, dtype=tf.int32)], axis=1), updates=tf.cos(position * div_term))
-        pe = tf.reshape(pe, (1, seq_size, feat_size))
-        return pe
+        pe = np.zeros((seq_size, feat_size))
+        position = np.arange(0, seq_size, dtype=np.float32)[:,None]
+        div_term = np.exp(np.arange(0, feat_size, 2) * (-np.log(10000.0) / feat_size))
+        pe[:, 0::2] = np.sin(position * div_term)
+        pe[:, 1::2] = np.cos(position * div_term)
+        pe = pe[None]
+        return tf.constant(pe, dtype=tf.float32) # [1, seq_size, feat_size]
 
 class ResBlockV2(snn.Module):
     """Layer-normed variant of the block from https://arxiv.org/abs/1603.05027.
@@ -1034,9 +1028,9 @@ class ResBlockV2(snn.Module):
         for i, (conv_i, ln_i) in enumerate(self.layers):
             x = ln_i(x)
             x = tf.nn.relu(x)
-        if i == 0 and self.use_projection:
-            shortcut = self.proj_conv(x)
-        x = conv_i(x)
+            if i == 0 and self.use_projection:
+                shortcut = self.proj_conv(x)
+            x = conv_i(x)
 
         return x + shortcut
 
@@ -1056,7 +1050,7 @@ def int2bin(integers_array: tf.Tensor) -> tf.Tensor:
         array of bits (on or off) in boolean type.
     """
     flat_arr = tf.reshape(tf.cast(integers_array, dtype=tf.int32), (-1, 1))
-    # bin_mask = jnp.tile(2 ** jnp.arange(32), (flat_arr.shape[0], 1))
+    # bin_mask = np.tile(2 ** np.arange(32), (flat_arr.shape[0], 1))
     bin_mask = tf.tile(tf.reshape(tf.pow(2, tf.range(32)), (1,32)), [tf.shape(flat_arr)[0], 1])
     masked = (flat_arr & bin_mask) != 0
     return tf.reshape(masked, (*integers_array.shape[:-1], integers_array.shape[-1] * 32))
@@ -1218,18 +1212,18 @@ class RepresentationNet(snn.Module):
             for i in range(self._hparams.representation.repr_net_res_blocks)
         ]
 
-        assert grouped_representation[:2] == (batch_size, self._task_spec.num_inputs), \
-            f"grouped_representation shape {grouped_representation.shape} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
-        # logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
+        assert grouped_representation.shape[:2] == (batch_size, self._task_spec.num_inputs), \
+            f"grouped_representation shape {grouped_representation.shape[:2]} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
+        logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
         # apply MLP to the combined program and locations embedding
         permutations_encoded = all_locations_net(grouped_representation)
-        # logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
+        logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
         # Combine all permutations into a single vector using a ResNetV2
-        joint_encoding = joint_locations_net(tf.reduce_mean(permutations_encoded, axis=1))
-        # logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
+        joint_encoding = joint_locations_net(tf.reduce_mean(permutations_encoded, axis=1, keepdims=True))
+        logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
         for net in joint_resnet:
             joint_encoding = net(joint_encoding)
-        return joint_encoding
+        return joint_encoding[:, 0, :] # remove the extra dimension
 
     def make_program_onehot(self, program, batch_size, max_program_size):
         # logger.debug("make_program_onehot shape %s", program.shape)
@@ -1243,7 +1237,7 @@ class RepresentationNet(snn.Module):
         program_onehot = tf.concat(
             [func_onehot, arg1_onehot, arg2_onehot], axis=-1
         )
-        assert program_onehot.shape[:2] == (batch_size, max_program_size, None), \
+        assert program_onehot.shape[:2] == (batch_size, max_program_size), \
             f"program_onehot shape {program_onehot.shape} does not match expected shape {(batch_size, max_program_size, None)}"
         # logger.debug("program_onehot shape %s", program_onehot.shape)
         return program_onehot
@@ -1255,8 +1249,8 @@ class RepresentationNet(snn.Module):
         # logger.debug("pad_program_encoding shape %s", program_encoding.shape)
         assert program_encoding.shape[:2] == (batch_size, max_program_size),\
             f"program_encoding shape {program_encoding.shape} does not match expected shape {(batch_size, max_program_size)}"
-        assert program_length.shape[:2] == (batch_size, self._task_spec.num_inputs),\
-            f"program_length shape {program_length.shape} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
+        # assert program_length.shape[:2] == (batch_size, self._task_spec.num_inputs),\
+        #     f"program_length shape {program_length.shape} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
 
         empty_program_output = tf.zeros(
             [batch_size, program_encoding.shape[-1]],
@@ -1266,8 +1260,8 @@ class RepresentationNet(snn.Module):
         )
 
         program_length_onehot = tf.one_hot(program_length, max_program_size + 1)
-        # logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
-        # logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
+        logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
+        logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
         # two cases here:
         # - program length is a batch of scalars corr. to the program length
         # - program length is a batch of vectors (of len num_inputs) corr. to the state of the program counters
@@ -1279,7 +1273,7 @@ class RepresentationNet(snn.Module):
             program_encoding = tf.einsum(
                 'bnd,bn->bd', program_encoding, program_length_onehot
             )
-        # logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
+        logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
 
         return program_encoding
 
@@ -1356,7 +1350,7 @@ class RepresentationNet(snn.Module):
         # that only the current state is passed to the network as input,
         # instead of the whole sequence of states,
         # that the CPU has seen while executing the program.
-        locations = tf.concat([registers, memory], axis=-1) # B x E x (R + M)
+        locations = tf.cast(tf.concat([registers, memory], axis=-1), tf.int32) # B x E x (R + M)
         # logger.debug("locations shape %s", locations.shape)
         # to support inputs with sequences of states, we conditinally transpose
         # the locations tensor to have the shape [B, P, H, D]
@@ -1371,9 +1365,7 @@ class RepresentationNet(snn.Module):
             locations, self._task_spec.num_locations, dtype=tf.float32
         )
         # logger.debug("locations_onehot shape %s", locations_onehot.shape)
-        locations_onehot = locations_onehot.reshape(
-            [batch_size, self._task_spec.num_inputs, -1]
-        )
+        locations_onehot = tf.reshape(locations_onehot, [batch_size, self._task_spec.num_inputs, -1])
         # logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
         return locations_onehot
 
@@ -1424,7 +1416,10 @@ class CategoricalHead(snn.Module):
 
     def __call__(self, x: tf.Tensor):
         # For training returns the logits, for inference the mean.
+        if len(x.shape) == 2:
+            x = tf.expand_dims(x, axis=1)
         logits = self._head(x) # project the embedding to the value support's numbeer of bins 
+        logits = tf.reshape(logits, (-1, self._value_support.num_bins)) # B x num_bins
         probs = tf.nn.softmax(logits) # take softmax -- probabilities over the bins
         # logger.debug("CategoricalHead: logits shape %s, probs shape %s", logits.shape, probs.shape)
         mean = self._value_support.mean(probs) # compute the mean, which is probs * [0, max_val/num_bins, 2max_val/num_bins, max_val]
@@ -1476,14 +1471,15 @@ class PredictionNet(snn.Module):
         
         # for debugging, we can check the distribution of the embedding
         # if logger.isEnabledFor(logging.DEBUG):
-        #     embedding_mean = jnp.mean(embedding)
+        #     embedding_mean = np.mean(embedding)
         #     embedding_std = jnp.std(embedding)
         #     embedding_min = jnp.min(embedding)
         #     embedding_max = jnp.max(embedding)
         #     logger.debug("PredictionNet.distr_check: embedding min %s, max %s mean %s std %s", embedding_min, embedding_max, embedding_mean, embedding_std)
-        
+        if len(embedding.shape) == 2:
+            embedding = tf.expand_dims(embedding, axis=1)
         policy = policy_head(embedding) # B x num_actions
-        
+        policy = tf.reshape(policy, (-1, self.task_spec.num_actions)) # B x num_actions
         # similarly, the policy should be close to a uniform distribution
         # with a mean of 1/num_actions
         # if logger.isEnabledFor(logging.DEBUG):
@@ -1549,12 +1545,12 @@ class AlphaDevNetwork(snn.Module):
     
     def __call__(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
         """Computes and returns the policy and value logits for the AZLearner."""
-        # logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
+        logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
         # inputs is the observation dict
         embedding: tf.Tensor = self._representation_net(inputs)
-        # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
+        logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
         prediction: NetworkOutput = self._prediction_net(embedding)
-        # logger.debug("AlphaDevNetwork: prediction shape %s", str({k:v.shape for k,v in prediction.items()}))
+        logger.debug("AlphaDevNetwork: prediction obtained")
         return self._return_fn(prediction)
 
 
@@ -1568,7 +1564,7 @@ class AssemblyGameModel(models.Model):
         task_spec: TaskSpec,
         name: str = 'AssemblyGameModel',
     ):
-        super().__init__(name=name)
+        super().__init__()
         self._environment = AssemblyGame(
             task_spec=task_spec,
         )
@@ -1638,12 +1634,23 @@ class AssemblyGameModel(models.Model):
         """Returns whether or not the model needs to be reset."""
         return self._needs_reset
 
+    def action_spec(self):
+        return self._environment.action_spec()
+    def reward_spec(self):
+        return self._environment.reward_spec()
+    def discount_spec(self):
+        return self._environment.discount_spec()
+    def observation_spec(self):
+        return self._environment.observation_spec()
+    def step(self, acttion):
+        return self._environment.step(action)
+
 # predictor net from JEPA
 
 # #################
 # factory functions
 # #################
-config: AlphaDevConfig = AlphaDevConfig.from_yaml('alphadev_config.yaml')
+config: AlphaDevConfig = AlphaDevConfig()
 
 env_spec = make_environment_spec(AssemblyGame(config.task_spec))
 
@@ -1669,36 +1676,37 @@ def model_factory(env_spec: EnvironmentSpec): # env_spec
     )
 
 def optimizer_factory():
-    return snn.optimizers.SGD(
-        learning_rate=config.learning_rate,
-        momentum=config.hparams.momentum,
+    return snn.optimizers.Momentum(
+        learning_rate=config.lr_init,
+        momentum=config.momentum,
     )
 
 # #################
 # Agent definition
 # #################
 
-distributed_agent = DistributedMCTS(
-    environment_factory=environment_factory, # AlphaGame environment
-    network_factory=network_factory,         # AlphaDev network
-    model_factory=model_factory,             # Either a learned model or a wrapper around the environment
-    optimizer_factory=optimizer_factory,     # SGD optimizer
-    num_actors=config.num_actors, # number of parallel actors
-    num_simulations=config.num_simulations, # number of rollouts per action
-    batch_size=config.batch_size,  # batch size used by the learner.
-    prefetch_size=config.prefetch_size,  # parameter passed to make_reverb_dataset
-    target_update_period=config.target_update_period, # NOTE: not used
-    samples_per_insert=config.samples_per_insert, # to balance the replay buffer
-    min_replay_size=config.min_replay_size, # used as a limiter for the replay buffer
-    max_replay_size=config.max_replay_size, # maximum size of the replay buffer
-    importance_sampling_exponent=config.importance_sampling_exponent, # not used
-    priority_exponent=config.priority_exponent, # not used
-    n_step=config.training_steps, # how many steps to buffer before adding to the replay buffer
-    learning_rate=config.learning_rate, # learning rate for the learner
-    discount=config.discount, # discount factor for the environment
-    environment_spec=config.env_spec, # defines the environment
-    save_logs=config.save_logs, # whether to save logs or not
-)
+# distributed_agent = DistributedMCTS(
+#     environment_factory=environment_factory, # AlphaGame environment
+#     network_factory=network_factory,         # AlphaDev network
+#     model_factory=model_factory,             # Either a learned model or a wrapper around the environment
+#     optimizer_factory=optimizer_factory,     # SGD optimizer
+#     num_actors=config.num_actors, # number of parallel actors
+#     num_simulations=config.num_simulations, # number of rollouts per action
+#     batch_size=config.batch_size,  # batch size used by the learner.
+#     prefetch_size=config.prefetch_size,  # parameter passed to make_reverb_dataset
+#     target_update_period=config.target_update_period, # NOTE: not used
+#     samples_per_insert=config.samples_per_insert, # to balance the replay buffer
+#     min_replay_size=config.min_replay_size, # used as a limiter for the replay buffer
+#     max_replay_size=config.max_replay_size, # maximum size of the replay buffer
+#     importance_sampling_exponent=config.importance_sampling_exponent, # not used
+#     priority_exponent=config.priority_exponent, # not used
+#     n_step=config.training_steps, # how many steps to buffer before adding to the replay buffer
+#     learning_rate=config.learning_rate, # learning rate for the learner
+#     discount=config.discount, # discount factor for the environment
+#     environment_spec=config.env_spec, # defines the environment
+#     save_logs=config.save_logs, # whether to save logs or not
+# )
+
 
 agent = MCTS(
     network=network_factory(None),
@@ -1714,5 +1722,32 @@ agent = MCTS(
 )
 
 if __name__ == '__main__':
-    # start training
-    pass
+    environment = environment_factory()
+    num_episodes = 100  # Example number of episodes
+    for episode in range(num_episodes):
+        # a. Reset environment and agent at start of episode
+        print("Initializing episode...")
+        timestep = environment.reset()
+        agent.actor.reset()
+
+        # b. Run episode
+        while not timestep.last():
+            print("Current timestep:", timestep.step_type)
+            # Agent selects an action
+            action = agent.select_action(timestep.observation)
+            print("Selected action:", action)
+            # Environment steps
+            new_timestep = environment.step(action)
+            # print("New timestep:", new_timestep)
+            # Agent observes the result
+            agent.observe(action=action, next_timestep=new_timestep)
+            # Update timestep
+            timestep = new_timestep
+
+        # c. Train the learner
+        print("Final timestep reached: ", timestep.step_type)
+        print("Training agent...")
+        agent.learner.step()
+
+        # d. Log training information (optional)
+        print(f"Episode {episode + 1}/{num_episodes} completed.")

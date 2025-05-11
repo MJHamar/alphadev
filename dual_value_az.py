@@ -2,7 +2,7 @@
 import tensorflow as tf
 from acme.agents.tf.mcts.learning import AZLearner
 
-from .distribution import DistributionSupport
+from distribution import DistributionSupport
 
 # From AlphaDev pseudocode
 def scalar_loss(prediction:tf.Tensor, target:tf.Tensor, value_max, num_bins) -> float:
