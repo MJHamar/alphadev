@@ -710,7 +710,7 @@ class AssemblyGame(Environment):
     
     def _check_invalid(self) -> bool:
         # either too long or the emulator is in an invalid state
-        logger.debug("AssemblyGame._check_invalid: len %s, inval %s", len(self._program), len(self._program) >= self._task_spec.max_program_size)
+        # logger.debug("AssemblyGame._check_invalid: len %s, inval %s", len(self._program), len(self._program) >= self._task_spec.max_program_size)
         return len(self._program) >= self._task_spec.max_program_size or \
             False # TODO: self._emulator.invalid()
     
@@ -776,8 +776,10 @@ class AssemblyGame(Environment):
                 asm_program=asm_program,
             )
             self._emulator.reset_state()
-            # execute the program
-            self._emulator.exe(program=self._program.asm_program)
+            # execute the program only if nonempty
+            if len(self._program) > 0:
+                # execute the program
+                self._emulator.exe(program=self._program.asm_program)
             # update the state
         return self._update_state()
     
@@ -1173,7 +1175,7 @@ class RepresentationNet(snn.Module):
     def _encode_program(self, inputs: CPUState, batch_size):
         # logger.debug("encode_program shape %s", inputs['program'].shape)
         program = inputs['program']
-        logger.debug("encode_program: program shape %s", program.shape)
+        # logger.debug("encode_program: program shape %s", program.shape)
         max_program_size = inputs['program'].shape[1] # TODO: this might not be a constant
         program_length = tf.cast(inputs['program_length'], tf.int32)
         program_onehot = self.make_program_onehot(
@@ -1193,7 +1195,7 @@ class RepresentationNet(snn.Module):
         program_encoding,
         batch_size,
     ):
-        logger.debug("aggregate_locations_program: locations_encoding shape %s", locations_encoding.shape)
+        # logger.debug("aggregate_locations_program: locations_encoding shape %s", locations_encoding.shape)
         locations_embedding = tf.vectorized_map(self.locations_embedder, locations_encoding)
         # logger.debug("aggregate_locations_program: locations_embedding shape %s", locations_embedding.shape)
 
@@ -1201,7 +1203,7 @@ class RepresentationNet(snn.Module):
         # this way, it matches the size of the observations.
         # logger.debug("aggregate_locations_program: program_encoding shape %s", program_encoding.shape)
         program_encoded_repeat = self.repeat_program_encoding(
-            program_encoding, batch_size
+            program_encoding[:, None, :], batch_size
         )
         # logger.debug("aggregate_locations_program: program_encoded_repeat shape %s", program_encoded_repeat.shape)
 
@@ -1213,12 +1215,10 @@ class RepresentationNet(snn.Module):
         return self.apply_joint_embedder(grouped_representation, batch_size)
 
     def repeat_program_encoding(self, program_encoding, batch_size):
-        logger.debug("aggregate_locations_program: repeat_program_encoding pre shape %s", program_encoding.shape)
         program_encoding = tf.broadcast_to(
             program_encoding,
             [batch_size, self._task_spec.num_inputs, program_encoding.shape[-1]],
         )
-        logger.debug("aggregate_locations_program: repeat_program_encoding post shape %s", program_encoding.shape)
         return program_encoding
 
     def apply_joint_embedder(self, grouped_representation, batch_size):
@@ -1530,9 +1530,9 @@ class AlphaDevNetwork(snn.Module):
         logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
         # inputs is the observation dict
         embedding: tf.Tensor = self._representation_net(inputs)
-        logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
+        # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
         prediction: NetworkOutput = self._prediction_net(embedding)
-        logger.debug("AlphaDevNetwork: prediction obtained")
+        # logger.debug("AlphaDevNetwork: prediction obtained")
         return self._return_fn(prediction)
 
 
@@ -1556,12 +1556,10 @@ class AssemblyGameModel(models.Model):
     def load_checkpoint(self):
         """Loads a saved model state, if it exists."""
         self._needs_reset = False
-        logger.debug("AssemblyGameModel.load_checkpoint w. pl %d", len(self._ckpt._program))
         self._environment = self._ckpt.copy()
 
     def save_checkpoint(self):
         """Saves the model state so that we can reset it after a rollout."""
-        logger.debug("AssemblyGameModel.save_checkpoint w. pl %d", len(self._environment._program))
         self._ckpt = self._environment.copy() # TODO: implement
 
     def update(
@@ -1714,12 +1712,12 @@ if __name__ == '__main__':
         logger.info("Initializing episode...")
         timestep = environment.reset()
         agent._actor.observe_first(timestep)
-
+        
         # b. Run episode
         while not timestep.last():
             # Agent selects an action
             action = agent.select_action(timestep.observation)
-            logger.info("ed %d: %s len %d act %d", episode, timestep.step_type, timestep.observation['program_length'], action)
+            # logger.info("ed %d: %s len %d act %d", episode, timestep.step_type, timestep.observation['program_length'], action)
             # Environment steps
             new_timestep = environment.step(action)
             # logger.info("New timestep:", new_timestep)
