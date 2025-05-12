@@ -34,7 +34,6 @@ class DistributionSupport(object):
         # based on proximity to the scalar.
         # input is B x 1
         # output needs to be B x num_bins
-        logger.debug("DistSup.scalar_to_two_hot scalar shape %s", scalar.shape)
         # first, calculate the steep size
         step = tf.cast(self.value_max / self.num_bins, tf.float32) # scalar step size
         # find the two closest bins

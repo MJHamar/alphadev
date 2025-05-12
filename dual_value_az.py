@@ -55,7 +55,6 @@ class DualValueAZLearner(AZLearner):
         inputs = next(self._iterator)
         # added c_t: correctness, l_t: latency reward terms. r_t = c_t*scale + l_t*scale
         o_t, _, rcl_t, d_t, o_tp1, extras = inputs.data
-        logger.debug("AZLearner._step: rcl_t %s", rcl_t.shape)
         r_t, c_t, l_t = rcl_t[:,0], rcl_t[:,1], rcl_t[:,2]
         
         pi_t = extras['pi']
@@ -126,6 +125,7 @@ class DualValueMCTSActor(MCTSActor):
         self._probs = probs.astype(np.float32)
 
         return action
+
 @dataclasses.dataclass
 class DvNode(search.Node):
     reward: np.ndarray = np.zeros((3,), dtype=np.float32)

@@ -682,7 +682,12 @@ class AssemblyGame(Environment):
         correctness_reward = self._task_spec.correctness_reward_weight * (
             self._num_hits - self._prev_num_hits
         )
+        if correctness_reward < 0:
+            correctness_reward = 0.0 # avoid negative rewards.
+        # NOTE: _is_correct is nonzero only if num_hits == max_num_hits.
+        # so in that case, correctness_reward is always positive
         correctness_reward += self._task_spec.correct_reward * self._is_correct
+        
         # update the previous correct items
         latency_reward = 0.0
         if include_latency: # cannot be <0 btw
@@ -691,9 +696,12 @@ class AssemblyGame(Environment):
                 latencies, self._task_spec.latency_quantile * 100
             ) * self._task_spec.latency_reward_weight
         reward = correctness_reward + latency_reward
-        
+        # if self._num_hits != self._prev_num_hits:
+        #     logger.debug(
+        #         "AssemblyGame._compute_reward: nh %s, pnh %s, r %s, l %s, c %s",
+        #         self._num_hits, self._prev_num_hits, reward, latency_reward, correctness_reward
+        #     )
         self._prev_num_hits = self._num_hits
-        
         return reward, latency_reward, correctness_reward
     
     def _make_observation(self) -> Dict[str, tf.Tensor]:
@@ -750,6 +758,7 @@ class AssemblyGame(Environment):
     def reset(self, state: Union[TimeStep, CPUState, None]=None) -> TimeStep:
         # deletes the program and resets the
         # CPU state to the original inputs
+        # logger.debug("AssemblyGame.reset: state is None %s", state is None)
         self._prev_num_hits = 0 # in eitheer case we need to reset this
         if state is None:
             self._emulator.reset_state()
@@ -763,7 +772,7 @@ class AssemblyGame(Environment):
                 ts_program = state.observation['program']
             else: # then it is a CPUState._asdict()
                 ts_program = state['program']
-            
+            # logger.debug("AssemblyGame.reset: ts_program shape %s", ts_program.shape)
             # either B x num_inputs x 3 or no batch dimension
             if len(ts_program.shape) > 2:
                 # we need to remove the batch dimension
@@ -785,6 +794,7 @@ class AssemblyGame(Environment):
         return self._update_state()
     
     def step(self, action:int) -> TimeStep:
+        # logger.debug("AssemblyGame.step: action %s", action)
         action_space = self._action_space_storage.get_space()
         # append the action to the program
         action_np = action_space.get_np(action)
@@ -1323,7 +1333,7 @@ class RepresentationNet(snn.Module):
         # logger.debug("make_locations_encoding_onehot shapes %s", str({k:v.shape for k,v in inputs['items']()}))
         memory = inputs['memory'] # B x E x M (batch, num_inputs, memory size)
         registers = inputs['registers'] # B x E x R (batch, num_inputs, register size)
-        logger.debug("registers shape %s, memory shape %s", registers.shape, memory.shape)
+        # logger.debug("registers shape %s, memory shape %s", registers.shape, memory.shape)
         # NOTE: originall implementation suggests the shape [B, H, P, D]
         # where we can only assume that 
         #   B - batch,
@@ -1345,13 +1355,13 @@ class RepresentationNet(snn.Module):
 
         # One-hot encode the values in the memory and average everything across
         # permutations.
-        logger.debug("locations shape %s", locations.shape)
+        # logger.debug("locations shape %s", locations.shape)
         locations_onehot = tf.one_hot( # shape is now B x E x num_locations x num_locations
             locations, self._task_spec.num_locations, dtype=tf.float32
         )
-        logger.debug("locations_onehot shape %s", locations_onehot.shape)
+        # logger.debug("locations_onehot shape %s", locations_onehot.shape)
         locations_onehot = tf.reshape(locations_onehot, [batch_size, self._task_spec.num_inputs, -1])
-        logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
+        # logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
         return locations_onehot
 
     def _make_locations_encoding_binary(self, inputs, batch_size):
@@ -1586,6 +1596,7 @@ class AssemblyGameModel(models.Model):
             expects.
         """
         # environment will change here, so we might want to reset it.
+        # logger.debug("AssemblyGameModel: update")
         self._needs_reset = True
         def assert_timestep():
             # to save time, we only compare the program.
@@ -1604,13 +1615,14 @@ class AssemblyGameModel(models.Model):
                 # logger.error("AssemblyGameModel: timestep assertion error %s", e)
                 return False
         if assert_timestep():
-            self._environment.step(action)
+            return self._environment.step(action)
         else:
             # re-executes the program contained in the timestep
-            self._environment.reset(next_timestep)
+            return self._environment.reset(next_timestep)
     
     def reset(self, initial_state: Optional[CPUState] = None):
         """Resets the model, optionally to an initial state."""
+        # logger.debug("AssemblyGameModel: reset")
         self._needs_reset = False
         self._environment.reset(initial_state)
 
@@ -1628,6 +1640,7 @@ class AssemblyGameModel(models.Model):
     def observation_spec(self):
         return self._environment.observation_spec()
     def step(self, action):
+        # logger.debug("AssemblyGameModel: step") 
         return self._environment.step(action)
 
 # predictor net from JEPA
