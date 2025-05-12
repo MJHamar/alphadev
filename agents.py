@@ -28,13 +28,16 @@ from acme.tf import utils as tf2_utils
 from acme.tf import variable_utils as tf2_variable_utils
 from acme.utils import counting
 from acme.utils import loggers
+import acme.utils
+import acme.utils.observers
+import acme.utils.observers.base
 import dm_env
 import launchpad as lp
 import reverb
 import sonnet as snt
 
 import numpy as np
-from dual_value_az import DualValueAZLearner
+from dual_value_az import DualValueAZLearner, DualValueMCTSActor
 
 import logging
 logger = logging.getLogger(__name__)
@@ -87,16 +90,16 @@ class MCTS(agent.Agent):
     logger.debug("Finished creating variables for network")
 
     # Now create the agent components: actor & learner.
-    actor = acting.MCTSActor(
-        environment_spec=environment_spec,
-        model=model,
-        network=network,
-        discount=discount,
-        adder=adder,
-        num_simulations=num_simulations,
-    )
 
     if use_dual_value_network:
+        actor = DualValueMCTSActor(
+            environment_spec=environment_spec,
+            model=model,
+            network=network,
+            discount=discount,
+            adder=adder,
+            num_simulations=num_simulations,
+        )
         learner = DualValueAZLearner(
             network=network,
             optimizer=optimizer,
@@ -104,6 +107,14 @@ class MCTS(agent.Agent):
             discount=discount,
         )
     else:
+        actor = acting.MCTSActor(
+            environment_spec=environment_spec,
+            model=model,
+            network=network,
+            discount=discount,
+            adder=adder,
+            num_simulations=num_simulations,
+        )
         learner = learning.AZLearner(
             network=network,
             optimizer=optimizer,
@@ -145,6 +156,8 @@ class DistributedMCTS:
         environment_spec: Optional[specs.EnvironmentSpec] = None,
         save_logs: bool = False,
         variable_update_period: int = 1000,
+        logger: loggers.Logger = None,
+        observers: Optional[acme.utils.observers.base.EnvLoopObserver] = [],
     ):
 
         if environment_spec is None:
@@ -173,6 +186,17 @@ class DistributedMCTS:
         self._discount = discount
         self._save_logs = save_logs
         self._variable_update_period = variable_update_period
+        # set up logging
+        if logger is not None:
+            self._logger = logger
+        else:
+            self._logger = loggers.make_default_logger(
+                'distributed_mcts', time_delta=30.0, asynchronous=True)
+        
+        if not isinstance(self._logger, loggers.AsyncLogger):
+            self._logger = loggers.AsyncLogger(logger)
+        # save observers
+        self._observers = observers
 
     def replay(self):
         """The replay storage worker."""
@@ -218,6 +242,7 @@ class DistributedMCTS:
             discount=self._discount,
             dataset=dataset,
             optimizer=optimizer,
+            logger=self._logger,
             counter=counter,
         )
 
@@ -260,7 +285,12 @@ class DistributedMCTS:
         )
 
         # Create the loop to connect environment and agent.
-        return acme.EnvironmentLoop(environment, actor, counter)
+        return acme.EnvironmentLoop(
+            environment=environment,
+            actor=actor,
+            counter=counter,
+            logger=self._logger,
+            observers=self._observers)
 
     def evaluator(
         self,
@@ -291,10 +321,8 @@ class DistributedMCTS:
             num_simulations=self._num_simulations,
         )
 
-        # Create the run loop and return it.
-        logger = loggers.make_default_logger('evaluator')
         return acme.EnvironmentLoop(
-            environment, actor, counter=counter, logger=logger)
+            environment, actor, counter=counter, logger=self._logger, observers=self._observers)
 
     def build(self, name='MCTS'):
         """Builds the distributed agent topology."""

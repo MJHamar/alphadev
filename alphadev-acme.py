@@ -223,7 +223,7 @@ class AlphaDevConfig(object):
         self.hparams.value = ml_collections.ConfigDict()
         self.hparams.value_max = 3.0  # These two parameters are task / reward-
         self.hparams.value_num_bins = 301  # dependent and need to be adjusted.
-        self.hparams.categorical_value_loss = False # wheether to treat the value functions as a distribution
+        self.hparams.categorical_value_loss = True # wheether to treat the value functions as a distribution
 
         ### Training
         self.training_steps = 1000 #int(1000e3)
@@ -738,7 +738,8 @@ class AssemblyGame(Environment):
             # too many components in acme hard-code the structure of TimeStep, and not
             # everything supports reward to be a dictionary, so we concatenate
             # the reward components into a single tensor
-            reward=tf.constant(reward, dtype=tf.float32) if not self._observe_reward_components else tf.constant([reward, correctness, latency], dtype=tf.float32),
+            reward=tf.constant(reward, dtype=tf.float32) if not self._observe_reward_components else tf.constant(
+                np.asarray([reward, correctness, latency]), dtype=tf.float32),
             discount=tf.constant(1.0, dtype=tf.float32), # NOTE: not sure what discount here means.
             observation=observation,
             # skip latency and correctness

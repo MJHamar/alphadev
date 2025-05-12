@@ -1,5 +1,9 @@
 import tensorflow as tf
 
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
 class DistributionSupport(object):
 
     def __init__(self, value_max: float, num_bins: int):
@@ -30,12 +34,12 @@ class DistributionSupport(object):
         # based on proximity to the scalar.
         # input is B x 1
         # output needs to be B x num_bins
-        
+        logger.debug("DistSup.scalar_to_two_hot scalar shape %s", scalar.shape)
         # first, calculate the steep size
-        step = self.value_max / self.num_bins # scalar step size
+        step = tf.cast(self.value_max / self.num_bins, tf.float32) # scalar step size
         # find the two closest bins
-        scalar = tf.constant(scalar)
-        low_bin = tf.cast(tf.floor(scalar / step), tf.int32) # B x 1
+        scalar = tf.cast(scalar, tf.float32) # B x 1
+        low_bin = tf.cast(tf.floor(scalar / step), tf.float32) # B x 1
         high_bin = low_bin + 1 # B x 1
         # find prroximity to the bins
         low_bin_proximity = tf.abs(scalar - low_bin * step)
@@ -49,16 +53,15 @@ class DistributionSupport(object):
         # and index the second dimension of the output. 
         # the value of the output at these indices is defined by the low/high_bin_weight
         # vectors, which are also (num_bins,) in size.
-        
         two_hot = tf.zeros((scalar.shape[0], self.num_bins), dtype=tf.float32)
         two_hot = tf.tensor_scatter_nd_update(
             two_hot,
-            tf.stack([tf.range(scalar.shape[0]), low_bin], axis=1),
+            tf.stack([tf.range(scalar.shape[0]), tf.cast(low_bin, tf.int32)], axis=1),
             tf.cast(low_bin_weight, tf.float32),
         )
         two_hot = tf.tensor_scatter_nd_update(
             two_hot,
-            tf.stack([tf.range(scalar.shape[0]), high_bin], axis=1),
+            tf.stack([tf.range(scalar.shape[0]), tf.cast(high_bin, tf.int32)], axis=1),
             tf.cast(high_bin_weight, tf.float32),
         )
         
