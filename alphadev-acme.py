@@ -61,7 +61,7 @@ class CPUState(NamedTuple):
     program_counter: tf.Tensor # num_inputs x 1 array of program counters (in int32)
 
 class Program(NamedTuple):
-    npy_program: tf.Tensor # <max_program_size> x 3 (opcode, op1, op2)
+    npy_program: np.ndarray # <max_program_size> x 3 (opcode, op1, op2)
     asm_program: List[Callable[[int], Any]] # list of pseudo-asm instructions
     
     def __len__(self):
@@ -699,11 +699,11 @@ class AssemblyGame(Environment):
     def _make_observation(self) -> Dict[str, tf.Tensor]:
         # get the current state of the CPU
         return CPUState(
-            registers=tf.constant(self._emulator.registers),
-            active_registers=tf.constant(self._emulator.register_mask),
-            memory=tf.constant(self._emulator.memory),
-            active_memory=tf.constant(self._emulator.memory_mask),
-            program=tf.constant(self._program.npy_program),
+            registers=tf.constant(self._emulator.registers[:, :self._task_spec.num_regs], dtype=tf.int32),
+            active_registers=tf.constant(self._emulator.register_mask[:, :self._task_spec.num_regs], dtype=tf.bool),
+            memory=tf.constant(self._emulator.memory, dtype=tf.int32),
+            active_memory=tf.constant(self._emulator.memory_mask, dtype=tf.bool),
+            program=tf.constant(self._program.npy_program, dtype=tf.int32),
             program_length=tf.constant(len(self._program), dtype=tf.int32),
             program_counter=tf.constant(self._emulator.program_counter, dtype=tf.int32)
         )._asdict()
@@ -728,8 +728,12 @@ class AssemblyGame(Environment):
         # we can now compute the reward
         reward, latency, correctness = self._compute_reward(include_latency=is_terminal)
         
+        step_type = StepType.FIRST if len(self._program) == 0 else (
+                        StepType.MID if not is_terminal else
+                            StepType.LAST)
+        
         ts = TimeStep(
-            step_type=StepType.MID if not is_terminal else StepType.LAST,
+            step_type=step_type,
             # too many components in acme hard-code the structure of TimeStep, and not
             # everything supports reward to be a dictionary, so we concatenate
             # the reward components into a single tensor
@@ -782,7 +786,8 @@ class AssemblyGame(Environment):
         action_np = action_space.get_np(action)
         action_asm = action_space.get_asm(action)
         
-        updated_program = self._program.npy_program[len(self._program),:] = action_np
+        updated_program = self._program.npy_program.copy()
+        updated_program[len(self._program),:] = action_np
         self._program = Program(
             npy_program=updated_program,
             asm_program=self._program.asm_program + [action_asm] # preserves immutability
@@ -832,9 +837,9 @@ class AssemblyGame(Environment):
         new_game._max_num_hits = self._max_num_hits
         new_game._action_space_storage = self._action_space_storage
         # copy the two mutable parts of the state
-        new_game._emulator = self._emulator.copy()
-        new_game._program = self._program.copy()
+        new_game._emulator = self._emulator.clone()
         # these are also 'immmutable'
+        new_game._program = self._program
         new_game._last_ts = self._last_ts
         new_game._is_correct = self._is_correct
         new_game._num_hits = self._num_hits
@@ -861,6 +866,16 @@ class MultiQueryAttentionBlock(snn.Module):
         self.num_heads = attention_params.num_heads
         self.attention_dropout = attention_params.attention_dropout
         self.position_encoding = attention_params.position_encoding
+        
+        self.P_q = snn.Linear(self.num_heads * self.head_depth, name='P_q')
+        self.P_k = snn.Linear(self.head_depth, name='P_k')
+        self.P_v = snn.Linear(self.head_depth, name='P_v')
+        self.P_o = snn.Linear(self.num_heads * self.head_depth, name='P_o')
+        if self.attention_dropout:
+            self.attention_dropout = snn.Dropout(self.attention_dropout, name='attn_dropout')
+        else:
+            self.attention_dropout = None
+        
     
     def __call__(self, inputs, encoded_state=None):
         """
@@ -892,53 +907,32 @@ class MultiQueryAttentionBlock(snn.Module):
             Y = tf.einsum ( "bhnv , hdv->bnd " , O, P_o)
             return Y
         """
+        *leading_dims, _ = inputs.shape # B x N x D
+        # logger.debug("MQAB: inputs shape %s", inputs.shape)
         # P_q, P_k, P_v, P_o are parameters, which we declare here
-        Q = self._linear_projection(inputs, self.num_heads, self.head_depth, name='P_q') # B x N x H x K
-        K = self._linear_projection(inputs, 1, self.head_depth, name='P_k') # B x M x K
-        V = self._linear_projection(inputs, 1, self.head_depth, name='P_v') # B x M x V
+        Q = self.P_q(inputs)
+        # logger.debug("MQAB: Q shape %s, reshaping to %s", Q.shape, (*leading_dims, self.num_heads, self.head_depth))
+        Q = tf.reshape(Q, (*leading_dims, self.num_heads, self.head_depth)) # B x N x H x K
+        K = self.P_k(inputs)
+        K = tf.reshape(K, (*leading_dims, self.head_depth)) # B x M x K
+        V = self.P_v(inputs)
+        V = tf.reshape(V, (*leading_dims, self.head_depth)) # B x M x V
         
-        # logger.debug("MQAB: logits einsum Q (bnhk) %s, K (bmk) %s -> bhnm", Q.shape, K.shape)
         logits = tf.einsum("bnhk,bmk->bhnm", Q, K) # B x N x H x M
-        # logger.debug("MQAB: logits shape (bhnm) %s", logits.shape)
         weights = tf.nn.softmax(logits) # NOTE: no causal masking, this is an encoder block
-        # logger.debug("MQAB: weights shape (bhnm) %s", weights.shape)
         if self.attention_dropout: # boolean
-            # logger.debug("MQAB: applying attention dropout %s", self.attention_dropout)
             weights = snn.Dropout(self.attention_dropout, name='attn_dropout')(weights)
-        # logger.debug("MQAB: output projection einsum weights (bhnm) %s, V (bmv) %s -> bhnv", weights.shape, V.shape)
         O = tf.einsum("bhnm,bmv->bhnv", weights, V) # B x N x H x V
-        # logger.debug("MQAB: O shape (bhnv) %s", O.shape)
-        B, _, N, _ = O.shape # B x H x N x V
-        # reshape O to B x N x (H*V)
-        O = tf.reshape(O, (B, N, -1)) # B x N x (H*V)
-        # logger.debug("MQAB: O reshaped to %s", O.shape)
         # apply the output projection
-        # logger.debug("MQAB: aggregate head projection bn[h*v] %s to bnd %s ", O.shape, inputs.shape)
-        Y = self._linear_projection(O, 1, inputs.shape[-1], name='P_o') # B x N x V
-        # logger.debug("MQAB: output shape (bnd) %s", Y.shape)
+        # logger.debug("MQAB: O shape %s, reshaping to %s", O.shape, (*leading_dims, self.num_heads * self.head_depth))
+        O = tf.reshape(O, (*leading_dims, self.num_heads * self.head_depth)) # B x N x H*V
+        Y = self.P_o(O) # B x N x V
+        
         assert Y.shape == inputs.shape,\
             f"Output shape {Y.shape} does not match input shape {inputs.shape}."
         
         return Y # B x N x D
     
-    def _linear_projection(
-        self,
-        x: tf.Tensor, # [B, N, D] (batch, seqence length, embedding dim)
-        num_heads: int,
-        head_size: int,
-        name: str | None = None,
-    ) -> tf.Tensor:
-        """Copy-paste from hk.MultiHeadAttention."""
-        y = snn.Linear(num_heads * head_size, name=name)(x) # proj mat. D x (H*K) 
-        # y should be [B, N, H*K]
-        assert y.ndim == 3, f"y should be 3D, but got {y.ndim}D"
-        assert y.shape[-1] == num_heads * head_size, f"y should be of shape [B, N, H*K], but got {y.shape}"
-        *leading_dims, _ = x.shape # [B, N, D]
-        # split last dimension (H*K) into H, K
-        new_shape = (*leading_dims, num_heads, head_size) if num_heads > 1 else (*leading_dims, head_size)
-        # logger.debug("linear_projection, reshaping y from %s to %s", y.shape, new_shape)
-        return tf.reshape(y, new_shape) # [B, N, H, K] or [B, N, K]
-
     @staticmethod
     def sinusoid_position_encoding(seq_size, feat_size):
         """Compute sinusoid absolute position encodings, 
@@ -1084,6 +1078,57 @@ class RepresentationNet(snn.Module):
         self._hparams = hparams
         self._task_spec = task_spec
         self._embedding_dim = embedding_dim
+        
+        self.program_mlp_embedder = snn.Sequential(
+            [
+                snn.Linear(self._embedding_dim), # (nF + 2*nL) x D -- input size is decided automatically
+                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+                tf.nn.relu,
+                snn.Linear(self._embedding_dim), # D x D
+            ],
+            name='per_instruction_program_embedder',
+        )
+        attention_params = self._hparams.representation.attention
+        make_attention_block = functools.partial(
+            MultiQueryAttentionBlock, attention_params
+        )
+        self.attention_encoders = snn.Sequential([
+            make_attention_block(name=f'attention_program_sequencer_{i}')
+            for i in range(self._hparams.representation.attention_num_layers)
+        ], name='program_attention')
+        
+        self.locations_embedder = snn.Sequential(
+            [
+                # input is embedding_dim size, because we already encoded in either one-hot or binary
+                snn.Linear(self._embedding_dim),
+                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+                tf.nn.relu,
+                snn.Linear(self._embedding_dim),
+            ],
+            name='per_locations_embedder',
+        )
+        self.all_locations_net = snn.Sequential(
+            [
+                snn.Linear(self._embedding_dim),
+                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+                tf.nn.relu,
+                snn.Linear(self._embedding_dim),
+            ],
+            name='per_element_embedder',
+        )
+        self.joint_locations_net = snn.Sequential(
+            [
+                snn.Linear(self._embedding_dim),
+                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
+                tf.nn.relu,
+                snn.Linear(self._embedding_dim),
+            ],
+            name='joint_embedder',
+        )
+        self.joint_resnet = snn.Sequential([
+            ResBlockV2(self._embedding_dim, name=f'joint_resblock_{i}')
+            for i in range(self._hparams.representation.repr_net_res_blocks)
+        ], name='joint_resnet')
 
     def __call__(self, inputs: CPUState):
         # logger.debug("representation_net program shape %s", inputs['program'].shape)
@@ -1125,6 +1170,7 @@ class RepresentationNet(snn.Module):
     def _encode_program(self, inputs: CPUState, batch_size):
         # logger.debug("encode_program shape %s", inputs['program'].shape)
         program = inputs['program']
+        logger.debug("encode_program: program shape %s", program.shape)
         max_program_size = inputs['program'].shape[1] # TODO: this might not be a constant
         program_length = tf.cast(inputs['program_length'], tf.int32)
         program_onehot = self.make_program_onehot(
@@ -1144,24 +1190,8 @@ class RepresentationNet(snn.Module):
         program_encoding,
         batch_size,
     ):
-        # note that Haiku passes the parameters to the entire class
-        # when apply() is called on it. So don't look for parameters here.
-        locations_embedder = snn.Sequential(
-            [
-                # input is embedding_dim size, because we already encoded in either one-hot or binary
-                snn.Linear(self._embedding_dim),
-                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-                tf.nn.relu,
-                snn.Linear(self._embedding_dim),
-            ],
-            name='per_locations_embedder',
-        )
-
-        # locations_encoding.shape == [B, P, D] so map embedder across locations to
-        # share weights
-        # logger.debug("aggregate_locations_program: locations_encoding shape %s", locations_encoding.shape)
-        
-        locations_embedding = tf.vectorized_map(locations_embedder, locations_encoding)
+        logger.debug("aggregate_locations_program: locations_encoding shape %s", locations_encoding.shape)
+        locations_embedding = tf.vectorized_map(self.locations_embedder, locations_encoding)
         # logger.debug("aggregate_locations_program: locations_embedding shape %s", locations_embedding.shape)
 
         # broadcast the program encoding for each example.
@@ -1189,40 +1219,16 @@ class RepresentationNet(snn.Module):
         return program_encoding
 
     def apply_joint_embedder(self, grouped_representation, batch_size):
-        all_locations_net = snn.Sequential(
-            [
-                snn.Linear(self._embedding_dim),
-                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-                tf.nn.relu,
-                snn.Linear(self._embedding_dim),
-            ],
-            name='per_element_embedder',
-        )
-        joint_locations_net = snn.Sequential(
-            [
-                snn.Linear(self._embedding_dim),
-                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-                tf.nn.relu,
-                snn.Linear(self._embedding_dim),
-            ],
-            name='joint_embedder',
-        )
-        joint_resnet = [
-            ResBlockV2(self._embedding_dim, name=f'joint_resblock_{i}')
-            for i in range(self._hparams.representation.repr_net_res_blocks)
-        ]
-
         assert grouped_representation.shape[:2] == (batch_size, self._task_spec.num_inputs), \
             f"grouped_representation shape {grouped_representation.shape[:2]} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
-        logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
+        # logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
         # apply MLP to the combined program and locations embedding
-        permutations_encoded = all_locations_net(grouped_representation)
-        logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
+        permutations_encoded = self.all_locations_net(grouped_representation)
+        # logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
         # Combine all permutations into a single vector using a ResNetV2
-        joint_encoding = joint_locations_net(tf.reduce_mean(permutations_encoded, axis=1, keepdims=True))
-        logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
-        for net in joint_resnet:
-            joint_encoding = net(joint_encoding)
+        joint_encoding = self.joint_locations_net(tf.reduce_mean(permutations_encoded, axis=1, keepdims=True))
+        # logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
+        joint_encoding = self.joint_resnet(joint_encoding)
         return joint_encoding[:, 0, :] # remove the extra dimension
 
     def make_program_onehot(self, program, batch_size, max_program_size):
@@ -1260,8 +1266,8 @@ class RepresentationNet(snn.Module):
         )
 
         program_length_onehot = tf.one_hot(program_length, max_program_size + 1)
-        logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
-        logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
+        # logger.debug("pad_program_encoding pre program_length_onehot shape %s", program_length_onehot.shape)
+        # logger.debug("pad_program_encoding pre program_encoding shape %s", program_encoding.shape)
         # two cases here:
         # - program length is a batch of scalars corr. to the program length
         # - program length is a batch of vectors (of len num_inputs) corr. to the state of the program counters
@@ -1273,28 +1279,12 @@ class RepresentationNet(snn.Module):
             program_encoding = tf.einsum(
                 'bnd,bn->bd', program_encoding, program_length_onehot
             )
-        logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
+        # logger.debug("pad_program_encoding post program_encoding shape %s", program_encoding.shape)
 
         return program_encoding
 
     def apply_program_mlp_embedder(self, program_encoding):
-        # input: B x P x (num_funcs + 2 * num_locations)
-        # output: B x P x embedding_dim
-        # P is the program length
-        # logger.debug("apply_program_mlp_embedder program shape %s, embedding_dim %s", program_encoding.shape, self._embedding_dim)
-        program_embedder = snn.Sequential(
-            [
-                snn.Linear(self._embedding_dim), # (nF + 2*nL) x D -- input size is decided automatically
-                snn.LayerNorm(axis=-1, create_scale=True, create_offset=True),
-                tf.nn.relu,
-                snn.Linear(self._embedding_dim), # D x D
-            ],
-            name='per_instruction_program_embedder',
-        )
-        # logger.debug("program.shape %s -->", program_encoding.shape)
-        # logger.debug("  program_embedder %s", program_embedder)
-        program_encoding = program_embedder(program_encoding)
-        # logger.debug("program_encoding shape %s <--", program_encoding.shape)
+        program_encoding = self.program_mlp_embedder(program_encoding)
         return program_encoding
 
     def apply_program_attention_embedder(self, program_encoding):
@@ -1309,14 +1299,6 @@ class RepresentationNet(snn.Module):
         assert d == self._embedding_dim, (
             f"program encoding dim {d} does not match embedding dim {self._embedding_dim}"
         ) 
-        attention_params = self._hparams.representation.attention
-        make_attention_block = functools.partial(
-            MultiQueryAttentionBlock, attention_params
-        )
-        attention_encoders = [
-            make_attention_block(name=f'attention_program_sequencer_{i}')
-            for i in range(self._hparams.representation.attention_num_layers)
-        ]
 
         *_, seq_size, feat_size = program_encoding.shape
 
@@ -1328,10 +1310,7 @@ class RepresentationNet(snn.Module):
         )
         program_encoding = tf.add(program_encoding, position_encodings)
 
-        for e in attention_encoders:
-            # logger.debug("apply_program_attention_embedder layer %s", e.name)
-            program_encoding = e(program_encoding, encoded_state=None)
-        # logger.debug("apply_program_attention_embedder post MQAB %s", program_encoding.shape)
+        program_encoding = self.attention_encoders(program_encoding)
 
         return program_encoding
 
@@ -1340,6 +1319,7 @@ class RepresentationNet(snn.Module):
         # logger.debug("make_locations_encoding_onehot shapes %s", str({k:v.shape for k,v in inputs['items']()}))
         memory = inputs['memory'] # B x E x M (batch, num_inputs, memory size)
         registers = inputs['registers'] # B x E x R (batch, num_inputs, register size)
+        logger.debug("registers shape %s, memory shape %s", registers.shape, memory.shape)
         # NOTE: originall implementation suggests the shape [B, H, P, D]
         # where we can only assume that 
         #   B - batch,
@@ -1361,12 +1341,13 @@ class RepresentationNet(snn.Module):
 
         # One-hot encode the values in the memory and average everything across
         # permutations.
+        logger.debug("locations shape %s", locations.shape)
         locations_onehot = tf.one_hot( # shape is now B x E x num_locations x num_locations
             locations, self._task_spec.num_locations, dtype=tf.float32
         )
-        # logger.debug("locations_onehot shape %s", locations_onehot.shape)
+        logger.debug("locations_onehot shape %s", locations_onehot.shape)
         locations_onehot = tf.reshape(locations_onehot, [batch_size, self._task_spec.num_inputs, -1])
-        # logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
+        logger.debug("locations_onehot reshaped to %s", locations_onehot.shape)
         return locations_onehot
 
     def _make_locations_encoding_binary(self, inputs, batch_size):
@@ -1449,20 +1430,18 @@ class PredictionNet(snn.Module):
         self.value_num_bins = value_num_bins
         self.support = DistributionSupport(self.value_max, self.value_num_bins)
         self.embedding_dim = embedding_dim
-
-    def __call__(self, embedding: tf.Tensor):
-        # logger.debug("PredictionNet: embedding shape %s", embedding.shape)
-        policy_head = make_head_network(
+        
+        self.policy_head = make_head_network(
             self.embedding_dim, self.task_spec.num_actions
         )
-        # logger.debug("PredictionNet: policy_head %s", policy_head)
-        value_head = CategoricalHead(self.embedding_dim, self.support)
-        # logger.debug("PredictionNet: value_head %s", value_head)
-        latency_value_head = CategoricalHead(self.embedding_dim, self.support)
+        self.value_head = CategoricalHead(self.embedding_dim, self.support)
+        self.latency_value_head = CategoricalHead(self.embedding_dim, self.support)
+
+    def __call__(self, embedding: tf.Tensor):
         # logger.debug("PredictionNet: latency_value_head %s", latency_value_head)
-        correctness_value = value_head(embedding)
+        correctness_value = self.value_head(embedding)
         # logger.debug("PredictionNet: correctness_value shape %s", str({k:v.shape for k, v in correctness_value.items()}))
-        latency_value = latency_value_head(embedding)
+        latency_value = self.latency_value_head(embedding)
         # logger.debug("PredictionNet: latency_value shape %s", str({k:v.shape for k, v in latency_value.items()}))
 
         # embedding is B x embedding_dim
@@ -1478,7 +1457,7 @@ class PredictionNet(snn.Module):
         #     logger.debug("PredictionNet.distr_check: embedding min %s, max %s mean %s std %s", embedding_min, embedding_max, embedding_mean, embedding_std)
         if len(embedding.shape) == 2:
             embedding = tf.expand_dims(embedding, axis=1)
-        policy = policy_head(embedding) # B x num_actions
+        policy = self.policy_head(embedding) # B x num_actions
         policy = tf.reshape(policy, (-1, self.task_spec.num_actions)) # B x num_actions
         # similarly, the policy should be close to a uniform distribution
         # with a mean of 1/num_actions
@@ -1642,7 +1621,7 @@ class AssemblyGameModel(models.Model):
         return self._environment.discount_spec()
     def observation_spec(self):
         return self._environment.observation_spec()
-    def step(self, acttion):
+    def step(self, action):
         return self._environment.step(action)
 
 # predictor net from JEPA
@@ -1655,9 +1634,8 @@ config: AlphaDevConfig = AlphaDevConfig()
 env_spec = make_environment_spec(AssemblyGame(config.task_spec))
 
 def environment_factory(): # no args
-    return AssemblyGameModel(
+    return AssemblyGame(
         task_spec=config.task_spec,
-        name='AssemblyGameEnvironment',
     )
 
 def network_factory(env_spec: DiscreteArray): 
@@ -1726,28 +1704,28 @@ if __name__ == '__main__':
     num_episodes = 100  # Example number of episodes
     for episode in range(num_episodes):
         # a. Reset environment and agent at start of episode
-        print("Initializing episode...")
+        logger.info("Initializing episode...")
         timestep = environment.reset()
-        agent.actor.reset()
+        agent._actor.observe_first(timestep)
 
         # b. Run episode
         while not timestep.last():
-            print("Current timestep:", timestep.step_type)
+            logger.info("Current timestep: %s", timestep.step_type)
             # Agent selects an action
             action = agent.select_action(timestep.observation)
-            print("Selected action:", action)
+            logger.info("Selected action: %s", action)
             # Environment steps
             new_timestep = environment.step(action)
-            # print("New timestep:", new_timestep)
+            # logger.info("New timestep:", new_timestep)
             # Agent observes the result
             agent.observe(action=action, next_timestep=new_timestep)
             # Update timestep
             timestep = new_timestep
 
         # c. Train the learner
-        print("Final timestep reached: ", timestep.step_type)
-        print("Training agent...")
+        logger.info("Final timestep reached: %s", timestep.step_type)
+        logger.info("Training agent...")
         agent.learner.step()
 
         # d. Log training information (optional)
-        print(f"Episode {episode + 1}/{num_episodes} completed.")
+        logger.info(f"Episode {episode + 1}/{num_episodes} completed.")
