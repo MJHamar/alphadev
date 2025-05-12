@@ -687,7 +687,7 @@ class AssemblyGame(Environment):
         latency_reward = 0.0
         if include_latency: # cannot be <0 btw
             latencies = self._eval_latency()
-            latency_reward = tfp.stats(
+            latency_reward = tfp.stats.percentile(
                 latencies, self._task_spec.latency_quantile * 100
             ) * self._task_spec.latency_reward_weight
         reward = correctness_reward + latency_reward
@@ -710,7 +710,8 @@ class AssemblyGame(Environment):
     
     def _check_invalid(self) -> bool:
         # either too long or the emulator is in an invalid state
-        return len(self._program) > self._task_spec.max_program_size or \
+        logger.debug("AssemblyGame._check_invalid: len %s, inval %s", len(self._program), len(self._program) >= self._task_spec.max_program_size)
+        return len(self._program) >= self._task_spec.max_program_size or \
             False # TODO: self._emulator.invalid()
     
     def _update_state(self):
@@ -737,8 +738,8 @@ class AssemblyGame(Environment):
             # too many components in acme hard-code the structure of TimeStep, and not
             # everything supports reward to be a dictionary, so we concatenate
             # the reward components into a single tensor
-            reward=reward if not self._observe_reward_components else tf.constant([reward, correctness, latency], dtype=tf.float32),
-            discount=1.0, # NOTE: not sure what discount here means.
+            reward=tf.constant(reward, dtype=tf.float32) if not self._observe_reward_components else tf.constant([reward, correctness, latency], dtype=tf.float32),
+            discount=tf.constant(1.0, dtype=tf.float32), # NOTE: not sure what discount here means.
             observation=observation,
             # skip latency and correctness
         )
@@ -769,7 +770,7 @@ class AssemblyGame(Environment):
                 ts_program = tf.squeeze(ts_program, axis=0)
 
             # convert the numpy program to a list of assembly instructions
-            asm_program = self._action_space_storage.npy_to_asm(ts_program)
+            asm_program = self._action_space_storage.npy_to_asm(ts_program.numpy())
             self._program = Program(
                 npy_program=ts_program.numpy(),
                 asm_program=asm_program,
@@ -806,9 +807,9 @@ class AssemblyGame(Environment):
         return Array(shape=(), dtype=np.float32)
     def observation_spec(self):
         return CPUState(
-            registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.float32),
+            registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.int32),
             active_registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.bool_),
-            memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.float32),
+            memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.int32),
             active_memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.bool_),
             program=Array(shape=(self._task_spec.max_program_size, 3), dtype=np.int32),
             program_length=Array(shape=(), dtype=np.int32),
@@ -836,6 +837,7 @@ class AssemblyGame(Environment):
         new_game._outputs = self._outputs
         new_game._max_num_hits = self._max_num_hits
         new_game._action_space_storage = self._action_space_storage
+        new_game._observe_reward_components = self._observe_reward_components
         # copy the two mutable parts of the state
         new_game._emulator = self._emulator.clone()
         # these are also 'immmutable'
@@ -844,6 +846,7 @@ class AssemblyGame(Environment):
         new_game._is_correct = self._is_correct
         new_game._num_hits = self._num_hits
         new_game._is_invalid = self._is_invalid
+        new_game._prev_num_hits = self._prev_num_hits
         return new_game
 
 # #################
@@ -1210,12 +1213,12 @@ class RepresentationNet(snn.Module):
         return self.apply_joint_embedder(grouped_representation, batch_size)
 
     def repeat_program_encoding(self, program_encoding, batch_size):
-        # logger.debug("aggregate_locations_program: repeat_program_encoding pre shape %s", program_encoding.shape)
+        logger.debug("aggregate_locations_program: repeat_program_encoding pre shape %s", program_encoding.shape)
         program_encoding = tf.broadcast_to(
             program_encoding,
             [batch_size, self._task_spec.num_inputs, program_encoding.shape[-1]],
         )
-        # logger.debug("aggregate_locations_program: repeat_program_encoding post shape %s", program_encoding.shape)
+        logger.debug("aggregate_locations_program: repeat_program_encoding post shape %s", program_encoding.shape)
         return program_encoding
 
     def apply_joint_embedder(self, grouped_representation, batch_size):
@@ -1552,11 +1555,13 @@ class AssemblyGameModel(models.Model):
     
     def load_checkpoint(self):
         """Loads a saved model state, if it exists."""
-        self.needs_reset = False
-        return self._ckpt
+        self._needs_reset = False
+        logger.debug("AssemblyGameModel.load_checkpoint w. pl %d", len(self._ckpt._program))
+        self._environment = self._ckpt.copy()
 
     def save_checkpoint(self):
         """Saves the model state so that we can reset it after a rollout."""
+        logger.debug("AssemblyGameModel.save_checkpoint w. pl %d", len(self._environment._program))
         self._ckpt = self._environment.copy() # TODO: implement
 
     def update(
@@ -1586,14 +1591,19 @@ class AssemblyGameModel(models.Model):
         def assert_timestep():
             # to save time, we only compare the program.
             # it deterministically defines the rest.
-            tf.assert_equal(
-                timestep.observation['program'],
-                self._environment._last_ts.observation['program'],
-                message=(
-                    f"timestep {timestep.observation['program']} does not match "
-                    f"environment {self._environment._last_ts.observation['program']}"
-                ),
-            )
+            try:
+                tf.assert_equal(
+                    timestep.observation['program'],
+                    self._environment._last_ts.observation['program'],
+                    message=(
+                        f"timestep {timestep.observation['program']} does not match "
+                        f"environment {self._environment._last_ts.observation['program']}"
+                    ),
+                )
+                return True
+            except tf.errors.InvalidArgumentError as e:
+                # logger.error("AssemblyGameModel: timestep assertion error %s", e)
+                return False
         if assert_timestep():
             self._environment.step(action)
         else:
@@ -1603,10 +1613,7 @@ class AssemblyGameModel(models.Model):
     def reset(self, initial_state: Optional[CPUState] = None):
         """Resets the model, optionally to an initial state."""
         self._needs_reset = False
-        if initial_state is not None:
-            self._environment.reset(initial_state) #TODO
-        else:
-            self._environment.reset()
+        self._environment.reset(initial_state)
 
     @property
     def needs_reset(self) -> bool:
@@ -1690,9 +1697,9 @@ agent = MCTS(
     network=network_factory(None),
     model=model_factory(None),
     optimizer=optimizer_factory(),
-    n_step=config.training_steps,
+    n_step=config.td_steps,
     discount=config.discount,
-    replay_capacity=config.td_steps,
+    replay_capacity=config.td_steps * 10, # TODO
     num_simulations=config.num_simulations,
     environment_spec=make_environment_spec(AssemblyGame(config.task_spec)),
     batch_size=config.batch_size,
@@ -1701,7 +1708,7 @@ agent = MCTS(
 
 if __name__ == '__main__':
     environment = environment_factory()
-    num_episodes = 100  # Example number of episodes
+    num_episodes = 100
     for episode in range(num_episodes):
         # a. Reset environment and agent at start of episode
         logger.info("Initializing episode...")
@@ -1710,10 +1717,9 @@ if __name__ == '__main__':
 
         # b. Run episode
         while not timestep.last():
-            logger.info("Current timestep: %s", timestep.step_type)
             # Agent selects an action
             action = agent.select_action(timestep.observation)
-            logger.info("Selected action: %s", action)
+            logger.info("ed %d: %s len %d act %d", episode, timestep.step_type, timestep.observation['program_length'], action)
             # Environment steps
             new_timestep = environment.step(action)
             # logger.info("New timestep:", new_timestep)
@@ -1723,9 +1729,9 @@ if __name__ == '__main__':
             timestep = new_timestep
 
         # c. Train the learner
-        logger.info("Final timestep reached: %s", timestep.step_type)
+        logger.info("Final timestep reached: %s reward: %s", timestep.step_type, timestep.reward.numpy())
         logger.info("Training agent...")
-        agent.learner.step()
+        agent._learner.step()
 
         # d. Log training information (optional)
         logger.info(f"Episode {episode + 1}/{num_episodes} completed.")
