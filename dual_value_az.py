@@ -219,4 +219,20 @@ def dv_mcts(
             node.total_value += ret
             node.visit_count += 1
 
+    # count the number of expanded nodes using BFS
+    # queue = [root]
+    # expanded_nodes = 0
+    # max_num_expanded_children = 0
+    # while queue:
+    #     node = queue.pop(0)
+    #     if node.children:
+    #         expanded_nodes += 1
+    #         num_children = 0
+    #         for c in node.children.values():
+    #             if c.children:
+    #                 num_children += 1
+    #                 queue.append(c)
+    #         max_num_expanded_children = max(max_num_expanded_children, num_children)
+    # logger.debug("MCTS Expanded %d nodes. max expanded children: %d", expanded_nodes, max_num_expanded_children)
+
     return root
