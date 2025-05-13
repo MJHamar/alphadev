@@ -14,7 +14,7 @@
 
 """Defines the distributed MCTS agent topology via Launchpad."""
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 import acme
 from acme import datasets
@@ -41,105 +41,114 @@ import numpy as np
 from dual_value_az import DualValueAZLearner, DualValueMCTSActor
 from acting import MCTSActor
 from search import PUCTSearchPolicy
+from observers import MCTSObserver
 
 import logging
 logger = logging.getLogger(__name__)
 
 class MCTS(agent.Agent):
-  """A single-process MCTS agent."""
+    """A single-process MCTS agent."""
 
-  def __init__(
-      self,
-      network: snt.Module,
-      model: models.Model,
-      optimizer: snt.Optimizer,
-      search_policy: Callable[[search.Node], types.Action],
-      temperature_fn: Callable[[int], float],
-      n_step: int,
-      discount: float,
-      replay_capacity: int,
-      num_simulations: int,
-      environment_spec: specs.EnvironmentSpec,
-      batch_size: int,
-      use_dual_value_network: bool = False,
-      logger: loggers.Logger = None,
-  ):
+    def __init__(
+        self,
+        network: snt.Module,
+        model: models.Model,
+        optimizer: snt.Optimizer,
+        search_policy: Callable[[search.Node], types.Action],
+        temperature_fn: Callable[[int], float],
+        n_step: int,
+        discount: float,
+        replay_capacity: int,
+        num_simulations: int,
+        environment_spec: specs.EnvironmentSpec,
+        batch_size: int,
+        use_dual_value_network: bool = False,
+        logger: loggers.Logger = None,
+        mcts_observers: Optional[Sequence[MCTSObserver]] = [],
+    ):
 
-    extra_spec = {
-        'pi':
-            specs.Array(
-                shape=(environment_spec.actions.num_values,), dtype=np.float32)
-    }
-    # Create a replay server for storing transitions.
-    replay_table = reverb.Table(
-        name=adders.DEFAULT_PRIORITY_TABLE,
-        sampler=reverb.selectors.Uniform(),
-        remover=reverb.selectors.Fifo(),
-        max_size=replay_capacity,
-        rate_limiter=reverb.rate_limiters.MinSize(1),
-        signature=adders.NStepTransitionAdder.signature(
-            environment_spec, extra_spec))
-    self._server = reverb.Server([replay_table], port=None)
+        extra_spec = {
+            'pi':
+                specs.Array(
+                    shape=(environment_spec.actions.num_values,), dtype=np.float32)
+        }
+        # Create a replay server for storing transitions.
+        replay_table = reverb.Table(
+            name=adders.DEFAULT_PRIORITY_TABLE,
+            sampler=reverb.selectors.Uniform(),
+            remover=reverb.selectors.Fifo(),
+            max_size=replay_capacity,
+            rate_limiter=reverb.rate_limiters.MinSize(1),
+            signature=adders.NStepTransitionAdder.signature(
+                environment_spec, extra_spec))
+        self._server = reverb.Server([replay_table], port=None)
 
-    # The adder is used to insert observations into replay.
-    address = f'localhost:{self._server.port}'
-    adder = adders.NStepTransitionAdder(
-        client=reverb.Client(address),
-        n_step=n_step,
-        discount=discount)
+        # The adder is used to insert observations into replay.
+        address = f'localhost:{self._server.port}'
+        adder = adders.NStepTransitionAdder(
+            client=reverb.Client(address),
+            n_step=n_step,
+            discount=discount)
 
-    # The dataset provides an interface to sample from replay.
-    dataset = datasets.make_reverb_dataset(server_address=address)
-    dataset = dataset.batch(batch_size, drop_remainder=True)
+        # The dataset provides an interface to sample from replay.
+        dataset = datasets.make_reverb_dataset(server_address=address)
+        dataset = dataset.batch(batch_size, drop_remainder=True)
 
-    tf2_utils.create_variables(network, [environment_spec.observations])
+        tf2_utils.create_variables(network, [environment_spec.observations])
 
-    # Now create the agent components: actor & learner.
+        # Now create the agent components: actor & learner.
+        counter = counting.Counter(None)
 
-    if use_dual_value_network:
-        actor = DualValueMCTSActor(
-            environment_spec=environment_spec,
-            model=model,
-            network=network,
-            discount=discount,
-            adder=adder,
-            num_simulations=num_simulations,
-            search_policy=search_policy,
-            temperature_fn=temperature_fn,
+        if use_dual_value_network:
+            actor = DualValueMCTSActor(
+                environment_spec=environment_spec,
+                model=model,
+                network=network,
+                discount=discount,
+                adder=adder,
+                num_simulations=num_simulations,
+                search_policy=search_policy,
+                temperature_fn=temperature_fn,
+                counter=counter,
+                observers=mcts_observers,
+            )
+            learner = DualValueAZLearner(
+                network=network,
+                optimizer=optimizer,
+                dataset=dataset,
+                discount=discount,
+                logger=logger,
+                counter=counter,
+            )
+        else:
+            actor = MCTSActor(
+                environment_spec=environment_spec,
+                model=model,
+                network=network,
+                discount=discount,
+                adder=adder,
+                num_simulations=num_simulations,
+                search_policy=search_policy,
+                temperature_fn=temperature_fn,
+                counter=counter,
+                observers=mcts_observers,
+            )
+            learner = learning.AZLearner(
+                network=network,
+                optimizer=optimizer,
+                dataset=dataset,
+                discount=discount,
+                logger=logger,
+                counter=counter,
+            )
+
+        # The parent class combines these together into one 'agent'.
+        super().__init__(
+            actor=actor,
+            learner=learner,
+            min_observations=10,
+            observations_per_step=1,
         )
-        learner = DualValueAZLearner(
-            network=network,
-            optimizer=optimizer,
-            dataset=dataset,
-            discount=discount,
-            logger=logger,
-        )
-    else:
-        actor = MCTSActor(
-            environment_spec=environment_spec,
-            model=model,
-            network=network,
-            discount=discount,
-            adder=adder,
-            num_simulations=num_simulations,
-            search_policy=search_policy,
-            temperature_fn=temperature_fn,
-        )
-        learner = learning.AZLearner(
-            network=network,
-            optimizer=optimizer,
-            dataset=dataset,
-            discount=discount,
-            logger=logger,
-        )
-
-    # The parent class combines these together into one 'agent'.
-    super().__init__(
-        actor=actor,
-        learner=learner,
-        min_observations=10,
-        observations_per_step=1,
-    )
 
 
 class DistributedMCTS:
@@ -170,6 +179,7 @@ class DistributedMCTS:
         variable_update_period: int = 1000,
         logger: loggers.Logger = None,
         observers: Optional[acme.utils.observers.base.EnvLoopObserver] = [],
+        mcts_observers: Optional[Sequence[MCTSObserver]] = [],
     ):
 
         if environment_spec is None:
@@ -211,6 +221,7 @@ class DistributedMCTS:
             self._logger = loggers.AsyncLogger(logger)
         # save observers
         self._observers = observers
+        self._mcts_observers = mcts_observers
 
     def replay(self):
         """The replay storage worker."""
@@ -299,6 +310,7 @@ class DistributedMCTS:
             search_policy=self._search_policy,
             temperature_fn=self._temperature_fn,
             counter=counter,
+            observers=self._mcts_observers,
         )
 
         # Create the loop to connect environment and agent.
@@ -338,6 +350,7 @@ class DistributedMCTS:
             num_simulations=self._num_simulations,
             search_policy=self._search_policy,
             temperature_fn=self._temperature_fn,
+            observers=self._mcts_observers,
         )
 
         return acme.EnvironmentLoop(
@@ -363,6 +376,7 @@ class DistributedMCTS:
                 lp.CourierNode(self.evaluator, learner, counter), label='evaluator')
 
         with program.group('actor'):
+            # TODO: add multiple actors
             program.add_node(
                 lp.CourierNode(self.actor, replay, learner, counter), label='actor')
 

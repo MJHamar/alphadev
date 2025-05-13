@@ -111,7 +111,7 @@ class DualValueMCTSActor(MCTSActor):
         root = dv_mcts(
             observation,
             model=self._model,
-            search_policy=search.puct,
+            search_policy=self._search_policy,
             evaluation=self._forward,
             num_simulations=self._num_simulations,
             num_actions=self._num_actions,
@@ -119,10 +119,18 @@ class DualValueMCTSActor(MCTSActor):
         )
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
-        probs = search.visit_count_policy(root)
+        training_steps = self._counter.get_counts()
+        training_steps = training_steps.get(self._counter.get_steps_key(), 0)
+        temperature = self._temperature_fn(training_steps)
+        probs = search.visit_count_policy(root, temperature=temperature)
         action = np.int32(np.random.choice(self._actions, p=probs))
 
         # Save the policy probs so that we can add them to replay in `observe()`.
         self._probs = probs.astype(np.float32)
+
+        for observer in self._observers:
+            observer.on_action_selection(
+                node=root, probs=probs, action=action,
+                training_steps=training_steps, temperature=temperature)
 
         return action

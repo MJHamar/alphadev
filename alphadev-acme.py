@@ -1383,7 +1383,8 @@ def make_agent(config: AlphaDevConfig):
             environment_spec=make_environment_spec(environment_factory()),
             variable_update_period=config.variable_update_period,
             logger=config.logger,
-            observers=config.observers,
+            observers=config.env_observers,
+            mcts_observers=config.search_observers,
     )
     else:
         return MCTS(
@@ -1400,6 +1401,7 @@ def make_agent(config: AlphaDevConfig):
             batch_size=config.batch_size,
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger=config.logger,
+            mcts_observers=config.search_observers,
         )
 
 def run_single_threaded(config: AlphaDevConfig, agent: MCTS):

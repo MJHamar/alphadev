@@ -19,7 +19,7 @@ Reimplementation of `acme.agents.tf.mcts.acting` that doesn't such so much.
 
 from typing import Optional, Tuple, Sequence, Callable
 
-import acme
+from acme.utils import counting
 from acme import adders
 from acme import specs
 from acme.agents.tf.mcts.acting import MCTSActor as acmeMCTSActor
@@ -35,6 +35,7 @@ import sonnet as snt
 import tensorflow as tf
 import tree
 
+from observers import MCTSObserver
 
 import logging
 logger = logging.getLogger(__name__)
@@ -55,8 +56,8 @@ class MCTSActor(acmeMCTSActor):
         temperature_fn: callable,
         adder: Optional[adders.Adder] = None,
         variable_client: Optional[tf2_variable_utils.VariableClient] = None,
-        counter: Optional[acme.utils.counting.Counter] = None,
-        post_mcts_observers: Optional[Sequence[Callable[[search.Node], None]]] = [],
+        counter: Optional[counting.Counter] = None,
+        observers: Optional[Sequence[MCTSObserver]] = [],
     ):
         super().__init__(
             environment_spec=environment_spec,
@@ -70,7 +71,7 @@ class MCTSActor(acmeMCTSActor):
         self._search_policy = search_policy
         self._temperature_fn = temperature_fn
         self._counter = counter
-        self._post_mcts_observers = post_mcts_observers
+        self._observers = observers
 
     def _forward(
         self, observation: types.Observation) -> Tuple[types.Probs, types.Value]:
@@ -100,16 +101,20 @@ class MCTSActor(acmeMCTSActor):
             num_actions=self._num_actions,
             discount=self._discount,
         )
-        for observer in self._post_mcts_observers:
-            observer(root)
         # Select an action according to the search policy.
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
-        training_steps = self._counter.get_counts(self._counter.get_steps_key())
-        probs = search.visit_count_policy(root, temperature=self._temperature_fn(training_steps))
+        training_steps = self._counter.get_counts()[self._counter.get_steps_key()]
+        temperature = self._temperature_fn(training_steps)
+        probs = search.visit_count_policy(root, temperature=temperature)
         action = np.int32(np.random.choice(self._actions, p=probs))
 
         # Save the policy probs so that we can add them to replay in `observe()`.
         self._probs = probs.astype(np.float32)
+
+        for observer in self._observers:
+            observer.on_action_selection(
+                node=root, probs=probs, action=action,
+                training_steps=training_steps, temperature=temperature)
 
         return action

@@ -5,8 +5,9 @@ import ml_collections
 import numpy as np
 
 from utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
+from observers import MCTSObserver, MCTSPolicyObserver
 
-from acme.utils.loggers import make_default_logger
+from acme.utils.loggers import make_default_logger, AsyncLogger
 from loggers import WandbLogger
 
 @dataclasses.dataclass
@@ -86,7 +87,9 @@ class AlphaDevConfig(object):
     wandb_mode: str = None
     wanbd_run_id: str = None
     # Observers
-    observers: list = dataclasses.field(default_factory=list)
+    # TODO: add environment observers
+    observe_mcts_policy: bool = True
+    mcts_observer_ratio: float = 0.1
 
     def __post_init__(self):
         
@@ -136,6 +139,10 @@ class AlphaDevConfig(object):
             observe_reward_components=self.hparams.categorical_value_loss,
         )
         
+        self.logger = self._make_logger()
+        self.env_observers, self.search_observers = self._make_observers(self.logger)
+    
+    def _make_logger(self):
         if self.use_wandb:
             wandb_config = {
                 'project': self.wandb_project,
@@ -146,13 +153,28 @@ class AlphaDevConfig(object):
             }
             if self.wanbd_run_id is not None:
                 wandb_config['run_id'] = self.wanbd_run_id
-            self.logger = WandbLogger(wandb_config)
+            logger = WandbLogger(wandb_config)
         else:
-            self.logger = make_default_logger(self.experiment_name)
+            logger = make_default_logger(self.experiment_name)
+        
+        if self.distributed:
+            # make the logger async
+            logger = AsyncLogger(logger)
+        return logger
 
-        # TODO: add observers
-        if not isinstance(self.observers, list) or len(self.observers) > 0:
-            raise ValueError('Observers are not supported yet.')
+    def _make_observers(self, logger):
+        """Create observers for the environment and search."""
+        env_observers = []
+        search_observers = []
+        
+        # TODO: environment observers
+        
+        if self.observe_mcts_policy:
+            search_observers.append(
+                MCTSPolicyObserver(logger, epsilon=self.mcts_observer_ratio)
+            )
+        
+        return env_observers, search_observers
 
     @classmethod
     def from_yaml(cls, path) -> 'AlphaDevConfig':
