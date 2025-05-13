@@ -21,9 +21,9 @@ from acme import datasets
 from acme import specs
 from acme.adders import reverb as adders
 from acme.agents import agent
-from acme.agents.tf.mcts import acting
 from acme.agents.tf.mcts import learning
 from acme.agents.tf.mcts import models
+from acme.agents.tf.mcts import types
 from acme.tf import utils as tf2_utils
 from acme.tf import variable_utils as tf2_variable_utils
 from acme.utils import counting
@@ -38,6 +38,8 @@ import sonnet as snt
 
 import numpy as np
 from dual_value_az import DualValueAZLearner, DualValueMCTSActor
+from acting import MCTSActor
+from search import PUCTSearchPolicy
 
 import logging
 logger = logging.getLogger(__name__)
@@ -50,6 +52,8 @@ class MCTS(agent.Agent):
       network: snt.Module,
       model: models.Model,
       optimizer: snt.Optimizer,
+      search_policy: Callable[[types.Node], types.Action],
+      temperature_fn: Callable[[int], float],
       n_step: int,
       discount: float,
       replay_capacity: int,
@@ -57,6 +61,7 @@ class MCTS(agent.Agent):
       environment_spec: specs.EnvironmentSpec,
       batch_size: int,
       use_dual_value_network: bool = False,
+      logger: loggers.Logger = None,
   ):
 
     extra_spec = {
@@ -99,27 +104,33 @@ class MCTS(agent.Agent):
             discount=discount,
             adder=adder,
             num_simulations=num_simulations,
+            search_policy=search_policy,
+            temperature_fn=temperature_fn,
         )
         learner = DualValueAZLearner(
             network=network,
             optimizer=optimizer,
             dataset=dataset,
             discount=discount,
+            logger=logger,
         )
     else:
-        actor = acting.MCTSActor(
+        actor = MCTSActor(
             environment_spec=environment_spec,
             model=model,
             network=network,
             discount=discount,
             adder=adder,
             num_simulations=num_simulations,
+            search_policy=search_policy,
+            temperature_fn=temperature_fn,
         )
         learner = learning.AZLearner(
             network=network,
             optimizer=optimizer,
             dataset=dataset,
             discount=discount,
+            logger=logger,
         )
 
     # The parent class combines these together into one 'agent'.
@@ -140,6 +151,8 @@ class DistributedMCTS:
         network_factory: Callable[[specs.DiscreteArray], snt.Module],
         model_factory: Callable[[specs.EnvironmentSpec], models.Model],
         optimizer_factory: Callable[[], snt.Optimizer],
+        search_policy: Callable[[types.Node], types.Action],
+        temperature_fn: Callable[[int], float],
         num_actors: int,
         num_simulations: int = 50,
         batch_size: int = 256,
@@ -167,6 +180,7 @@ class DistributedMCTS:
         self._network_factory = network_factory
         self._model_factory = model_factory
         self._optimizer_factory = optimizer_factory
+        self._search_policy = search_policy
 
         # Internalize hyperparameters.
         self._num_actors = num_actors
@@ -184,6 +198,8 @@ class DistributedMCTS:
         self._learning_rate = learning_rate
         self._discount = discount
         self._variable_update_period = variable_update_period
+        self._temperature_fn = temperature_fn
+        
         # set up logging
         if logger is not None:
             self._logger = logger
@@ -272,7 +288,7 @@ class DistributedMCTS:
         )
 
         # Create the agent.
-        actor = acting.MCTSActor(
+        actor = MCTSActor(
             environment_spec=self._env_spec,
             model=model,
             network=network,
@@ -280,6 +296,9 @@ class DistributedMCTS:
             adder=adder,
             variable_client=variable_client,
             num_simulations=self._num_simulations,
+            search_policy=self._search_policy,
+            temperature_fn=self._temperature_fn,
+            counter=counter,
         )
 
         # Create the loop to connect environment and agent.
@@ -310,13 +329,15 @@ class DistributedMCTS:
             update_period=self._variable_update_period)
 
         # Create the agent.
-        actor = acting.MCTSActor(
+        actor = MCTSActor(
             environment_spec=self._env_spec,
             model=model,
             network=network,
             discount=self._discount,
             variable_client=variable_client,
             num_simulations=self._num_simulations,
+            search_policy=self._search_policy,
+            temperature_fn=self._temperature_fn,
         )
 
         return acme.EnvironmentLoop(

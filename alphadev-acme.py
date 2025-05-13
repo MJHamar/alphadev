@@ -14,6 +14,7 @@ import ml_collections
 from acme.specs import EnvironmentSpec, make_environment_spec, Array, BoundedArray, DiscreteArray
 from acme.agents.tf.mcts import models
 from dm_env import Environment, TimeStep, StepType
+import launchpad as lp
 
 from tinyfive.multi_machine import multi_machine
 from agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
@@ -22,6 +23,7 @@ from loggers import WandbLogger
 from utils import x86_enumerate_actions, x86_opcode2int, x86_signatures, x86_to_riscv
 from utils import TaskSpec, Program, CPUState, REG_T, MEM_T, IMM_T
 from config import AlphaDevConfig
+from search import PUCTSearchPolicy
 
 import logging
 logger = logging.getLogger(__name__)
@@ -1323,86 +1325,83 @@ class AssemblyGameModel(models.Model):
         # logger.debug("AssemblyGameModel: step") 
         return self._environment.step(action)
 
-# predictor net from JEPA
-
-# #################
-# factory functions
-# #################
-config: AlphaDevConfig = AlphaDevConfig()
-
-wandb_logger = WandbLogger(config=config)
-
-env_spec = make_environment_spec(AssemblyGame(config.task_spec))
-
-def environment_factory(): # no args
-    return AssemblyGame(
-        task_spec=config.task_spec,
-    )
-
-def network_factory(env_spec: DiscreteArray): 
-    # env_spec here is env.actions 
-    # (i.e. enumeration of available actions). we ignore it
-    return AlphaDevNetwork(
-        hparams=config.hparams,
-        task_spec=config.task_spec,
-    )
-
-def model_factory(env_spec: EnvironmentSpec): # env_spec
-    # again. we ignore the env_spec.
-    return AssemblyGameModel(
-        task_spec=config.task_spec,
-        name='AssemblyGameModel',
-    )
-
-def optimizer_factory():
-    return snn.optimizers.Momentum(
-        learning_rate=config.lr_init,
-        momentum=config.momentum,
-    )
 
 # #################
 # Agent definition
 # #################
 
-# distributed_agent = DistributedMCTS(
-#     environment_factory=environment_factory, # AlphaGame environment
-#     network_factory=network_factory,         # AlphaDev network
-#     model_factory=model_factory,             # Either a learned model or a wrapper around the environment
-#     optimizer_factory=optimizer_factory,     # SGD optimizer
-#     num_actors=config.num_actors, # number of parallel actors
-#     num_simulations=config.num_simulations, # number of rollouts per action
-#     batch_size=config.batch_size,  # batch size used by the learner.
-#     prefetch_size=config.prefetch_size,  # parameter passed to make_reverb_dataset
-#     target_update_period=config.target_update_period, # NOTE: not used
-#     samples_per_insert=config.samples_per_insert, # to balance the replay buffer
-#     min_replay_size=config.min_replay_size, # used as a limiter for the replay buffer
-#     max_replay_size=config.max_replay_size, # maximum size of the replay buffer
-#     importance_sampling_exponent=config.importance_sampling_exponent, # not used
-#     priority_exponent=config.priority_exponent, # not used
-#     n_step=config.training_steps, # how many steps to buffer before adding to the replay buffer
-#     learning_rate=config.learning_rate, # learning rate for the learner
-#     discount=config.discount, # discount factor for the environment
-#     environment_spec=config.env_spec, # defines the environment
-#     save_logs=config.save_logs, # whether to save logs or not
-# )
+def make_agent(config: AlphaDevConfig):
+    # -- create factories
+    def environment_factory(): # no args
+        return AssemblyGame(
+            task_spec=config.task_spec,
+        )
+    def network_factory(env_spec: DiscreteArray): 
+        # env_spec here is env.actions 
+        # (i.e. enumeration of available actions). we ignore it
+        return AlphaDevNetwork(
+            hparams=config.hparams,
+            task_spec=config.task_spec,
+        )
 
+    def model_factory(env_spec: EnvironmentSpec): # env_spec
+        # again. we ignore the env_spec.
+        return AssemblyGameModel(
+            task_spec=config.task_spec,
+            name='AssemblyGameModel',
+        )
 
-agent = MCTS(
-    network=network_factory(None),
-    model=model_factory(None),
-    optimizer=optimizer_factory(),
-    n_step=config.td_steps,
-    discount=config.discount,
-    replay_capacity=config.td_steps * 10, # TODO
-    num_simulations=config.num_simulations,
-    environment_spec=make_environment_spec(AssemblyGame(config.task_spec)),
-    batch_size=config.batch_size,
-    use_dual_value_network=config.hparams.categorical_value_loss
-)
+    def optimizer_factory():
+        return snn.optimizers.Momentum(
+            learning_rate=config.lr_init,
+            momentum=config.momentum,
+        )
+    # -- search policy
+    search_policy = PUCTSearchPolicy(config.pb_c_base, config.pb_c_init)
+    
+    if config.distributed:
+        return DistributedMCTS(
+            environment_factory=environment_factory,
+            network_factory=network_factory,
+            model_factory=model_factory,
+            optimizer_factory=optimizer_factory,
+            search_policy=search_policy,
+            temperature_fn=config.temperature_fn,
+            num_actors=config.num_actors,
+            num_simulations=config.num_simulations,
+            batch_size=config.batch_size,
+            prefetch_size=config.prefetch_size,
+            target_update_period=config.target_update_period,
+            samples_per_insert=config.samples_per_insert,
+            min_replay_size=config.min_replay_size,
+            max_replay_size=config.max_replay_size,
+            importance_sampling_exponent=config.importance_sampling_exponent,
+            priority_exponent=config.priority_exponent,
+            n_step=config.n_step,
+            learning_rate=config.lr_init,
+            discount=config.discount,
+            environment_spec=make_environment_spec(environment_factory()),
+            variable_update_period=config.variable_update_period,
+            logger=config.logger,
+            observers=config.observers,
+    )
+    else:
+        return MCTS(
+            network=network_factory(None),
+            model=model_factory(None),
+            optimizer=optimizer_factory(),
+            n_step=config.n_step,
+            discount=config.discount,
+            replay_capacity=config.max_replay_size, # TODO
+            num_simulations=config.num_simulations,
+            environment_spec=env_spec,
+            batch_size=config.batch_size,
+            use_dual_value_network=config.hparams.categorical_value_loss,
+            logger=config.logger,
+        )
 
-if __name__ == '__main__':
-    environment = environment_factory()
-    num_episodes = 100
+def run_single_threaded(config: AlphaDevConfig, agent: MCTS):
+    num_episodes = config.training_steps
     for episode in range(num_episodes):
         # a. Reset environment and agent at start of episode
         logger.info("Initializing episode...")
@@ -1429,3 +1428,35 @@ if __name__ == '__main__':
 
         # d. Log training information (optional)
         logger.info(f"Episode {episode + 1}/{num_episodes} completed.")
+
+def run_distributed(config: AlphaDevConfig, agent: DistributedMCTS):
+    # build the distributed agent
+    program: lp.Program = agent.build()
+    # run the distributed agent
+    lp.launch(program)
+
+def run_alphadev(config: AlphaDevConfig):
+    # -- define agent
+    agent = make_agent(config)
+    # -- run
+    if config.distributed:
+        # run in distributed mode
+        run_distributed(config, agent)
+    else:
+        # run in single-threaded mode
+        run_single_threaded(config, agent)
+    
+    # -- save
+
+if __name__ == '__main__':
+    # -- load config
+    import sys
+    args = sys.argv[1:]
+    try:
+        config_path = args[0]
+        config = AlphaDevConfig.from_yaml(config_path)
+    except Exception as e:
+        print("No config file provided. Using default config.")
+        config = AlphaDevConfig()
+    # -- run alphadev
+    run_alphadev(config)

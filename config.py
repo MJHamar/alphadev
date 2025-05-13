@@ -65,6 +65,7 @@ class AlphaDevConfig(object):
     momentum = 0.9
     
     ### Distributed training
+    distributed: bool = False # whether to use distributed training
     prefetch_size: int = 4,
     variable_update_period: int = 50, # aka checkpoint interval
     target_update_period: int = 10, # aka target interval
@@ -83,6 +84,8 @@ class AlphaDevConfig(object):
     wandb_mode: str = None
     wandb_log_model: str = None
     wanbd_run_id: str = None
+    # Observers
+    observers: list = []
 
     def __post_init__(self):
         
@@ -145,6 +148,10 @@ class AlphaDevConfig(object):
             self.logger = WandbLogger(wandb_config)
         else:
             self.logger = make_default_logger(self.experiment_name)
+
+        # TODO: add observers
+        if not isinstance(self.observers, list) or len(self.observers) > 0:
+            raise ValueError('Observers are not supported yet.')
 
     @classmethod
     def from_yaml(cls, path) -> 'AlphaDevConfig':

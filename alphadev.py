@@ -2388,6 +2388,23 @@ def _ucb_score(
     min_max_stats: MinMaxStats,
 ) -> float:
     """Computes the UCB score based on its value + exploration based on prior."""
+    # UCB score = value_j + exploration
+    # value_j = average reward of the j^th child
+    # exploration = ucb_c * sqrt(log(N) / n_j)
+    # where N is the number of visits to the parent node and n_j is the number of visits to the j^th child.
+    # PUCT (UCT with a prior) is similar
+    # 
+    # Here, we do the following steps:
+    # 1. compute the scaling value dynamically as log( ( N + pb_c_base + 1 ) / pb_c_base ) + pb_c_init
+    #   -- where pb_c_base is a normalization constant and pb_c_init is a constant
+    #   -- for all purposes, this becomes the ucb_c term for the rest of the equation.
+    # 2. compute ucb_c * sqrt( N ) / ( 1 + n_j )
+    # 3. incorporate the prior as pb_c * child.prior
+    # 4. compute the value score as ( child.reward + config.discount * child.value() ) - min_v / ( max_v - min_v )
+    #   -- where min_v and max_v are empirical minimum and maximum values of the tree.
+    #      this is another normalization step.
+    # 5. return the sum of the prior score and the value score.
+    # NOTE: this is equivalent to the original PUCT equation, proposed by Rosin 2011
     pb_c = (
         math.log((parent.visit_count + config.pb_c_base + 1) / config.pb_c_base)
         + config.pb_c_init
