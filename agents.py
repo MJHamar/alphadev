@@ -177,7 +177,8 @@ class DistributedMCTS:
         discount: float = 0.99,
         environment_spec: Optional[specs.EnvironmentSpec] = None,
         variable_update_period: int = 1000,
-        logger: loggers.Logger = None,
+        use_dual_value_network: bool = False,
+        logger_factory: Callable[[], loggers.Logger] = None,
         observers: Optional[acme.utils.observers.base.EnvLoopObserver] = [],
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
     ):
@@ -208,17 +209,15 @@ class DistributedMCTS:
         self._learning_rate = learning_rate
         self._discount = discount
         self._variable_update_period = variable_update_period
+        self._use_dual_value_network = use_dual_value_network
         self._temperature_fn = temperature_fn
         
         # set up logging
-        if logger is not None:
-            self._logger = logger
+        if logger_factory is not None:
+            self._logger_factory = logger_factory
         else:
-            self._logger = loggers.make_default_logger(
-                'distributed_mcts', time_delta=30.0, asynchronous=True)
-        
-        if not isinstance(self._logger, loggers.AsyncLogger):
-            self._logger = loggers.AsyncLogger(logger)
+            self._logger_factory = lambda: loggers.make_default_logger(
+                'distributed_mcts', time_delta=30.0)
         # save observers
         self._observers = observers
         self._mcts_observers = mcts_observers
@@ -245,7 +244,8 @@ class DistributedMCTS:
             signature=signature)
         return [replay_table]
 
-    def learner(self, replay: reverb.Client, counter: counting.Counter):
+    def learner(self, replay: reverb.Client, counter: counting.Counter,
+                logger: loggers.Logger):
         """The learning part of the agent."""
         # Create the networks.
         network = self._network_factory(self._env_spec.actions)
@@ -262,20 +262,31 @@ class DistributedMCTS:
         optimizer = self._optimizer_factory()
 
         # Return the learning agent.
-        return learning.AZLearner(
-            network=network,
-            discount=self._discount,
-            dataset=dataset,
-            optimizer=optimizer,
-            logger=self._logger,
-            counter=counter,
-        )
+        if self._use_dual_value_network:
+            return DualValueAZLearner(
+                network=network,
+                optimizer=optimizer,
+                dataset=dataset,
+                discount=self._discount,
+                logger=logger,
+                counter=counter,
+            )
+        else:
+            return learning.AZLearner(
+                network=network,
+                discount=self._discount,
+                dataset=dataset,
+                optimizer=optimizer,
+                logger=logger,
+                counter=counter,
+            )
 
     def actor(
         self,
         replay: reverb.Client,
         variable_source: acme.VariableSource,
         counter: counting.Counter,
+        logger: loggers.Logger,
     ) -> acme.EnvironmentLoop:
         """The actor process."""
 
@@ -283,6 +294,8 @@ class DistributedMCTS:
         environment = self._environment_factory()
         network = self._network_factory(self._env_spec.actions)
         model = self._model_factory(self._env_spec)
+        
+        mcts_observers = self._mcts_observers(logger)
 
         # Create variable client for communicating with the learner.
         tf2_utils.create_variables(network, [self._env_spec.observations])
@@ -298,33 +311,51 @@ class DistributedMCTS:
             discount=self._discount,
         )
 
-        # Create the agent.
-        actor = MCTSActor(
-            environment_spec=self._env_spec,
-            model=model,
-            network=network,
-            discount=self._discount,
-            adder=adder,
-            variable_client=variable_client,
-            num_simulations=self._num_simulations,
-            search_policy=self._search_policy,
-            temperature_fn=self._temperature_fn,
-            counter=counter,
-            observers=self._mcts_observers,
-        )
+        if self._use_dual_value_network:
+            actor = DualValueMCTSActor(
+                environment_spec=self._env_spec,
+                model=model,
+                network=network,
+                discount=self._discount,
+                adder=adder,
+                variable_client=variable_client,
+                num_simulations=self._num_simulations,
+                search_policy=self._search_policy,
+                temperature_fn=self._temperature_fn,
+                counter=counter,
+                observers=mcts_observers,
+            )
+        else:
+            # Create the agent.
+            actor = MCTSActor(
+                environment_spec=self._env_spec,
+                model=model,
+                network=network,
+                discount=self._discount,
+                adder=adder,
+                variable_client=variable_client,
+                num_simulations=self._num_simulations,
+                search_policy=self._search_policy,
+                temperature_fn=self._temperature_fn,
+                counter=counter,
+                observers=mcts_observers,
+            )
+
+        observers = self._observers(logger)
 
         # Create the loop to connect environment and agent.
         return acme.EnvironmentLoop(
             environment=environment,
             actor=actor,
             counter=counter,
-            logger=self._logger,
-            observers=self._observers)
+            logger=logger,
+            observers=observers)
 
     def evaluator(
         self,
         variable_source: acme.VariableSource,
         counter: counting.Counter,
+        logger: loggers.Logger,
     ):
         """The evaluation process."""
 
@@ -333,6 +364,8 @@ class DistributedMCTS:
         network = self._network_factory(self._env_spec.actions)
         model = self._model_factory(self._env_spec)
 
+        mcts_observers = self._mcts_observers(logger)
+
         # Create variable client for communicating with the learner.
         tf2_utils.create_variables(network, [self._env_spec.observations])
         variable_client = tf2_variable_utils.VariableClient(
@@ -340,21 +373,38 @@ class DistributedMCTS:
             variables={'policy': network.trainable_variables},
             update_period=self._variable_update_period)
 
-        # Create the agent.
-        actor = MCTSActor(
-            environment_spec=self._env_spec,
-            model=model,
-            network=network,
-            discount=self._discount,
-            variable_client=variable_client,
-            num_simulations=self._num_simulations,
-            search_policy=self._search_policy,
-            temperature_fn=self._temperature_fn,
-            observers=self._mcts_observers,
-        )
+        if self._use_dual_value_network:
+            actor = DualValueMCTSActor(
+                environment_spec=self._env_spec,
+                model=model,
+                network=network,
+                discount=self._discount,
+                variable_client=variable_client,
+                num_simulations=self._num_simulations,
+                search_policy=self._search_policy,
+                temperature_fn=self._temperature_fn,
+                counter=counter,
+                observers=mcts_observers,
+            )
+        else:
+            # Create the agent.
+            actor = MCTSActor(
+                environment_spec=self._env_spec,
+                model=model,
+                network=network,
+                discount=self._discount,
+                variable_client=variable_client,
+                num_simulations=self._num_simulations,
+                search_policy=self._search_policy,
+                temperature_fn=self._temperature_fn,
+                counter=counter,
+                observers=mcts_observers,
+            )
+        
+        observers = self._observers(logger)
 
         return acme.EnvironmentLoop(
-            environment, actor, counter=counter, logger=self._logger, observers=self._observers)
+            environment, actor, counter=counter, logger=logger, observers=observers)
 
     def build(self, name='MCTS'):
         """Builds the distributed agent topology."""
@@ -366,18 +416,22 @@ class DistributedMCTS:
         with program.group('counter'):
             counter = program.add_node(
                 lp.CourierNode(counting.Counter), label='counter')
+        
+        with program.group('logger'):
+            logger = program.add_node(
+                lp.CourierNode(self._logger_factory), label='logger')
 
         with program.group('learner'):
             learner = program.add_node(
-                lp.CourierNode(self.learner, replay, counter), label='learner')
+                lp.CourierNode(self.learner, replay, counter, logger), label='learner')
 
         with program.group('evaluator'):
             program.add_node(
-                lp.CourierNode(self.evaluator, learner, counter), label='evaluator')
+                lp.CourierNode(self.evaluator, learner, counter, logger), label='evaluator')
 
         with program.group('actor'):
             # TODO: add multiple actors
             program.add_node(
-                lp.CourierNode(self.actor, replay, learner, counter), label='actor')
+                lp.CourierNode(self.actor, replay, learner, counter, logger), label='actor')
 
         return program

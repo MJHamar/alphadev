@@ -7,7 +7,7 @@ import numpy as np
 from utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
 from observers import MCTSObserver, MCTSPolicyObserver
 
-from acme.utils.loggers import make_default_logger, AsyncLogger
+from acme.utils.loggers import make_default_logger, Logger
 from loggers import WandbLogger
 
 @dataclasses.dataclass
@@ -72,7 +72,7 @@ class AlphaDevConfig(object):
     prefetch_size: int = 4
     variable_update_period: int = 50 # aka checkpoint interval
     target_update_period: int = 10 # aka target interval
-    samples_per_insert: float = 32.0
+    samples_per_insert: int = 1
     min_replay_size: int = 1000
     max_replay_size: int = 1000000
     importance_sampling_exponent: float = 0.2
@@ -139,43 +139,9 @@ class AlphaDevConfig(object):
             observe_reward_components=self.hparams.categorical_value_loss,
         )
         
-        self.logger = self._make_logger()
-        self.env_observers, self.search_observers = self._make_observers(self.logger)
+        self.logger_factory = make_logger_factory(self)
+        self.env_observers, self.search_observers = make_observer_factories(self)
     
-    def _make_logger(self):
-        if self.use_wandb:
-            wandb_config = {
-                'project': self.wandb_project,
-                'entity': self.wandb_entity,
-                'tags': self.wandb_tags,
-                'notes': self.wandb_notes,
-                'mode': self.wandb_mode,
-            }
-            if self.wanbd_run_id is not None:
-                wandb_config['run_id'] = self.wanbd_run_id
-            logger = WandbLogger(wandb_config)
-        else:
-            logger = make_default_logger(self.experiment_name)
-        
-        if self.distributed:
-            # make the logger async
-            logger = AsyncLogger(logger)
-        return logger
-
-    def _make_observers(self, logger):
-        """Create observers for the environment and search."""
-        env_observers = []
-        search_observers = []
-        
-        # TODO: environment observers
-        
-        if self.observe_mcts_policy:
-            search_observers.append(
-                MCTSPolicyObserver(logger, epsilon=self.mcts_observer_ratio)
-            )
-        
-        return env_observers, search_observers
-
     @classmethod
     def from_yaml(cls, path) -> 'AlphaDevConfig':
         """Create a config from a ml_collections.ConfigDict."""
@@ -186,3 +152,35 @@ class AlphaDevConfig(object):
     @staticmethod
     def visit_softmax_temperature_fn(steps): 
         return 1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
+
+def make_logger_factory(config: AlphaDevConfig):
+    def _make_logger() -> Logger:
+        if config.use_wandb:
+            wandb_config = {
+                'project': config.wandb_project,
+                'entity': config.wandb_entity,
+                'tags': config.wandb_tags,
+                'notes': config.wandb_notes,
+                'mode': config.wandb_mode,
+            }
+            if config.wanbd_run_id is not None:
+                wandb_config['run_id'] = config.wanbd_run_id
+            logger = WandbLogger(wandb_config)
+        else:
+            logger = make_default_logger(config.experiment_name)
+        
+        return logger
+    return _make_logger
+
+def make_observer_factories(config: AlphaDevConfig):
+    def make_env_observers(logger):
+        return [] # TODO: add environment observers
+    def make_search_observers(logger):
+        search_observers = []
+        if config.observe_mcts_policy:
+            search_observers.append(
+                MCTSPolicyObserver(logger, epsilon=config.mcts_observer_ratio)
+            )
+        return search_observers
+    
+    return make_env_observers, make_search_observers

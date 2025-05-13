@@ -1382,11 +1382,13 @@ def make_agent(config: AlphaDevConfig):
             discount=config.discount,
             environment_spec=make_environment_spec(environment_factory()),
             variable_update_period=config.variable_update_period,
-            logger=config.logger,
+            use_dual_value_network=config.hparams.categorical_value_loss,
+            logger_factory=config.logger_factory,
             observers=config.env_observers,
             mcts_observers=config.search_observers,
     )
     else:
+        cfg_logger = config.logger_factory()
         return MCTS(
             network=network_factory(None),
             model=model_factory(None),
@@ -1400,8 +1402,8 @@ def make_agent(config: AlphaDevConfig):
             temperature_fn=config.temperature_fn,
             batch_size=config.batch_size,
             use_dual_value_network=config.hparams.categorical_value_loss,
-            logger=config.logger,
-            mcts_observers=config.search_observers,
+            logger=cfg_logger,
+            mcts_observers=[obs(cfg_logger) for obs in config.search_observers],
         )
 
 def run_single_threaded(config: AlphaDevConfig, agent: MCTS):

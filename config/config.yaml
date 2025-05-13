@@ -1,0 +1,72 @@
+experiment_name: AlphaDev-test
+
+# Environment
+num_inputs: 17
+num_mem: 14
+num_regs: 5
+items_to_sort: 3
+correct_reward: 1.0
+correctness_reward_weight: 2.0
+latency_reward_weight: 0.5
+latency_quantile: 0.05
+num_latency_simulations: 10
+
+# Self-Play
+num_actors: 1
+max_moves: 100
+num_simulations: 5
+discount: 1.0
+root_dirichlet_alpha: 0.03
+root_exploration_fraction: 0.25
+
+# UCB formula
+pb_c_base: 19652
+pb_c_init: 1.25
+temperature_fn: visit_softmax_temperature_fn
+
+# Network architecture
+embedding_dim: 512
+representation_use_program: True
+representation_use_locations: True
+representation_use_locations_binary: False
+representation_use_permutation_embedding: False
+representation_repr_net_res_blocks: 8
+representation_attention_head_depth: 128
+representation_attention_num_heads: 4
+representation_attention_attention_dropout: False
+representation_attention_position_encoding: absolute
+representation_attention_num_layers: 6
+value_max: 3.0
+value_num_bins: 301
+categorical_value_loss: True
+
+# Training
+training_steps: 1000
+batch_size: 8
+n_step: 5
+lr_init: 0.0002
+momentum: 0.9
+
+# Distributed training
+distributed: True
+prefetch_size: 4
+variable_update_period: 50
+target_update_period: 10
+samples_per_insert: 32.0
+min_replay_size: 1000
+max_replay_size: 1000000
+importance_sampling_exponent: 0.2
+priority_exponent: 0.6
+
+# Logging
+use_wandb: False
+wandb_project: alphadev
+wandb_entity: hamar_m
+wandb_tags: null
+wandb_notes: null
+wandb_mode: online
+wanbd_run_id: null
+
+# Observers
+observe_mcts_policy: True
+mcts_observer_ratio: 0.001
