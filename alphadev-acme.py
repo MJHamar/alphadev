@@ -1,9 +1,8 @@
 """
 Main script for running AlphaDev with an ACME and reverb backend.
 """
-from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Generator, Sequence, Mapping, Optional, Union
+from typing import NamedTuple, Dict, Tuple, Any, Callable, List, Sequence, Mapping, Optional, Union
 import functools
-import itertools
 
 import sonnet as snn
 import tensorflow as tf
@@ -15,12 +14,14 @@ import ml_collections
 from acme.specs import EnvironmentSpec, make_environment_spec, Array, BoundedArray, DiscreteArray
 from acme.agents.tf.mcts import models
 from dm_env import Environment, TimeStep, StepType
-# from acme.agents.tf.mcts
-# from acme.agents.tf.mcts.agent_distributed import DistributedMCTS
 
 from tinyfive.multi_machine import multi_machine
 from agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
 from distribution import DistributionSupport
+from loggers import WandbLogger
+from utils import x86_enumerate_actions, x86_opcode2int, x86_signatures, x86_to_riscv
+from utils import TaskSpec, Program, CPUState, REG_T, MEM_T, IMM_T
+from config import AlphaDevConfig
 
 import logging
 logger = logging.getLogger(__name__)
@@ -28,248 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger.setLevel(logging.DEBUG)
 
 # #################
-# Type definitions
-# #################
-
-class IOExample(NamedTuple):
-    inputs: tf.Tensor # num_inputs x <sequence_length>
-    outputs: tf.Tensor # num_inputs x <num_mem>
-    output_mask: tf.Tensor # num_inputs x <num_mem> boolean array masking irrelevant parts of the output
-
-class TaskSpec(NamedTuple):
-    max_program_size: int
-    num_inputs: int # number of input examples
-    num_funcs: int # number of x86 instructions to consider
-    num_regs: int # number of registers to consider
-    num_mem: int # number of memory locations to consider. num_mem+num_regs = num_locations
-    num_locations: int # memory + register locations to consider
-    num_actions: int # number of actions in the action space
-    correct_reward: float # reward for correct program
-    correctness_reward_weight: float # weight for correctness reward
-    latency_reward_weight: float # weight for latency reward
-    latency_quantile: float # quantile for latency reward
-    inputs: IOExample # input examples for the task
-    observe_reward_components: bool # whether to return the reward components for the value function (for categorical value loss)
-
-class CPUState(NamedTuple):
-    registers: tf.Tensor # num_inputs x num_regs array of register values
-    active_registers: tf.Tensor # num_inputs x num_regs boolean array of active registers
-    memory: tf.Tensor # num_inputs x num_mem array of memory locations
-    active_memory: tf.Tensor # num_inputs x num_mem boolean array of active memory locations
-    program: tf.Tensor # max_program_size x 1 array of progrram instructions.
-    program_length: tf.Tensor  # scalar length of the program 
-    program_counter: tf.Tensor # num_inputs x 1 array of program counters (in int32)
-
-class Program(NamedTuple):
-    npy_program: np.ndarray # <max_program_size> x 3 (opcode, op1, op2)
-    asm_program: List[Callable[[int], Any]] # list of pseudo-asm instructions
-    
-    def __len__(self):
-        return len(self.asm_program)
-
-# #################
-# Input geneerators
-# #################
-
-def generate_sort_inputs(
-    items_to_sort: int, max_len:int, num_samples: int=None) -> IOExample:
-    """
-    This is equivalent to the C++ code sort_functioons_test.cc:
-    TestCases GenerateSortTestCases(int items_to_sort) {
-        TestCases test_cases;
-        auto add_all_permutations = [&test_cases](const std::vector<int>& initial) {
-            std::vector<int> perm(initial);
-            do {
-            std::vector<int> expected = perm;
-            std::sort(expected.begin(), expected.end());
-            test_cases.push_back({perm, expected});
-            } while (std::next_permutation(perm.begin(), perm.end()));
-        };
-        // Loop over all possible configurations of binary relations on sorted items.
-        // Between each two consecutive items we can insert either '==' or '<'. Then,
-        // for each configuration we generate all possible permutations.
-        for (int i = 0; i < 1 << (items_to_sort - 1); ++i) {
-            std::vector<int> relation = {1};
-            for (int mask = i, j = 0; j < items_to_sort - 1; mask /= 2, ++j) {
-            relation.push_back(mask % 2 == 0 ? relation.back() : relation.back() + 1);
-            }
-            add_all_permutations(relation);
-        }
-        return test_cases;
-        }
-    """
-    # generate all weak orderings
-    io_list = []
-    def generate_testcases(items_to_sort: int) -> List[Tuple[List[int], List[int]]]:
-        #   logger.debug("Generating test cases for %d items to sort", items_to_sort)
-        def add_all_permutations(initial: List[int]) -> List[Tuple[List[int], List[int]]]:
-            for perm in itertools.permutations(initial, len(initial)):
-                expected = np.array(sorted(perm))
-                io_list.append((np.array(perm), expected))
-        for i in range(0, items_to_sort+1):
-            relation = [1]
-            mask = i; j=0
-            while j < items_to_sort - 1: # no idea how to express this more pythonic
-                j += 1
-                relation.append(relation[-1] if mask % 2 == 0 else relation[-1] + 1)
-                mask //= 2
-            add_all_permutations(relation)
-
-    def remap_input(inp: np.ndarray, out: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        mapping = {}
-        prev = 0
-        for o in out.tolist():
-            if o not in mapping:
-                mapping[o] = np.random.randint(prev+1, prev+3) # don't blow it up. 
-                prev = mapping[o]
-        out = np.array([mapping[o] for o in out.tolist()])
-        inp = np.array([mapping[i] for i in inp.tolist()])
-        return inp, out
-
-    generate_testcases(items_to_sort)
-    i_list = np.stack([i for i, _ in io_list])
-    # padded outputs
-    o_list = np.stack([
-        np.pad(o, (0, max_len-len(o)), 'constant', constant_values=0)
-        for _, o in io_list])
-    o_mask = np.stack([
-        [1 for _ in range(len(o))] +\
-        [0 for _ in range(max_len-len(o))]
-        for _, o in io_list])
-    assert o_list.shape[1] == o_mask.shape[1] == max_len, \
-        f"Expected output shape {max_len}, got {o_list.shape[1]}"
-    # remove duplicates
-    _, uidx = np.unique(i_list, axis=0, return_index=True) # remove duplicates
-    i_list = i_list[uidx, :] # shape F(items_to_sort) x items_to_sort
-    o_list = o_list[uidx, :] # shape F(items_to_sort) x max_len
-    o_mask = o_mask[uidx, :] # shape F(items_to_sort) x max_len
-    
-    
-    #   logger.debug("Generated %d test cases", len(io_list))
-    # shuffle the permutations. if num_samples > len(permutations), we set
-    # inputs = permutations + num_samples - len(permutations) random samples from permutations
-    # otherwise, we set inputs = random.sample(permutations, num_samples)
-    new_indices = np.random.permutation(len(i_list))
-    if num_samples is None:
-        pass # select all elements
-    elif num_samples > i_list.shape[0]:
-        new_indices = np.concatenate([new_indices, new_indices[:num_samples - i_list.shape[0]]])
-    else:
-        new_indices = new_indices[:num_samples]
-    
-    i_list = i_list[new_indices]
-    o_list = o_list[new_indices]
-    o_mask = o_mask[new_indices]
-    # add some noise to the inputs
-    for i in range(i_list.shape[0]):
-        i_list[i], o_list[i] = remap_input(i_list[i], o_list[i])
-    
-    # logger.debug("generate_sort_inputs: i_list shape %s", i_list.shape)
-    # logger.debug("generate_sort_inputs: o_list shape %s", o_list.shape)
-    # logger.debug("generate_sort_inputs: o_mask shape %s", o_mask.shape)
-    
-    return IOExample(
-        inputs=i_list,
-        outputs=o_list,
-        output_mask=o_mask,
-    )
-
-# #################
-# Config
-# #################
-
-
-class AlphaDevConfig(object):
-    """AlphaDev configuration."""
-
-    @staticmethod
-    def visit_softmax_temperature_fn(steps): 
-        return 1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
-    
-    def __init__(
-        self,
-    ):
-        self.experiment_name = 'AlphaDev-test'
-        ### Self-Play
-        self.num_actors = 1 # TPU actors
-        # pylint: disable-next=g-long-lambda
-        self.max_moves = np.inf
-        self.num_simulations = 5
-        self.discount = 1.0
-
-        # Root prior exploration noise.
-        self.root_dirichlet_alpha = 0.03
-        self.root_exploration_fraction = 0.25
-
-        # UCB formula
-        self.pb_c_base = 19652
-        self.pb_c_init = 1.25
-
-        ### Network architecture
-        self.hparams = ml_collections.ConfigDict()
-        self.hparams.embedding_dim = 512
-        self.hparams.representation = ml_collections.ConfigDict()
-        self.hparams.representation.use_program = True
-        self.hparams.representation.use_locations = True
-        self.hparams.representation.use_locations_binary = False
-        self.hparams.representation.use_permutation_embedding = False
-        self.hparams.representation.repr_net_res_blocks = 8
-        self.hparams.representation.attention = ml_collections.ConfigDict()
-        self.hparams.representation.attention.head_depth = 128
-        self.hparams.representation.attention.num_heads = 4
-        self.hparams.representation.attention.attention_dropout = False
-        self.hparams.representation.attention.position_encoding = 'absolute'
-        self.hparams.representation.attention_num_layers = 6
-        self.hparams.value = ml_collections.ConfigDict()
-        self.hparams.value_max = 3.0  # These two parameters are task / reward-
-        self.hparams.value_num_bins = 301  # dependent and need to be adjusted.
-        self.hparams.categorical_value_loss = True # wheether to treat the value functions as a distribution
-
-        ### Training
-        self.training_steps = 1000 #int(1000e3)
-        self.checkpoint_interval = 50 # used to be 500
-        self.target_network_interval = 10 # used to be 100
-        self.window_size = int(1e3) # 1e6 originally
-        self.batch_size = 8
-        self.td_steps = 5
-        self.lr_init = 2e-4
-        self.momentum = 0.9
-
-
-        # Environment: spec of the Variable Sort 3 task
-        num_inputs = 17; num_mem = 14; num_regs = 5
-        self.task_spec = TaskSpec(
-            max_program_size=100,
-            num_inputs=num_inputs,
-            num_funcs=len(x86_opcode2int),
-            num_locations=num_regs+num_mem,
-            num_regs=num_regs,
-            num_mem=num_mem,
-            num_actions=240, # original value was 271
-            correct_reward=1.0,
-            correctness_reward_weight=2.0,
-            latency_reward_weight=0.5,
-            latency_quantile=0,
-            inputs=generate_sort_inputs(
-                items_to_sort=3,
-                max_len=num_mem,
-                num_samples=num_inputs
-            ),
-            observe_reward_components=self.hparams.categorical_value_loss,
-        )
-        
-        #   logger.debug("Inputs: %s", self.inputs)
-        assert self.task_spec.num_inputs == self.task_spec.inputs.inputs.shape[0],\
-            f"Expected {self.task_spec.num_inputs} inputs, got {self.inputs.inputs.shape[0]}"
-
-    @classmethod
-    def from_yaml(cls, path) -> 'AlphaDevConfig':
-        """Create a config from a ml_collections.ConfigDict."""
-        pass
-
-# #################
 # Action Spaces 
-# TODO: make distributed
 # #################
 
 class ActionSpace:
@@ -307,87 +67,6 @@ class ActionSpace:
         Get the number of actions in the action space.
         """
         return len(self.actions)
-
-X0 = 0 # hard-wired zero register
-X1 = 1 # reserved for comparison ops
-REG_T = 10
-MEM_T = 11
-IMM_T = 12
-
-def x86_to_riscv(opcode: str, operands: Tuple[int, int], mem_offset) -> Tuple[str, Callable[[int], Tuple[int, int]]]:
-    """
-    Convert an x86 (pseudo-) instruction to a RISC-V (pseudo-) instruction.
-    """
-    
-    if opcode == "mv": # move between registers
-        return [lambda _: ("ADD", (operands[0], X0, operands[1]),)]
-    elif opcode == "lw": # load word from memory to register
-        return [lambda _: ("LW", (operands[1], operands[0]-mem_offset, X0),)]
-    # rd,imm,rs -- rd, rs(imm)
-    elif opcode == "sw": # store word from register to memory
-        return [lambda _: ("SW", (operands[0], operands[1]-mem_offset, X0),)] 
-    # rs1,imm,rs2 -- rs1, rs2(imm)
-    elif opcode == "cmp": # compare two registers
-        return [lambda _: ("SUB", (X1, operands[0], operands[1]),)]
-        # if A > B, then X1 > 0
-        # if A < B, then X1 < 0
-        # riscv has bge (>=) and blt (<) instructions
-    elif opcode == "cmovg": # conditional move if greater than
-        return [ # A > B <=> B < A -- 0 < X1
-            lambda pc: ("BLT", (0, X1, pc+8),), 
-            # skip next instruction if A < B
-            lambda _ : ("ADD", (operands[1], X0, operands[0]),)
-            # copy C to D
-        ]
-    elif opcode == "cmovle": # conditional move if less than or equal
-        return [ # A <= B <=> B >= A -- 0 >= X1
-            lambda pc: ("BGE", (0, X1, pc+8),),
-            # skip next instruction if A > B
-            lambda _ : ("ADD", (operands[1], X0, operands[0]),) 
-            # copy E to F
-        ]
-    else:
-        raise ValueError(f"Unknown opcode: {opcode}")
-
-x86_signatures = {
-    "mv" : (REG_T, REG_T), # move <reg1>, <reg2> 
-    "lw" : (MEM_T, REG_T), # move <mem>, <reg1>
-    "sw" : (REG_T, MEM_T), # move <reg1>, <mem>
-    # no load immediates are used in AlphaDev fixed-sort programs
-    "cmp" : (REG_T, REG_T),
-    "cmovg" : (REG_T, REG_T),
-    "cmovle" : (REG_T, REG_T),
-    # skip jump instructions, they are not used in the published sort algorithms
-    }
-
-x86_opcode2int = {
-    k: i for i, k in enumerate(x86_signatures.keys())
-}
-
-def x86_enumerate_actions(max_reg: int, max_mem: int) -> Dict[int, Tuple[str, Tuple[int, int]]]:
-    def apply_opcode(opcode: str, operands: Tuple[int, int, int]) -> List[Tuple[str, Tuple[int, int]]]:
-        # operands is a triple (reg1, reg2, mem)
-        signature = x86_signatures[opcode]
-        if signature == (REG_T, REG_T):
-            return [(opcode, (operands[0], operands[1]))]
-        elif signature == (MEM_T, REG_T):
-            return [(opcode, (operands[2], operands[0]))]
-        elif signature == (REG_T, MEM_T):
-            return [(opcode, (operands[0], operands[2]))]
-        else:
-            assert False, f"No signature of type {signature} should be used. fix this."
-    def enum_actions(r1: int, r2: int, m: int) -> Generator[Tuple[str, Tuple[int, int]], None, None]:
-        for i in range(r1):
-            for j in range(r2):
-                for k in range(max_reg, max_reg + m): # offset the memory locations
-                    # generate all combinations of registers and memory
-                    for opcode in x86_signatures.keys():
-                        yield from apply_opcode(opcode, (i, j, k))
-    #   logger.debug("Enumerating actions for max_reg=%d, max_mem=%d", max_reg, max_mem)
-    actions = set(enum_actions(max_reg, max_reg, max_mem))
-    actions = {i: action for i, action in enumerate(actions)}
-    #   logger.debug("Enumerated %d actions", len(actions))
-    return actions
 
 
 class ActionSpaceStorage:
@@ -692,10 +371,10 @@ class AssemblyGame(Environment):
         latency_reward = 0.0
         if include_latency: # cannot be <0 btw
             latencies = self._eval_latency()
-            latency_reward = tfp.stats.percentile(
-                latencies, self._task_spec.latency_quantile * 100
+            latency_reward = np.quantile(
+                latencies, self._task_spec.latency_quantile
             ) * self._task_spec.latency_reward_weight
-        reward = correctness_reward + latency_reward
+        reward = max(correctness_reward - latency_reward, 0.0)
         # if self._num_hits != self._prev_num_hits:
         #     logger.debug(
         #         "AssemblyGame._compute_reward: nh %s, pnh %s, r %s, l %s, c %s",
@@ -746,8 +425,9 @@ class AssemblyGame(Environment):
             # too many components in acme hard-code the structure of TimeStep, and not
             # everything supports reward to be a dictionary, so we concatenate
             # the reward components into a single tensor
-            reward=tf.constant(reward, dtype=tf.float32) if not self._observe_reward_components else tf.constant(
-                np.asarray([reward, correctness, latency]), dtype=tf.float32),
+            reward=(tf.constant(reward, dtype=tf.float32) 
+                        if not self._observe_reward_components else 
+                            tf.constant(np.asarray([reward, correctness, latency]), dtype=tf.float32)),
             discount=tf.constant(1.0, dtype=tf.float32), # NOTE: not sure what discount here means.
             observation=observation,
             # skip latency and correctness
@@ -1649,6 +1329,8 @@ class AssemblyGameModel(models.Model):
 # factory functions
 # #################
 config: AlphaDevConfig = AlphaDevConfig()
+
+wandb_logger = WandbLogger(config=config)
 
 env_spec = make_environment_spec(AssemblyGame(config.task_spec))
 

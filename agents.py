@@ -154,7 +154,6 @@ class DistributedMCTS:
         learning_rate: float = 1e-3,
         discount: float = 0.99,
         environment_spec: Optional[specs.EnvironmentSpec] = None,
-        save_logs: bool = False,
         variable_update_period: int = 1000,
         logger: loggers.Logger = None,
         observers: Optional[acme.utils.observers.base.EnvLoopObserver] = [],
@@ -184,7 +183,6 @@ class DistributedMCTS:
         self._n_step = n_step
         self._learning_rate = learning_rate
         self._discount = discount
-        self._save_logs = save_logs
         self._variable_update_period = variable_update_period
         # set up logging
         if logger is not None:

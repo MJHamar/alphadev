@@ -1,0 +1,158 @@
+import yaml
+import dataclasses
+import ml_collections
+import numpy as np
+
+from utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
+
+from acme.utils.loggers import make_default_logger
+from loggers import WandbLogger
+
+@dataclasses.dataclass
+class AlphaDevConfig(object):
+    """AlphaDev configuration."""
+
+    experiment_name = 'AlphaDev-test'
+    
+    # Environment: spec of the Variable Sort 3 task
+    num_inputs = 17
+    num_mem = 14
+    num_regs = 5
+    items_to_sort = 3
+    correct_reward=1.0
+    correctness_reward_weight=2.0
+    latency_reward_weight=0.5
+    latency_quantile=0.05
+    num_latency_simulations = 10
+    ### Self-Play
+    num_actors = 1 
+    max_moves = 100
+    num_simulations = 5
+    discount = 1.0
+
+    # Root prior exploration noise.
+    root_dirichlet_alpha = 0.03
+    root_exploration_fraction = 0.25
+
+    # UCB formula
+    pb_c_base = 19652
+    pb_c_init = 1.25
+
+    ### Network architecture
+    embedding_dim = 512
+    # representation network
+    representation_use_program = True
+    representation_use_locations = True
+    representation_use_locations_binary = False
+    representation_use_permutation_embedding = False
+    representation_repr_net_res_blocks = 8
+    # Multi-Query Attention
+    representation_attention_head_depth = 128
+    representation_attention_num_heads = 4
+    representation_attention_attention_dropout = False
+    representation_attention_position_encoding = 'absolute'
+    representation_attention_num_layers = 6
+    # Value head
+    value_max = 3.0  # These two parameters are task / reward-
+    value_num_bins = 301  # dependent and need to be adjusted.
+    categorical_value_loss = True # wheether to treat the value functions as a distribution
+
+    ### Training
+    training_steps = 1000 #int(1000e3)
+    batch_size = 8
+    n_step = 5 # TD steps
+    lr_init = 2e-4
+    momentum = 0.9
+    
+    ### Distributed training
+    prefetch_size: int = 4,
+    variable_update_period: int = 50, # aka checkpoint interval
+    target_update_period: int = 10, # aka target interval
+    samples_per_insert: float = 32.0,
+    min_replay_size: int = 1000,
+    max_replay_size: int = 1000000,
+    importance_sampling_exponent: float = 0.2,
+    priority_exponent: float = 0.6,
+    
+    # Logging
+    use_wandb = True
+    wandb_project: str = None
+    wandb_entity: str = None
+    wandb_tags: str = None
+    wandb_notes: str = None
+    wandb_mode: str = None
+    wandb_log_model: str = None
+    wanbd_run_id: str = None
+
+    def __post_init__(self):
+        
+        self.hparams = ml_collections.ConfigDict()
+        self.hparams.embedding_dim
+        # representation network
+        self.hparams.representation = ml_collections.ConfigDict()
+        self.hparams.representation.use_program
+        self.hparams.representation.use_locations
+        self.hparams.representation.use_locations_binary
+        self.hparams.representation.use_permutation_embedding
+        self.hparams.representation.repr_net_res_blocks
+        # Multi-Query Attention
+        self.hparams.representation.attention = ml_collections.ConfigDict()
+        self.hparams.representation.attention.head_depth
+        self.hparams.representation.attention.num_heads
+        self.hparams.representation.attention.attention_dropout
+        self.hparams.representation.attention.position_encoding
+        self.hparams.representation.attention.num_layers
+        # Value head
+        self.hparams.value = ml_collections.ConfigDict()
+        self.hparams.value.value_max
+        self.hparams.value.value_num_bins
+        self.hparams.categorical_value_loss
+        
+        self.input_examples = generate_sort_inputs(
+                items_to_sort=self.inputs_to_sort,
+                max_len=self.num_mem,
+                num_samples=self.num_inputs
+            ),
+        
+        self.task_spec = TaskSpec(
+            max_program_size=self.max_moves,
+            num_inputs=self.num_inputs,
+            num_funcs=len(x86_opcode2int),
+            num_locations=self.num_regs+self.num_mem,
+            num_regs=self.num_regs,
+            num_mem=self.num_mem,
+            num_actions=len(self.input_examples), # original value was 271
+            correct_reward=self.correct_reward,
+            correctness_reward_weight=self.correctness_reward_weight,
+            latency_reward_weight=self.latency_reward_weight,
+            latency_quantile=self.latency_quantile,
+            num_latency_simulations=self.num_latency_simulations,
+            inputs=self.input_examples,
+            observe_reward_components=self.hparams.categorical_value_loss,
+        )
+        
+        if self.use_wandb:
+            wandb_config = {
+                'project': self.wandb_project,
+                'entity': self.wandb_entity,
+                'tags': self.wandb_tags,
+                'notes': self.wandb_notes,
+                'mode': self.wandb_mode,
+                'log_model': self.wandb_log_model,
+            }
+            if self.wanbd_run_id is not None:
+                wandb_config['run_id'] = self.wanbd_run_id
+            self.logger = WandbLogger(wandb_config)
+        else:
+            self.logger = make_default_logger(self.experiment_name)
+
+    @classmethod
+    def from_yaml(cls, path) -> 'AlphaDevConfig':
+        """Create a config from a ml_collections.ConfigDict."""
+        with open(path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+            return cls(**config_dict)
+
+    @staticmethod
+    def visit_softmax_temperature_fn(steps): 
+        return 1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
