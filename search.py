@@ -37,7 +37,7 @@ def dv_mcts(
 
     # Evaluate the prior policy for this state.
     prior, value = evaluation(observation)
-    assert prior.shape == (num_actions,)
+    assert prior.shape == (num_actions,), f"Expected prior shape {(num_actions,)}, got {prior.shape}."
 
     # Add exploration noise to the prior.
     noise = np.random.dirichlet(alpha=[dirichlet_alpha] * num_actions)
@@ -116,7 +116,7 @@ def dv_mcts(
     #                 num_children += 1
     #                 queue.append(c)
     #         max_num_expanded_children = max(max_num_expanded_children, num_children)
-    # logger.debug("MCTS Expanded %d nodes. max expanded children: %d", expanded_nodes, max_num_expanded_children)
+    # print("MCTS Expanded %d nodes. max expanded children: %d" % (expanded_nodes, max_num_expanded_children))
 
     return root
 

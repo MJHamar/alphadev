@@ -24,6 +24,7 @@ from acme.agents import agent
 from acme.agents.tf.mcts import learning
 from acme.agents.tf.mcts import models
 from acme.agents.tf.mcts import types
+from acme.agents.tf.mcts import search
 from acme.tf import utils as tf2_utils
 from acme.tf import variable_utils as tf2_variable_utils
 from acme.utils import counting
@@ -52,7 +53,7 @@ class MCTS(agent.Agent):
       network: snt.Module,
       model: models.Model,
       optimizer: snt.Optimizer,
-      search_policy: Callable[[types.Node], types.Action],
+      search_policy: Callable[[search.Node], types.Action],
       temperature_fn: Callable[[int], float],
       n_step: int,
       discount: float,
@@ -92,7 +93,6 @@ class MCTS(agent.Agent):
     dataset = dataset.batch(batch_size, drop_remainder=True)
 
     tf2_utils.create_variables(network, [environment_spec.observations])
-    logger.debug("Finished creating variables for network")
 
     # Now create the agent components: actor & learner.
 
@@ -151,7 +151,7 @@ class DistributedMCTS:
         network_factory: Callable[[specs.DiscreteArray], snt.Module],
         model_factory: Callable[[specs.EnvironmentSpec], models.Model],
         optimizer_factory: Callable[[], snt.Optimizer],
-        search_policy: Callable[[types.Node], types.Action],
+        search_policy: Callable[[search.Node], types.Action],
         temperature_fn: Callable[[int], float],
         num_actors: int,
         num_simulations: int = 50,

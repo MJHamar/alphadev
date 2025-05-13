@@ -1,3 +1,4 @@
+from typing import Callable, Union
 import yaml
 import dataclasses
 import ml_collections
@@ -37,6 +38,7 @@ class AlphaDevConfig(object):
     # UCB formula
     pb_c_base = 19652
     pb_c_init = 1.25
+    temperature_fn: Union[str, Callable] = 'visit_softmax_temperature_fn'
 
     ### Network architecture
     embedding_dim = 512
@@ -66,56 +68,56 @@ class AlphaDevConfig(object):
     
     ### Distributed training
     distributed: bool = False # whether to use distributed training
-    prefetch_size: int = 4,
-    variable_update_period: int = 50, # aka checkpoint interval
-    target_update_period: int = 10, # aka target interval
-    samples_per_insert: float = 32.0,
-    min_replay_size: int = 1000,
-    max_replay_size: int = 1000000,
-    importance_sampling_exponent: float = 0.2,
-    priority_exponent: float = 0.6,
+    prefetch_size: int = 4
+    variable_update_period: int = 50 # aka checkpoint interval
+    target_update_period: int = 10 # aka target interval
+    samples_per_insert: float = 32.0
+    min_replay_size: int = 1000
+    max_replay_size: int = 1000000
+    importance_sampling_exponent: float = 0.2
+    priority_exponent: float = 0.6
     
     # Logging
-    use_wandb = True
+    use_wandb = False
     wandb_project: str = None
     wandb_entity: str = None
     wandb_tags: str = None
     wandb_notes: str = None
     wandb_mode: str = None
-    wandb_log_model: str = None
     wanbd_run_id: str = None
     # Observers
-    observers: list = []
+    observers: list = dataclasses.field(default_factory=list)
 
     def __post_init__(self):
         
         self.hparams = ml_collections.ConfigDict()
-        self.hparams.embedding_dim
+        self.hparams.embedding_dim = self.embedding_dim
         # representation network
         self.hparams.representation = ml_collections.ConfigDict()
-        self.hparams.representation.use_program
-        self.hparams.representation.use_locations
-        self.hparams.representation.use_locations_binary
-        self.hparams.representation.use_permutation_embedding
-        self.hparams.representation.repr_net_res_blocks
+        self.hparams.representation.use_program = self.representation_use_program
+        self.hparams.representation.use_locations = self.representation_use_locations
+        self.hparams.representation.use_locations_binary = self.representation_use_locations_binary
+        self.hparams.representation.use_permutation_embedding = self.representation_use_permutation_embedding
+        self.hparams.representation.repr_net_res_blocks = self.representation_repr_net_res_blocks
         # Multi-Query Attention
         self.hparams.representation.attention = ml_collections.ConfigDict()
-        self.hparams.representation.attention.head_depth
-        self.hparams.representation.attention.num_heads
-        self.hparams.representation.attention.attention_dropout
-        self.hparams.representation.attention.position_encoding
-        self.hparams.representation.attention.num_layers
+        self.hparams.representation.attention.head_depth = self.representation_attention_head_depth
+        self.hparams.representation.attention.num_heads = self.representation_attention_num_heads
+        self.hparams.representation.attention.attention_dropout = self.representation_attention_attention_dropout
+        self.hparams.representation.attention.position_encoding = self.representation_attention_position_encoding
+        self.hparams.representation.attention.num_layers = self.representation_attention_num_layers
         # Value head
-        self.hparams.value = ml_collections.ConfigDict()
-        self.hparams.value.value_max
-        self.hparams.value.value_num_bins
-        self.hparams.categorical_value_loss
+        self.hparams.value_max = self.value_max
+        self.hparams.value_num_bins = self.value_num_bins
+        self.hparams.categorical_value_loss = self.categorical_value_loss
+        
+        self.temperature_fn = self.visit_softmax_temperature_fn
         
         self.input_examples = generate_sort_inputs(
-                items_to_sort=self.inputs_to_sort,
+                items_to_sort=self.items_to_sort,
                 max_len=self.num_mem,
                 num_samples=self.num_inputs
-            ),
+            )
         
         self.task_spec = TaskSpec(
             max_program_size=self.max_moves,
@@ -124,7 +126,7 @@ class AlphaDevConfig(object):
             num_locations=self.num_regs+self.num_mem,
             num_regs=self.num_regs,
             num_mem=self.num_mem,
-            num_actions=len(self.input_examples), # original value was 271
+            num_actions=240, # original value was 271
             correct_reward=self.correct_reward,
             correctness_reward_weight=self.correctness_reward_weight,
             latency_reward_weight=self.latency_reward_weight,
@@ -141,7 +143,6 @@ class AlphaDevConfig(object):
                 'tags': self.wandb_tags,
                 'notes': self.wandb_notes,
                 'mode': self.wandb_mode,
-                'log_model': self.wandb_log_model,
             }
             if self.wanbd_run_id is not None:
                 wandb_config['run_id'] = self.wanbd_run_id

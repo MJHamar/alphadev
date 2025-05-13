@@ -792,7 +792,7 @@ class RepresentationNet(snn.Module):
         )
         self.attention_encoders = snn.Sequential([
             make_attention_block(name=f'attention_program_sequencer_{i}')
-            for i in range(self._hparams.representation.attention_num_layers)
+            for i in range(self._hparams.representation.attention.num_layers)
         ], name='program_attention')
         
         self.locations_embedder = snn.Sequential(
@@ -1394,13 +1394,17 @@ def make_agent(config: AlphaDevConfig):
             discount=config.discount,
             replay_capacity=config.max_replay_size, # TODO
             num_simulations=config.num_simulations,
-            environment_spec=env_spec,
+            environment_spec=make_environment_spec(environment_factory()),
+            search_policy=search_policy,
+            temperature_fn=config.temperature_fn,
             batch_size=config.batch_size,
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger=config.logger,
         )
 
 def run_single_threaded(config: AlphaDevConfig, agent: MCTS):
+    environment = AssemblyGame(config.task_spec)
+    
     num_episodes = config.training_steps
     for episode in range(num_episodes):
         # a. Reset environment and agent at start of episode

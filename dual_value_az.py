@@ -1,7 +1,6 @@
 """Definition of the AlphaZero learner with a dual value head."""
 import tensorflow as tf
 from acme.agents.tf.mcts.learning import AZLearner
-from acme.agents.tf.mcts.acting import MCTSActor
 from acme.agents.tf.mcts import types
 from acme.agents.tf.mcts import search
 from acme.agents.tf.mcts import models
@@ -12,6 +11,8 @@ from scipy import special
 import dataclasses
 
 from distribution import DistributionSupport
+from acting import MCTSActor
+from search import dv_mcts, DvNode
 
 import logging
 logger = logging.getLogger(__name__)
@@ -125,114 +126,3 @@ class DualValueMCTSActor(MCTSActor):
         self._probs = probs.astype(np.float32)
 
         return action
-
-@dataclasses.dataclass
-class DvNode(search.Node):
-    reward: np.ndarray = np.zeros((3,), dtype=np.float32)
-
-    def expand(self, prior: np.ndarray):
-        """Expands this node, adding child nodes."""
-        assert prior.ndim == 1  # Prior should be a flat vector.
-        assert self.terminal is False, "Can't expand terminal nodes."
-        for a, p in enumerate(prior):
-            self.children[a] = DvNode(prior=p)
-
-# Dual-valued implementation of the MCTS algorithm from 
-# `acme/agents/tf/mcts/search.py`
-def dv_mcts(
-    observation: types.Observation,
-    model: models.Model,
-    search_policy: search.SearchPolicy,
-    evaluation: types.EvaluationFn,
-    num_simulations: int,
-    num_actions: int,
-    discount: float = 1.,
-    dirichlet_alpha: float = 1,
-    exploration_fraction: float = 0.,
-) -> DvNode:
-    """Does Monte Carlo tree search (MCTS), AlphaZero style."""
-
-    # Evaluate the prior policy for this state.
-    prior, value = evaluation(observation)
-    assert prior.shape == (num_actions,)
-
-    # Add exploration noise to the prior.
-    noise = np.random.dirichlet(alpha=[dirichlet_alpha] * num_actions)
-    prior = prior * (1 - exploration_fraction) + noise * exploration_fraction
-
-    # Create a fresh tree search.
-    root = DvNode()
-    root.expand(prior)
-
-    # Save the model state so that we can reset it for each simulation.
-    model.save_checkpoint()
-    for _ in range(num_simulations):
-        # Start a new simulation from the top.
-        trajectory = [root]
-        node = root
-
-        # Generate a trajectory.
-        timestep = None
-        while node.children:
-            # Select an action according to the search policy.
-            action = search_policy(node)
-
-            # Point the node at the corresponding child.
-            node = node.children[action]
-
-            # Step the simulator and add this timestep to the node.
-            timestep = model.step(action)
-            # NOTE: changed line nr. 1
-            node.reward = timestep.reward if timestep.reward is not None else np.zeros((3,), dtype=np.float32)
-            node.terminal = timestep.last()
-            trajectory.append(node)
-
-        if timestep is None:
-            raise ValueError('Generated an empty rollout; this should not happen.')
-
-        # Calculate the bootstrap for leaf nodes.
-        if node.terminal:
-            # If terminal, there is no bootstrap value.
-            value = 0.
-        else:
-            # Otherwise, bootstrap from this node with our value function.
-            prior, value = evaluation(timestep.observation)
-
-            # We also want to expand this node for next time.
-            node.expand(prior)
-
-        # Load the saved model state.
-        model.load_checkpoint()
-
-        # Monte Carlo back-up with bootstrap from value function.
-        ret = value
-        while trajectory:
-            # Pop off the latest node in the trajectory.
-            node = trajectory.pop()
-
-            # Accumulate the discounted return
-            ret *= discount
-            # NOTE: changed line nr. 2
-            ret += node.reward[0] # only the combined (correctness + latency) reward is used
-
-            # Update the node.
-            node.total_value += ret
-            node.visit_count += 1
-
-    # count the number of expanded nodes using BFS
-    # queue = [root]
-    # expanded_nodes = 0
-    # max_num_expanded_children = 0
-    # while queue:
-    #     node = queue.pop(0)
-    #     if node.children:
-    #         expanded_nodes += 1
-    #         num_children = 0
-    #         for c in node.children.values():
-    #             if c.children:
-    #                 num_children += 1
-    #                 queue.append(c)
-    #         max_num_expanded_children = max(max_num_expanded_children, num_children)
-    # logger.debug("MCTS Expanded %d nodes. max expanded children: %d", expanded_nodes, max_num_expanded_children)
-
-    return root

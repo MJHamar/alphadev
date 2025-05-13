@@ -17,7 +17,7 @@ Reimplementation of `acme.agents.tf.mcts.acting` that doesn't such so much.
 
 """A MCTS actor."""
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Sequence, Callable
 
 import acme
 from acme import adders
@@ -34,6 +34,7 @@ from scipy import special
 import sonnet as snt
 import tensorflow as tf
 import tree
+
 
 import logging
 logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ class MCTSActor(acmeMCTSActor):
         adder: Optional[adders.Adder] = None,
         variable_client: Optional[tf2_variable_utils.VariableClient] = None,
         counter: Optional[acme.utils.counting.Counter] = None,
+        post_mcts_observers: Optional[Sequence[Callable[[search.Node], None]]] = [],
     ):
         super().__init__(
             environment_spec=environment_spec,
@@ -68,6 +70,7 @@ class MCTSActor(acmeMCTSActor):
         self._search_policy = search_policy
         self._temperature_fn = temperature_fn
         self._counter = counter
+        self._post_mcts_observers = post_mcts_observers
 
     def _forward(
         self, observation: types.Observation) -> Tuple[types.Probs, types.Value]:
@@ -97,6 +100,9 @@ class MCTSActor(acmeMCTSActor):
             num_actions=self._num_actions,
             discount=self._discount,
         )
+        for observer in self._post_mcts_observers:
+            observer(root)
+        # Select an action according to the search policy.
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
         training_steps = self._counter.get_counts(self._counter.get_steps_key())
