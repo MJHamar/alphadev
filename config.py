@@ -68,7 +68,7 @@ class AlphaDevConfig(object):
     momentum = 0.9
     
     ### Distributed training
-    distributed: bool = False # whether to use distributed training
+    distributed: bool = True # whether to use distributed training
     prefetch_size: int = 4
     variable_update_period: int = 50 # aka checkpoint interval
     target_update_period: int = 10 # aka target interval
@@ -79,17 +79,17 @@ class AlphaDevConfig(object):
     priority_exponent: float = 0.6
     
     # Logging
-    use_wandb = False
-    wandb_project: str = None
-    wandb_entity: str = None
+    use_wandb = True
+    wandb_project: str = 'alphadev'
+    wandb_entity: str = "hamar_m"
     wandb_tags: str = None
     wandb_notes: str = None
-    wandb_mode: str = None
+    wandb_mode: str = 'online'
     wanbd_run_id: str = None
     # Observers
     # TODO: add environment observers
     observe_mcts_policy: bool = True
-    mcts_observer_ratio: float = 0.1
+    mcts_observer_ratio: float = 0.001
 
     def __post_init__(self):
         

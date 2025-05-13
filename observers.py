@@ -46,7 +46,6 @@ class MCTSObserver:
             return self._on_action_selection(node, probs, action, training_steps, temperature)
         return self._noop(node)
 
-
     def on_search_end(self, node):
         """
         Called when the search ends.
