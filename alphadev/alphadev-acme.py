@@ -441,7 +441,6 @@ class AssemblyGame(Environment):
         # deletes the program and resets the
         # CPU state to the original inputs
         # logger.debug("AssemblyGame.reset: state is None %s", state is None)
-        self._prev_num_hits = 0 # in eitheer case we need to reset this
         if state is None:
             self._emulator.reset_state()
             self._reset_program()
@@ -472,7 +471,10 @@ class AssemblyGame(Environment):
             if len(self._program) > 0:
                 # execute the program
                 self._emulator.exe(program=self._program.asm_program)
-            # update the state
+        # calculate the number of hits we have currently,
+        # so reset doesn't return accidentally return positive reward
+        self._prev_num_hits, _ = self._eval_output(self._emulator.memory)
+        # update the state
         return self._update_state()
     
     def step(self, action:int) -> TimeStep:
