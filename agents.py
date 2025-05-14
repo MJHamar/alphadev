@@ -435,13 +435,13 @@ class DistributedMCTS:
             learner = program.add_node(
                 lp.CourierNode(self.learner, replay, counter, logger), label='learner')
 
-        # with program.group('evaluator'):
-        #     program.add_node(
-        #         lp.CourierNode(self.evaluator, learner, counter, logger), label='evaluator')
+        with program.group('evaluator'):
+            program.add_node(
+                lp.CourierNode(self.evaluator, learner, counter, logger), label='evaluator')
 
         with program.group('actor'):
-            # TODO: add multiple actors
-            program.add_node(
-                lp.CourierNode(self.actor, replay, learner, counter, logger), label='actor')
+            for _ in range(self._num_actors):
+                program.add_node(
+                    lp.CourierNode(self.actor, replay, learner, counter, logger), label='actor')
 
         return program
