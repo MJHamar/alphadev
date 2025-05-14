@@ -1,4 +1,4 @@
-from typing import Callable, Union
+from typing import Callable, Union, Optional
 import yaml
 import dataclasses
 import ml_collections
@@ -14,58 +14,58 @@ from loggers import WandbLogger
 class AlphaDevConfig(object):
     """AlphaDev configuration."""
 
-    experiment_name = 'AlphaDev-test'
+    experiment_name: str = 'AlphaDev-test'
     
     # Environment: spec of the Variable Sort 3 task
-    num_inputs = 17
-    num_mem = 14
-    num_regs = 5
-    items_to_sort = 3
-    correct_reward=1.0
-    correctness_reward_weight=2.0
-    latency_reward_weight=0.5
-    latency_quantile=0.05
-    num_latency_simulations = 10
+    num_inputs: int = 17
+    num_mem: int = 14
+    num_regs: int = 5
+    items_to_sort: int = 3
+    correct_reward: float = 1.0
+    correctness_reward_weight: float = 2.0
+    latency_reward_weight: float = 0.5
+    latency_quantile: float = 0.05
+    num_latency_simulations: int = 10
     ### Self-Play
-    num_actors = 1 
-    max_moves = 100
-    num_simulations = 5
-    discount = 1.0
+    num_actors: int = 1 
+    max_moves: int = 100
+    num_simulations: int = 5
+    discount: float = 1.0
 
     # Root prior exploration noise.
-    root_dirichlet_alpha = 0.03
-    root_exploration_fraction = 0.25
+    root_dirichlet_alpha: float = 0.03
+    root_exploration_fraction: float = 0.25
 
     # UCB formula
-    pb_c_base = 19652
-    pb_c_init = 1.25
+    pb_c_base: int = 19652
+    pb_c_init: float = 1.25
     temperature_fn: Union[str, Callable] = 'visit_softmax_temperature_fn'
 
     ### Network architecture
-    embedding_dim = 512
+    embedding_dim: int = 512
     # representation network
-    representation_use_program = True
-    representation_use_locations = True
-    representation_use_locations_binary = False
-    representation_use_permutation_embedding = False
-    representation_repr_net_res_blocks = 8
+    representation_use_program: bool = True
+    representation_use_locations: bool = True
+    representation_use_locations_binary: bool = False
+    representation_use_permutation_embedding: bool = False
+    representation_repr_net_res_blocks: int = 8
     # Multi-Query Attention
-    representation_attention_head_depth = 128
-    representation_attention_num_heads = 4
-    representation_attention_attention_dropout = False
-    representation_attention_position_encoding = 'absolute'
-    representation_attention_num_layers = 6
+    representation_attention_head_depth: int = 128
+    representation_attention_num_heads: int = 4
+    representation_attention_attention_dropout: bool = False
+    representation_attention_position_encoding: str = 'absolute'
+    representation_attention_num_layers: int = 6
     # Value head
-    value_max = 3.0  # These two parameters are task / reward-
-    value_num_bins = 301  # dependent and need to be adjusted.
-    categorical_value_loss = True # wheether to treat the value functions as a distribution
+    value_max: float = 3.0  # These two parameters are task / reward-
+    value_num_bins: int = 301  # dependent and need to be adjusted.
+    categorical_value_loss: bool = True # wheether to treat the value functions as a distribution
 
     ### Training
-    training_steps = 1000 #int(1000e3)
-    batch_size = 8
-    n_step = 5 # TD steps
-    lr_init = 2e-4
-    momentum = 0.9
+    training_steps: int = 1000 #int(1000e3)
+    batch_size: int = 8
+    n_step: int = 5 # TD steps
+    lr_init: float = 2e-4
+    momentum: float = 0.9
     
     ### Distributed training
     distributed: bool = True # whether to use distributed training
@@ -77,15 +77,18 @@ class AlphaDevConfig(object):
     max_replay_size: int = 1000000
     importance_sampling_exponent: float = 0.2
     priority_exponent: float = 0.6
+    lp_launch_type: str = 'local_mp'
+    lp_terminal: str = 'tmux_session'
+    lp_tmux_session_name: str = 'thesis'
     
     # Logging
-    use_wandb = True
+    use_wandb: bool = True
     wandb_project: str = 'alphadev'
     wandb_entity: str = "hamar_m"
-    wandb_tags: str = None
-    wandb_notes: str = None
+    wandb_tags: Optional[str] = None
+    wandb_notes: Optional[str] = None
     wandb_mode: str = 'online'
-    wanbd_run_id: str = None
+    wanbd_run_id: Optional[str] = None
     # Observers
     # TODO: add environment observers
     observe_mcts_policy: bool = True
@@ -156,6 +159,7 @@ class AlphaDevConfig(object):
 def make_logger_factory(config: AlphaDevConfig):
     def _make_logger() -> Logger:
         if config.use_wandb:
+            print('Creating wandb logger')
             wandb_config = {
                 'project': config.wandb_project,
                 'entity': config.wandb_entity,
@@ -167,7 +171,8 @@ def make_logger_factory(config: AlphaDevConfig):
                 wandb_config['run_id'] = config.wanbd_run_id
             logger = WandbLogger(wandb_config)
         else:
-            logger = make_default_logger(config.experiment_name)
+            print('Creating terminal logger')
+            logger = make_default_logger(config.experiment_name, time_delta=0.0)
         
         return logger
     return _make_logger

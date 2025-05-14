@@ -52,11 +52,14 @@ distributed: True
 prefetch_size: 4
 variable_update_period: 50
 target_update_period: 10
-samples_per_insert: 32.0
+samples_per_insert: 2
 min_replay_size: 1000
 max_replay_size: 1000000
 importance_sampling_exponent: 0.2
 priority_exponent: 0.6
+lp_launch_type: 'local_mp'
+lp_terminal: 'tmux_session'
+lp_tmux_session_name: 'thesis'
 
 # Logging
 use_wandb: False

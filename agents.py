@@ -42,9 +42,8 @@ from dual_value_az import DualValueAZLearner, DualValueMCTSActor
 from acting import MCTSActor
 from search import PUCTSearchPolicy
 from observers import MCTSObserver
+from loggers import LoggerService, LoggerServiceWrapper
 
-import logging
-logger = logging.getLogger(__name__)
 
 class MCTS(agent.Agent):
     """A single-process MCTS agent."""
@@ -247,6 +246,8 @@ class DistributedMCTS:
     def learner(self, replay: reverb.Client, counter: counting.Counter,
                 logger: loggers.Logger):
         """The learning part of the agent."""
+        # wrap the logger
+        logger = LoggerServiceWrapper(logger)
         # Create the networks.
         network = self._network_factory(self._env_spec.actions)
 
@@ -289,6 +290,8 @@ class DistributedMCTS:
         logger: loggers.Logger,
     ) -> acme.EnvironmentLoop:
         """The actor process."""
+        # wrap the logger
+        logger = LoggerServiceWrapper(logger)
 
         # Build environment, model, network.
         environment = self._environment_factory()
@@ -358,6 +361,8 @@ class DistributedMCTS:
         logger: loggers.Logger,
     ):
         """The evaluation process."""
+        # wrap the logger
+        logger = LoggerServiceWrapper(logger)
 
         # Build environment, model, network.
         environment = self._environment_factory()
@@ -418,16 +423,21 @@ class DistributedMCTS:
                 lp.CourierNode(counting.Counter), label='counter')
         
         with program.group('logger'):
+            # logger factory defines a write method
+            # LoggerService overrides it with a log method
+            # LoggerServiceWrapper re-overrides it with a write method to
+            # match the interface of the rest of the code
+            # ugly hack but this is a limitation of launchpad
             logger = program.add_node(
-                lp.CourierNode(self._logger_factory), label='logger')
+                lp.CourierNode(LoggerService, self._logger_factory), label='logger')
 
         with program.group('learner'):
             learner = program.add_node(
                 lp.CourierNode(self.learner, replay, counter, logger), label='learner')
 
-        with program.group('evaluator'):
-            program.add_node(
-                lp.CourierNode(self.evaluator, learner, counter, logger), label='evaluator')
+        # with program.group('evaluator'):
+        #     program.add_node(
+        #         lp.CourierNode(self.evaluator, learner, counter, logger), label='evaluator')
 
         with program.group('actor'):
             # TODO: add multiple actors

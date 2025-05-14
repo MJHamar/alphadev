@@ -79,6 +79,7 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
         """
         Called when an action is selected.
         """
+        print(f"writing to the logger service")
         self._logger.write({
             'action': action,
             'probs': probs,

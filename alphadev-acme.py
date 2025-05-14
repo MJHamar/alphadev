@@ -1441,7 +1441,7 @@ def run_distributed(config: AlphaDevConfig, agent: DistributedMCTS):
     # build the distributed agent
     program: lp.Program = agent.build()
     # run the distributed agent
-    lp.launch(program)
+    lp.launch(program, launch_type=config.lp_launch_type, terminal=config.lp_terminal)
 
 def run_alphadev(config: AlphaDevConfig):
     # -- define agent
@@ -1464,7 +1464,7 @@ if __name__ == '__main__':
         config_path = args[0]
         config = AlphaDevConfig.from_yaml(config_path)
     except Exception as e:
-        print("No config file provided. Using default config.")
+        print("No config file provided. Using default config.", e)
         config = AlphaDevConfig()
     # -- run alphadev
     run_alphadev(config)
