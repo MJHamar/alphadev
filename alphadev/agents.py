@@ -38,11 +38,11 @@ import reverb
 import sonnet as snt
 
 import numpy as np
-from dual_value_az import DualValueAZLearner, DualValueMCTSActor
-from acting import MCTSActor
-from search import PUCTSearchPolicy
-from observers import MCTSObserver
-from loggers import LoggerService, LoggerServiceWrapper
+from .dual_value_az import DualValueAZLearner, DualValueMCTSActor
+from .acting import MCTSActor
+from .search import PUCTSearchPolicy
+from .observers import MCTSObserver
+from .loggers import LoggerService, LoggerServiceWrapper
 
 
 class MCTS(agent.Agent):

@@ -17,13 +17,13 @@ from dm_env import Environment, TimeStep, StepType
 import launchpad as lp
 
 from tinyfive.multi_machine import multi_machine
-from agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
-from distribution import DistributionSupport
-from loggers import WandbLogger
-from utils import x86_enumerate_actions, x86_opcode2int, x86_signatures, x86_to_riscv
-from utils import TaskSpec, Program, CPUState, REG_T, MEM_T, IMM_T
-from config import AlphaDevConfig
-from search import PUCTSearchPolicy
+from .agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
+from .distribution import DistributionSupport
+from .loggers import WandbLogger
+from .utils import x86_enumerate_actions, x86_opcode2int, x86_signatures, x86_to_riscv
+from .utils import TaskSpec, Program, CPUState, REG_T, MEM_T, IMM_T
+from .config import AlphaDevConfig
+from .search import PUCTSearchPolicy
 
 import logging
 logger = logging.getLogger(__name__)

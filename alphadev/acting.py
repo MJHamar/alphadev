@@ -35,7 +35,7 @@ import sonnet as snt
 import tensorflow as tf
 import tree
 
-from observers import MCTSObserver
+from .observers import MCTSObserver
 
 import logging
 logger = logging.getLogger(__name__)

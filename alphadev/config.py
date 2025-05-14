@@ -4,11 +4,11 @@ import dataclasses
 import ml_collections
 import numpy as np
 
-from utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
-from observers import MCTSObserver, MCTSPolicyObserver
-
 from acme.utils.loggers import make_default_logger, Logger
-from loggers import WandbLogger
+
+from .utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
+from .observers import MCTSObserver, MCTSPolicyObserver
+from .loggers import WandbLogger
 
 @dataclasses.dataclass
 class AlphaDevConfig(object):

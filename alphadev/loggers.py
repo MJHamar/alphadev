@@ -1,13 +1,6 @@
-import asyncio
-import threading
-import queue
-import sys
 from typing import Callable
 from acme.utils import loggers
 import wandb
-
-from launchpad.nodes.dereference import maybe_dereference
-
 import pickle
 
 class WandbLogger(loggers.Logger):
@@ -51,7 +44,7 @@ class LoggerService(object):
 
 class LoggerServiceWrapper(object):
     def __init__(self, logger):
-        self._logger_service = maybe_dereference(logger)
+        self._logger_service = logger
     def write(self, message):
         """
         Public method to enqueue a log message. This method can be called from any thread.

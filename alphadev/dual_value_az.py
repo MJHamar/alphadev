@@ -10,9 +10,9 @@ import numpy as np
 from scipy import special
 import dataclasses
 
-from distribution import DistributionSupport
-from acting import MCTSActor
-from search import dv_mcts, DvNode
+from .distribution import DistributionSupport
+from .acting import MCTSActor
+from .search import dv_mcts, DvNode
 
 import logging
 logger = logging.getLogger(__name__)
