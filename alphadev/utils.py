@@ -161,30 +161,30 @@ def x86_to_riscv(opcode: str, operands: Tuple[int, int], mem_offset) -> Tuple[st
     """
     
     if opcode == "mv": # move between registers
-        return [lambda _: ("ADD", (operands[0], X0, operands[1]),)]
+        return [("ADD", (operands[0], X0, operands[1]))]
     elif opcode == "lw": # load word from memory to register
-        return [lambda _: ("LW", (operands[1], operands[0]-mem_offset, X0),)]
+        return [("LW", (operands[1], operands[0]-mem_offset, X0))]
     # rd,imm,rs -- rd, rs(imm)
     elif opcode == "sw": # store word from register to memory
-        return [lambda _: ("SW", (operands[0], operands[1]-mem_offset, X0),)] 
+        return [("SW", (operands[0], operands[1]-mem_offset, X0))] 
     # rs1,imm,rs2 -- rs1, rs2(imm)
     elif opcode == "cmp": # compare two registers
-        return [lambda _: ("SUB", (X1, operands[0], operands[1]),)]
+        return [("SUB", (X1, operands[0], operands[1]))]
         # if A > B, then X1 > 0
         # if A < B, then X1 < 0
         # riscv has bge (>=) and blt (<) instructions
     elif opcode == "cmovg": # conditional move if greater than
         return [ # A > B <=> B < A -- 0 < X1
-            lambda pc: ("BLT", (0, X1, pc+8),), 
+            ("BLT", (X0, X1, 8)),
             # skip next instruction if A < B
-            lambda _ : ("ADD", (operands[1], X0, operands[0]),)
+            ("ADD", (operands[1], X0, operands[0]))
             # copy C to D
         ]
     elif opcode == "cmovle": # conditional move if less than or equal
         return [ # A <= B <=> B >= A -- 0 >= X1
-            lambda pc: ("BGE", (0, X1, pc+8),),
+            ("BGE", (X0, X1, 8)),
             # skip next instruction if A > B
-            lambda _ : ("ADD", (operands[1], X0, operands[0]),) 
+            ("ADD", (operands[1], X0, operands[0])) 
             # copy E to F
         ]
     else:
