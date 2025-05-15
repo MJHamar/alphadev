@@ -177,7 +177,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self.mem_read_actions = tf.constant(mem_read_actions)
         self.mem_write_actions = tf.constant(mem_write_actions)
 
-    def get_mask(self, state, history: List[Tuple[str, Tuple[int, int]]]) -> tf.Tensor:
+    def get_mask(self, state: Dict[str, tf.Tensor], history: List[Tuple[str, Tuple[int, int]]]) -> tf.Tensor:
         """
         Get the mask over the action space for the given state and history.
 
@@ -188,13 +188,16 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         _mems_written = set()
 
         def update_history(opcode, operands):
-            # update the history with the action
-            if opcode.startswith("L"):  # (MEM_T, _)
-                _mems_read.add(operands[0])
-            elif opcode.startswith("S"):  # (_, MEM_T)
-                _mems_written.add(operands[1])
+            # update the history with the action.
+            # NOTE: history at this point is in RISC-V format.
+            # both load and store actions have (absolute) address as position 2
+            # rd/rs1 imm rs1/2. It is also in bytes so we divide by 4
+            if opcode.startswith("LW"):  # (MEM_T, _)
+                _mems_read.add(operands[1]//4)
+            elif opcode.startswith("SW"):  # (_, MEM_T)
+                _mems_written.add(operands[1]//4)
 
-        if history is not None:
+        if history:
             # iterate over the history
             for action in history:
                 update_history(*action)
@@ -211,9 +214,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # (E: number of examples, R: number of registers, M: number of memory locations)
         # we consider the largest window of active registers and memory locations
         # so we take their union
-        active_registers = state.register_mask  # shape E x R+(unused) # TODO: we might want to let the emulator know
+        active_registers = state['active_registers']  # shape E x R+(unused) # TODO: we might want to let the emulator know
         active_registers = tf.reduce_any(active_registers, axis=0)  # shape R
-        active_memory = state.memory_mask  # shape E x M
+        active_memory = state['active_memory']  # shape E x M
         active_memory = tf.reduce_any(active_memory, axis=0)  # shape M
 
         assert active_registers.shape[0] == self.max_reg, \
@@ -222,24 +225,22 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             "active memory and max_mem do not match."
 
         # find windows of locations that are valid
-        reg_window = tf.Variable(tf.zeros_like(reg_locs, dtype=tf.bool))
         last_reg = tf.cast(tf.argmax(tf.reverse(tf.cast(active_registers, tf.int64), axis=[0])), tf.int32)
-        last_reg = -last_reg
-        active_registers = tf.tensor_scatter_nd_update(active_registers, [[last_reg]], [True])
-        reg_window.assign(tf.concat([active_registers, tf.zeros([self.max_reg + self.max_mem - self.max_reg], dtype=tf.bool)], axis=0))
-        reg_window = reg_window.read_value()[:self.max_reg]
+        if last_reg != 0: # 0 means window is full
+            last_reg = self.max_reg - last_reg
+            active_registers = tf.tensor_scatter_nd_update(active_registers, [[last_reg]], [True])
+        reg_window = tf.concat([active_registers, tf.zeros((self.max_mem,), dtype=active_registers.dtype)], axis=-1)
 
         # same for the memory locations
-        mem_window = tf.Variable(tf.zeros_like(mem_locs, dtype=tf.bool))
         last_mem = tf.cast(tf.argmax(tf.reverse(tf.cast(active_memory, tf.int64), axis=[0])), tf.int32)
-        last_mem = -last_mem
-        active_memory = tf.tensor_scatter_nd_update(active_memory, [[last_mem]], [True])
-        mem_window.assign(tf.concat([tf.zeros([self.max_reg], dtype=tf.bool), active_memory], axis=0))
-        mem_window = mem_window.read_value()[self.max_reg:]
+        if last_mem != 0: # 0 means window is full
+            last_mem = self.max_mem - last_mem
+            active_memory = tf.tensor_scatter_nd_update(active_memory, [[last_mem]], [True])
+        mem_window = tf.concat([tf.zeros((self.max_reg,), dtype=active_memory.dtype), active_memory], axis=-1)
 
         # Identify register-only actions that access *any* location *outside* the active register window.
         # 1. Get access pattern for locations outside the window:
-        inactive_loc_access = tf.boolean_mask(act_loc_table, ~reg_window)  # Shape (N_inactive_locs, N_actions)
+        inactive_loc_access = tf.boolean_mask(act_loc_table, ~reg_window, axis=0)  # Shape (N_inactive_locs, N_actions)
         # 2. Check for each action if it accesses *any* inactive location:
         accesses_inactive_loc = tf.reduce_any(inactive_loc_access, axis=0)  # Shape (N_actions,)
         # A register-only action is valid if it is a register-only action
@@ -328,7 +329,8 @@ class AssemblyGame(Environment):
         self._emulator = multi_machine(
             mem_size=task_spec.num_mem*4, # 4 bytes per memory location
             num_machines=task_spec.num_inputs,
-            initial_state=self._inputs
+            initial_state=self._inputs,
+            special_x_regs=np.array([1], dtype=np.int32), # TODO: this is the hard-coded X1 register for now.
         )
         # TODO: make this distributed
         self._action_space_storage = x86ActionSpaceStorage(

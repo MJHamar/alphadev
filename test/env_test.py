@@ -51,7 +51,29 @@ sort3_riscv_asm = [
 ]
 x86_reg2int = {'eax': 2, 'ecx': 3, 'edx': 4, 'r8d': 5}
 x86_mem2int = {'(%0)': 0+6, '0x4(%0)': 1+6, '0x8(%0)': 2+6}
+# sort3_x86_asm_rel = [
+#     "lw 6 5",
+#     "lw 7 2",
+#     "lw 8 3",
+#     "sw 5 6",
+#     "sw 3 7",
+#     "sw 2 8",
+#     "cmp 2 3",
+#     "mv 2 4",
+#     "cmovl 3 4",
+#     "cmovg 3 2",
+#     "cmp 5 2",
+#     "mv 5 3",
+#     "cmovl 2 3",
+#     "cmovle 5 2",
+#     "cmp 3 4",
+#     "cmovle 4 5",
+#     "cmovg 4 3",
+# ]
 sort3_x86_asm_rel = [
+    # "mv" : (REG_T, REG_T), # move <reg1>, <reg2> 
+    # "lw" : (MEM_T, REG_T), # move <mem>, <reg1>
+    # "sw" : (REG_T, MEM_T), # move <reg1>, <mem>
     "lw 7 2",
     "lw 8 3",
     "cmp 2 3",
@@ -251,6 +273,28 @@ def test_assembly_game():
     assert np.array_equal(outp, test_cases[:,1,:]), f"Expected {test_cases[:,1,:]}, got {outp}"
     print("Test case 6 passed")
 
+# test case 7 -- see if the action pruning rules allow the program to be executed.
+def test_assembly_game_pruning():
+    game = AssemblyGame(task_spec)
+    # we need to find the integers in the action space corresponding to the instructions
+    # in the program
+    reverse_action_loopup = {tuple(a): i for i, a in game._action_space_storage.actions.items()}
+    for insn in sort3_x86_asm_rel:
+        op, operands = insn[0], insn[1]
+        # get the integer corresponding to the instruction
+        action = reverse_action_loopup[(op, operands)]
+        mask = game.legal_actions()
+        assert mask[action] == True, f"Action {action} ({(op,operands)}) is not legal. Mask: {[f'{i}:{m}' for i, m in enumerate(mask)]}"
+        timestep = game.step(action)
+        print('ts reward', timestep.reward)
+    # check if the output is correct
+    outp = timestep.observation['memory']
+    
+    assert np.array_equal(outp, test_cases[:,1,:]), f"Expected {test_cases[:,1,:]}, got {outp}"
+    print("Test case 7 passed")
+
+
+
 if __name__ == "__main__":
     test_target_correct_1()
     test_pseudo_asm_machine()
@@ -258,4 +302,5 @@ if __name__ == "__main__":
     test_x86_to_riscv()
     test_x86_to_riscv_translation_correct()
     test_assembly_game()
+    test_assembly_game_pruning()
     print("All tests passed")
