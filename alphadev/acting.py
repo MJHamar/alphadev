@@ -36,6 +36,7 @@ import tensorflow as tf
 import tree
 
 from .observers import MCTSObserver
+from .search import visit_count_policy
 
 import logging
 logger = logging.getLogger(__name__)
@@ -106,7 +107,14 @@ class MCTSActor(acmeMCTSActor):
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
         training_steps = self._counter.get_counts()[self._counter.get_steps_key()]
         temperature = self._temperature_fn(training_steps)
-        probs = search.visit_count_policy(root, temperature=temperature)
+        # get the action mask from the model
+        if self._model.needs_reset:
+            self._model.reset(observation)
+        action_mask = self._model.legal_actions(observation)
+        # perform masked visit count policy
+        probs = visit_count_policy(root, temperature=temperature, mask=action_mask)
+        assert probs.shape == (self._num_actions,), f"Expected probs shape {(self._num_actions,)}, got {probs.shape}."
+        # sample an action from the masked visit count policy
         action = np.int32(np.random.choice(self._actions, p=probs))
 
         # Save the policy probs so that we can add them to replay in `observe()`.

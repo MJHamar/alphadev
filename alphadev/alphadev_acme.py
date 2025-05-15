@@ -498,6 +498,9 @@ class AssemblyGame(Environment):
         # and return the updated timestep
         return self._update_state()
     
+    def legal_actions(self) -> np.ndarray:
+        return self._action_space_storage.get_mask(self._last_ts.observation, self._program.asm_program)
+    
     def reward_spec(self):
         return Array(shape=(), dtype=np.float32) if not self._observe_reward_components else Array(shape=(3,), dtype=np.float32)
     def discount_spec(self):
@@ -1314,6 +1317,10 @@ class AssemblyGameModel(models.Model):
     def needs_reset(self) -> bool:
         """Returns whether or not the model needs to be reset."""
         return self._needs_reset
+
+    def legal_actions(self):
+        """Returns the legal actions for the current state."""
+        return self._environment.legal_actions()
 
     def action_spec(self):
         return self._environment.action_spec()

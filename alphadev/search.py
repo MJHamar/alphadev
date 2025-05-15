@@ -1,7 +1,7 @@
 """
 Extension of `acme.agents.tf.mcts.search`
 """
-from acme.agents.tf.mcts.search import SearchPolicy, puct, Node
+from acme.agents.tf.mcts.search import SearchPolicy, puct, Node, check_numerics
 from acme.agents.tf.mcts import types
 from acme.agents.tf.mcts import models
 
@@ -147,3 +147,12 @@ class PUCTSearchPolicy(SearchPolicy):
 
     def __call__(self, node: Node) -> int:
         return dyn_puct(node, self.c_puct_base, self.c_puct_init)
+
+def visit_count_policy(root: Node, temperature: float = 1.0, mask: np.ndarray = None) -> int:
+    visits = root.children_visits
+    masked_visits = visits * mask # multiply by the mask to keep the shape, but make invalid actions impossible to choose    
+    rescaled_visits = masked_visits**(1 / temperature)
+    probs = rescaled_visits / np.sum(rescaled_visits)
+    check_numerics(probs)
+    
+    return probs
