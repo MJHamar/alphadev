@@ -2,7 +2,7 @@
 import numpy as np
 from tinyfive.machine import machine
 from tinyfive.multi_machine import multi_machine, pseudo_asm_machine
-from alphadev.utils import x86_to_riscv
+from alphadev.utils import x86_to_riscv, x86_enumerate_actions
 
 
 sort3_x86_asm = [
@@ -115,14 +115,15 @@ for insn in sort3_riscv_asm_split:
         operands = [operands[0], operands[1], 8]
     sort3_riscv_asm_rel.append([op, *operands])
 
+# manually convert the riscv code to callables that the machine expects
+program = []
+for insn in sort3_riscv_asm_rel:
+    op, operands = insn[0], insn[1:]
+    program.append((op.upper(), operands))
+
 # test case 2 -- test a pseudo instruction machine 
-def test_target_correct_2():
+def test_pseudo_asm_machine():
     m = pseudo_asm_machine(1024)
-    # manually convert the riscv code to callables that the machine expects
-    program = []
-    for insn in sort3_riscv_asm_rel:
-        op, operands = insn[0], insn[1:]
-        program.append((op.upper(), operands))
     # input starts at 0
     for i in range(test_cases.shape[0]):
         inp, out = test_cases[i,0], test_cases[i,1]
@@ -136,11 +137,33 @@ def test_target_correct_2():
         # check if the output is correct
         assert np.array_equal(outp, out), f"Test case {i} failed: expected {out}, got {outp}"
     print("Test case 2 passed")
-    
-# test case 3 -- test translation of x86 to riscv
 
+# test case 3 -- test a multi machine
+def test_multi_machine():
+    m = multi_machine(1024, 13, test_cases[:,0,:])
+    # execute the program on all inputs at once
+    m.exe(program=program)
+    # read the output from memory
+    outp = m.memory[:, :3]
+    # check if the output is correct
+    assert np.array_equal(outp, test_cases[:,1,:])
+    print("Test case 3 passed")
 
+# test case 4 -- test translation of x86 to riscv
+x86_action_space = x86_enumerate_actions(6,5) # 5 regs and 5 mem locattions are more than enough
+def test_x86_to_riscv():
+    riscv_action_space = []
+    for x86_action, x86_operands in x86_action_space.values():
+        riscv_action_space.extend(x86_to_riscv(x86_action, x86_operands, 6))
+    # check if all the actions in the test case are present in the riscv action space
+    for insn in sort3_riscv_asm_rel:
+        op, operands = insn[0], insn[1:]
+        # check if the instruction is in the action space
+        assert (op.upper(), tuple(operands)) in riscv_action_space, f"Instruction {insn} not found in action space"
+    print("Test case 4 passed")
 
 if __name__ == "__main__":
     test_target_correct_1()
-    test_target_correct_2()
+    test_pseudo_asm_machine()
+    test_multi_machine()
+    test_x86_to_riscv()

@@ -163,10 +163,10 @@ def x86_to_riscv(opcode: str, operands: Tuple[int, int], mem_offset) -> Tuple[st
     if opcode == "mv": # move between registers
         return [("ADD", (operands[0], X0, operands[1]))]
     elif opcode == "lw": # load word from memory to register
-        return [("LW", (operands[1], operands[0]-mem_offset, X0))]
+        return [("LW", (operands[1], (operands[0]-mem_offset)*4, X0))]
     # rd,imm,rs -- rd, rs(imm)
     elif opcode == "sw": # store word from register to memory
-        return [("SW", (operands[0], operands[1]-mem_offset, X0))] 
+        return [("SW", (operands[0], (operands[1]-mem_offset)*4, X0))] 
     # rs1,imm,rs2 -- rs1, rs2(imm)
     elif opcode == "cmp": # compare two registers
         return [("SUB", (X1, operands[0], operands[1]))]
@@ -174,18 +174,24 @@ def x86_to_riscv(opcode: str, operands: Tuple[int, int], mem_offset) -> Tuple[st
         # if A < B, then X1 < 0
         # riscv has bge (>=) and blt (<) instructions
     elif opcode == "cmovg": # conditional move if greater than
-        return [ # A > B <=> B < A -- 0 < X1
-            ("BLT", (X0, X1, 8)),
-            # skip next instruction if A < B
-            ("ADD", (operands[1], X0, operands[0]))
-            # copy C to D
+        return [ # jump if A <= B; move otherwise
+            ("BGE", (X0, X1, 8)), # X1 = A - B ; 0 >= A - B ; B >= A
+            ("ADD", (operands[1], X0, operands[0])) # copy C to D
+        ]
+    elif opcode == "cmovge": # conditional move if greater than
+        return [ # jump if A < B; move otherwise
+            ("BLT", (X1, X0, 8)), # X1 = A - B ; A - B < 0 ; A < B
+            ("ADD", (operands[1], X0, operands[0])) # copy C to D
+        ]
+    elif opcode == "cmovl": # conditional move if less than
+        return [ # jump if A >= B; move otherwise
+            ("BGE", (X1, X0, 8)), # X1 = A - B ; A - B >= 0 ; A >= B
+            ("ADD", (operands[1], X0, operands[0])) # copy C to D
         ]
     elif opcode == "cmovle": # conditional move if less than or equal
-        return [ # A <= B <=> B >= A -- 0 >= X1
-            ("BGE", (X0, X1, 8)),
-            # skip next instruction if A > B
-            ("ADD", (operands[1], X0, operands[0])) 
-            # copy E to F
+        return [ # jump if A > B; move otherwise
+            ("BLT", (X0, X1, 8)), # X1 = A - B ; 0 < A - B ; B < A
+            ("ADD", (operands[1], X0, operands[0])) # copy C to D
         ]
     else:
         raise ValueError(f"Unknown opcode: {opcode}")
@@ -197,7 +203,9 @@ x86_signatures = {
     # no load immediates are used in AlphaDev fixed-sort programs
     "cmp" : (REG_T, REG_T),
     "cmovg" : (REG_T, REG_T),
+    "cmovge" : (REG_T, REG_T),
     "cmovle" : (REG_T, REG_T),
+    "cmovl" : (REG_T, REG_T),
     # skip jump instructions, they are not used in the published sort algorithms
     }
 
