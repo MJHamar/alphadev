@@ -2,8 +2,8 @@
 import numpy as np
 from tinyfive.machine import machine
 from tinyfive.multi_machine import multi_machine, pseudo_asm_machine
-from alphadev.utils import x86_to_riscv, x86_enumerate_actions
-
+from alphadev.utils import x86_to_riscv, x86_enumerate_actions, TaskSpec, CPUState, IOExample
+from alphadev.alphadev_acme import x86ActionSpaceStorage, AssemblyGame
 
 sort3_x86_asm = [
     "mov 0x4(%0), %%eax ".strip(),
@@ -49,6 +49,32 @@ sort3_riscv_asm = [
     "add x3 x0 x4", # @84                     move if ( x3-x4 ) >  0 [x3 greater than x4]
     "sw  x3  4 x0", # @88 mov %%ecx, 0x4(%0)
 ]
+x86_reg2int = {'eax': 2, 'ecx': 3, 'edx': 4, 'r8d': 5}
+x86_mem2int = {'(%0)': 0+6, '0x4(%0)': 1+6, '0x8(%0)': 2+6}
+sort3_x86_asm_rel = [
+    "lw 7 2",
+    "lw 8 3",
+    "cmp 2 3",
+    "mv 2 4",
+    "cmovl 3 4",
+    "lw 6 5",
+    "cmovg 3 2",
+    "cmp 5 2",
+    "mv 5 3",
+    "cmovl 2 3",
+    "cmovle 5 2",
+    "sw 2 8",
+    "cmp 3 4",
+    "cmovle 4 5",
+    "sw 5 6",
+    "cmovg 4 3",
+    "sw 3 7",
+]
+sort3_x86_asm_rel = [
+    (insn.split()[0], tuple([int(o) for o in insn.split()[1:]])) for insn in sort3_x86_asm_rel
+]
+
+
 sort3_riscv_asm_split = []
 for insn in sort3_riscv_asm:
     insn = insn.split()
@@ -56,6 +82,16 @@ for insn in sort3_riscv_asm:
     # convert the operands to integers
     operands = [int(op[1:]) if op[0] == 'x' else int(op) for op in operands]
     sort3_riscv_asm_split.append([op, *operands])
+
+# convert the absolute offsets to relative offsets
+# in branching instructions to make them covariant to the current pc
+sort3_riscv_asm_rel = []
+for insn in sort3_riscv_asm_split:
+    op, operands = insn[0], insn[1:]
+    if op.startswith('b'): #bge or blt, the last operand is the offset. always 8
+        operands = [operands[0], operands[1], 8]
+    sort3_riscv_asm_rel.append([op, *operands])
+
 
 # there are 13 possible orderings of 3 numbers with replacement.
 # the above algorithm sorts in descending order.
@@ -106,15 +142,6 @@ def test_target_correct_1():
         assert np.array_equal(outp, out), f"Test case {i} failed: expected {out}, got {outp}"
     print("Test case 1 passed")
 
-# convert the absolute offsets to relative offsets
-# in branching instructions to make them covariant to the current pc
-sort3_riscv_asm_rel = []
-for insn in sort3_riscv_asm_split:
-    op, operands = insn[0], insn[1:]
-    if op.startswith('b'): #bge or blt, the last operand is the offset. always 8
-        operands = [operands[0], operands[1], 8]
-    sort3_riscv_asm_rel.append([op, *operands])
-
 # manually convert the riscv code to callables that the machine expects
 program = []
 for insn in sort3_riscv_asm_rel:
@@ -150,7 +177,8 @@ def test_multi_machine():
     print("Test case 3 passed")
 
 # test case 4 -- test translation of x86 to riscv
-x86_action_space = x86_enumerate_actions(6,5) # 5 regs and 5 mem locattions are more than enough
+x86_action_space = x86_enumerate_actions(6,5) # 6 regs and 5 mem locattions are more than enough
+print("x86 action space size", len(x86_action_space))
 def test_x86_to_riscv():
     riscv_action_space = []
     for x86_action, x86_operands in x86_action_space.values():
@@ -162,8 +190,72 @@ def test_x86_to_riscv():
         assert (op.upper(), tuple(operands)) in riscv_action_space, f"Instruction {insn} not found in action space"
     print("Test case 4 passed")
 
+# test case 5 -- see if translation of x86 to riscv produces the expected output
+def test_x86_to_riscv_translation_correct():
+    action_space_storage = x86ActionSpaceStorage(6,5)
+    # map x86 instructions to integers
+    reverse_action_loopup = {tuple(a): i for i, a in action_space_storage.actions.items()}
+    translated = []
+    for x86insn in sort3_x86_asm_rel:
+        op, operands = x86insn[0], x86insn[1]
+        # check if the instruction is in the action space
+        assert (op, operands) in reverse_action_loopup, f"Instruction {x86insn} not found in action space"
+        idx = reverse_action_loopup[(op, operands)]
+        riscv_asm = action_space_storage.asm_actions[idx]
+        translated.extend(riscv_asm)
+    for translated, og in zip(translated, sort3_riscv_asm_rel):
+        og_op, og_operands = og[0].upper(), tuple(og[1:])
+        print(f"{translated} -- {(og_op, og_operands)}")
+        assert translated == (og_op, og_operands), f"Translated {translated} does not match original {(og_op, og_operands)}"
+    print("Test case 5 passed")
+    
+
+# test case 6 -- see how the AssemblyGame works
+
+task_spec = TaskSpec(
+    max_program_size=25,
+    num_inputs=13,
+    num_funcs=9,
+    num_regs=6,
+    num_mem=3,
+    num_locations=6+5,
+    num_actions=276,
+    correct_reward=1.0,
+    correctness_reward_weight=1.0,
+    latency_reward_weight=1.0,
+    latency_quantile=0.05,
+    num_latency_simulations=10,
+    inputs=IOExample(
+        inputs=test_cases[:,0,:],
+        outputs=test_cases[:,1,:],
+        output_mask=np.ones_like(test_cases[:,1,:], dtype=np.int32),
+    ),
+    observe_reward_components=False
+)
+
+def test_assembly_game():
+    game = AssemblyGame(task_spec)
+    # we need to find the integers in the action space corresponding to the instructions
+    # in the program
+    reverse_action_loopup = {tuple(a): i for i, a in game._action_space_storage.actions.items()}
+    for insn in sort3_x86_asm_rel:
+        op, operands = insn[0], insn[1]
+        # check if the instruction is in the action space
+        assert (op, operands) in reverse_action_loopup, f"Instruction not found. Either the previous test fails as well or there is a mistake in this testcase"
+        # get the integer corresponding to the instruction
+        action = reverse_action_loopup[(op, operands)]
+        game.step(action)
+    # check if the output is correct
+    outp = game._last_ts.observation['memory']
+    
+    assert np.array_equal(outp, test_cases[:,1,:]), f"Expected {test_cases[:,1,:]}, got {outp}"
+    print("Test case 6 passed")
+
 if __name__ == "__main__":
     test_target_correct_1()
     test_pseudo_asm_machine()
     test_multi_machine()
     test_x86_to_riscv()
+    test_x86_to_riscv_translation_correct()
+    test_assembly_game()
+    print("All tests passed")

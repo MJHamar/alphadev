@@ -483,12 +483,13 @@ class AssemblyGame(Environment):
         # append the action to the program
         action_np = action_space.get_np(action)
         action_asm = action_space.get_asm(action)
-        
+        if not isinstance(action_asm, list):
+            action_asm = [action_asm]
         updated_program = self._program.npy_program.copy()
         updated_program[len(self._program),:] = action_np
         self._program = Program(
             npy_program=updated_program,
-            asm_program=self._program.asm_program + [action_asm] # preserves immutability
+            asm_program=self._program.asm_program + action_asm # preserves immutability
         )
         # reset the emulator
         self._emulator.reset_state()

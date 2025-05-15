@@ -161,7 +161,7 @@ def x86_to_riscv(opcode: str, operands: Tuple[int, int], mem_offset) -> Tuple[st
     """
     
     if opcode == "mv": # move between registers
-        return [("ADD", (operands[0], X0, operands[1]))]
+        return [("ADD", (operands[1], X0, operands[0]))]
     elif opcode == "lw": # load word from memory to register
         return [("LW", (operands[1], (operands[0]-mem_offset)*4, X0))]
     # rd,imm,rs -- rd, rs(imm)
