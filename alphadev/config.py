@@ -163,6 +163,7 @@ def make_logger_factory(config: AlphaDevConfig):
             wandb_config = {
                 'project': config.wandb_project,
                 'entity': config.wandb_entity,
+                'name': config.experiment_name,
                 'tags': config.wandb_tags,
                 'notes': config.wandb_notes,
                 'mode': config.wandb_mode,
