@@ -97,6 +97,8 @@ class MCTS(agent.Agent):
 
         # Now create the agent components: actor & learner.
         counter = counting.Counter(None)
+        
+        mcts_observers = mcts_observers(logger)
 
         if use_dual_value_network:
             actor = DualValueMCTSActor(

@@ -301,8 +301,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             if tf.reduce_all(insn == 0):
                 # reached the end of the program
                 break
-            asm_insn = self._npy_reversed.get(tuple(insn))
-            asm_program.append(asm_insn)
+            insn_idx = self._npy_reversed.get(tuple(insn))
+            asm_insn = self.asm_actions.get(insn_idx)
+            asm_program.extend(asm_insn)
         return asm_program
 
 # #################
@@ -474,7 +475,7 @@ class AssemblyGame(Environment):
                 # execute the program
                 self._emulator.exe(program=self._program.asm_program)
         # calculate the number of hits we have currently,
-        # so reset doesn't return accidentally return positive reward
+        # so reset doesn't accidentally return positive reward
         self._prev_num_hits, _ = self._eval_output(self._emulator.memory)
         # update the state
         return self._update_state()
@@ -1415,7 +1416,7 @@ def make_agent(config: AlphaDevConfig):
             batch_size=config.batch_size,
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger=cfg_logger,
-            mcts_observers=[obs(cfg_logger) for obs in config.search_observers],
+            mcts_observers=config.search_observers,
         )
 
 def run_single_threaded(config: AlphaDevConfig, agent: MCTS):
