@@ -110,7 +110,7 @@ class MCTSActor(acmeMCTSActor):
         # get the action mask from the model
         if self._model.needs_reset:
             self._model.reset(observation)
-        action_mask = self._model.legal_actions(observation)
+        action_mask = self._model.legal_actions()
         # perform masked visit count policy
         probs = visit_count_policy(root, temperature=temperature, mask=action_mask)
         assert probs.shape == (self._num_actions,), f"Expected probs shape {(self._num_actions,)}, got {probs.shape}."

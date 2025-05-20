@@ -290,7 +290,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             "no actions left in the action space."
 
         # combine the masks by taking their union
-        return tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask)
+        return tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask).numpy()
 
     def get_space(self) -> ActionSpace:
         return self.action_space_cls(self.actions, self.asm_actions, self.np_actions)

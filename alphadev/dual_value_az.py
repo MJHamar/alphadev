@@ -2,7 +2,6 @@
 import tensorflow as tf
 from acme.agents.tf.mcts.learning import AZLearner
 from acme.agents.tf.mcts import types
-from acme.agents.tf.mcts import search
 from acme.agents.tf.mcts import models
 import dm_env
 import tree
@@ -12,7 +11,7 @@ import dataclasses
 
 from .distribution import DistributionSupport
 from .acting import MCTSActor
-from .search import dv_mcts, DvNode
+from .search import mcts, DvNode, Node, visit_count_policy
 
 import logging
 logger = logging.getLogger(__name__)
@@ -108,7 +107,7 @@ class DualValueMCTSActor(MCTSActor):
 
         # Compute a fresh MCTS plan.
         # NOTE: we use a modified implementation here.
-        root = dv_mcts(
+        root = mcts(
             observation,
             model=self._model,
             search_policy=self._search_policy,
@@ -116,13 +115,20 @@ class DualValueMCTSActor(MCTSActor):
             num_simulations=self._num_simulations,
             num_actions=self._num_actions,
             discount=self._discount,
+            node_class=DvNode,
         )
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
-        training_steps = self._counter.get_counts()
-        training_steps = training_steps.get(self._counter.get_steps_key(), 0)
+        training_steps = self._counter.get_counts().get(self._counter.get_steps_key(), 0)
         temperature = self._temperature_fn(training_steps)
-        probs = search.visit_count_policy(root, temperature=temperature)
+        # get the action mask from the model
+        if self._model.needs_reset:
+            self._model.reset(observation)
+        action_mask = self._model.legal_actions()
+        # perform masked visit count policy
+        probs = visit_count_policy(root, temperature=temperature, mask=action_mask)
+        assert probs.shape == (self._num_actions,), f"Expected probs shape {(self._num_actions,)}, got {probs.shape}."
+        # sample an action from the masked visit count policy
         action = np.int32(np.random.choice(self._actions, p=probs))
 
         # Save the policy probs so that we can add them to replay in `observe()`.
