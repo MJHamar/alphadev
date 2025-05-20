@@ -491,19 +491,28 @@ class AssemblyGame(Environment):
         # update the state
         return self._update_state()
     
-    def step(self, action:int) -> TimeStep:
+    def step(self, actions:Union[List[int], int]) -> TimeStep:
         # logger.debug("AssemblyGame.step: action %s", action)
         action_space = self._action_space_storage.get_space()
-        # append the action to the program
-        action_np = action_space.get_np(action)
-        action_asm = action_space.get_asm(action)
-        if not isinstance(action_asm, list):
-            action_asm = [action_asm]
+        if not isinstance(actions, list):
+            # single action
+            actions = [actions]
+        assert len(self._program) + len(actions) <= self._task_spec.max_program_size, \
+            "Program size exceeded. Current size: %d, action size: %d" % (len(self._program), len(actions))
         updated_program = self._program.npy_program.copy()
-        updated_program[len(self._program),:] = action_np
+        new_asm_program = []
+        for i, action in enumerate(actions):
+            # append the action to the program
+            action_np = action_space.get_np(action)
+            action_asm = action_space.get_asm(action)
+            if not isinstance(action_asm, list):
+                action_asm = [action_asm]
+            updated_program[len(self._program)+i,:] = action_np
+            new_asm_program.extend(action_asm)
+        
         self._program = Program(
             npy_program=updated_program,
-            asm_program=self._program.asm_program + action_asm # preserves immutability
+            asm_program=self._program.asm_program + new_asm_program
         )
         # reset the emulator
         self._emulator.reset_state()

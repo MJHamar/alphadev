@@ -57,22 +57,20 @@ def dv_mcts(
 
         # Generate a trajectory.
         timestep = None
+        actions = []
         while node.children:
             # Select an action according to the search policy.
             action = search_policy(node)
-
             # Point the node at the corresponding child.
             node = node.children[action]
-
-            # Step the simulator and add this timestep to the node.
-            timestep = model.step(action)
-            # NOTE: changed line nr. 1
-            node.reward = timestep.reward if timestep.reward is not None else np.zeros((3,), dtype=np.float32)
-            node.terminal = timestep.last()
+            actions.append(action)
             trajectory.append(node)
-
-        if timestep is None:
-            raise ValueError('Generated an empty rollout; this should not happen.')
+        
+        # Replay the simulator until the current node and expand it.
+        timestep = model.step(actions)
+        # NOTE: changed line nr. 1
+        node.reward = timestep.reward if timestep.reward is not None else np.zeros((3,), dtype=np.float32)
+        node.terminal = timestep.last()
 
         # Calculate the bootstrap for leaf nodes.
         if node.terminal:
