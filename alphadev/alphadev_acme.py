@@ -332,7 +332,7 @@ class AssemblyGame(Environment):
         self._task_spec = task_spec
         self._inputs = task_spec.inputs.inputs
         self._output_mask = task_spec.inputs.output_mask
-        self._outputs = tf.cast(tf.boolean_mask(task_spec.inputs.outputs, self._output_mask), tf.int32)
+        self._outputs = task_spec.inputs.outputs
         self._max_num_hits = tf.math.count_nonzero(self._output_mask)
         # whether to return the correctness and latency components of the reward
         # in the TimeSteps
@@ -358,7 +358,7 @@ class AssemblyGame(Environment):
         )
     
     def _eval_output(self, output: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        masked_output = tf.boolean_mask(output, self._output_mask)
+        masked_output = tf.multiply(output, self._output_mask)
         hits = tf.equal(masked_output, self._outputs)
         num_hits = tf.math.count_nonzero(hits)
         all_hits = tf.equal(num_hits, self._max_num_hits)
@@ -425,7 +425,7 @@ class AssemblyGame(Environment):
         if self._is_invalid:
             self._is_correct = False; self._num_hits = 0
         else:
-            self._is_correct, self._num_hits = self._eval_output(self._emulator.memory)
+            self._is_correct, self._num_hits = self._eval_output(observation['memory'])
         # terminality check
         is_terminal = self._is_correct or self._is_invalid
         

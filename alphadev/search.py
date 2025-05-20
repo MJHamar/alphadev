@@ -8,6 +8,7 @@ from acme.agents.tf.mcts import models
 import dataclasses
 import numpy as np
 
+from tqdm import tqdm
 
 @dataclasses.dataclass
 class DvNode(Node):
@@ -49,7 +50,7 @@ def dv_mcts(
 
     # Save the model state so that we can reset it for each simulation.
     model.save_checkpoint()
-    for _ in range(num_simulations):
+    for _ in tqdm(range(num_simulations), desc='MCTS simulations'):
         # Start a new simulation from the top.
         trajectory = [root]
         node = root
