@@ -102,6 +102,7 @@ class MCTSActor(acmeMCTSActor):
             num_actions=self._num_actions,
             discount=self._discount,
         )
+        logger.debug(f"mcts finished")
         # Select an action according to the search policy.
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.

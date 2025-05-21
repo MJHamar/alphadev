@@ -27,7 +27,7 @@ from .search import PUCTSearchPolicy
 import logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # fix for memory problems
 
@@ -1495,9 +1495,6 @@ if __name__ == '__main__':
     import multiprocessing
     multiprocessing.set_start_method("spawn")
     
-    logging.basicConfig(
-        level=logging.INFO,
-    )
     # -- load config
     import sys
     args = sys.argv[1:]

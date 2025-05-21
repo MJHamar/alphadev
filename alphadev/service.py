@@ -11,6 +11,7 @@ import threading
 import contextlib
 import multiprocessing
 import portpicker
+from time import sleep
 from uuid import uuid4 as uuid
 
 import logging
@@ -173,7 +174,6 @@ class RPCClient(MaybeLogger):
             self._client = client
         
         def __call__(self, *args, **kwargs):
-            
             # Call the method on the client
             payload = {
                 'method': self._method,
@@ -356,6 +356,10 @@ class ReverbService(MaybeLogger):
             port=self._port,
             checkpointer=checkpointer,
         )
+        # keep the server running
+        base_logger.info('Reverb server started on port %s', self._port)
+        while True:
+            sleep(10)
     
     def stop(self):
         """
