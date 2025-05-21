@@ -38,7 +38,7 @@ def test_program():
     prog = Program()
     internal_factory = lambda: Internal(10)
     with prog.group('test'):
-        client = prog.add_service(RPCService('test', instance_factory=internal_factory, conn_config=redis_config))
+        client = prog.add_service(RPCService(instance_factory=internal_factory, conn_config=redis_config))
     worker = multiprocessing.Process(target=runner, args=(client,))
     worker.start()
     prog.launch()
@@ -50,3 +50,4 @@ if __name__ == '__main__':
     import logging
     logging.basicConfig(level=logging.DEBUG)
     test_program()
+    print('test_program passed')

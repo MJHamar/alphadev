@@ -14,7 +14,6 @@ import ml_collections
 from acme.specs import EnvironmentSpec, make_environment_spec, Array, BoundedArray, DiscreteArray
 from acme.agents.tf.mcts import models
 from dm_env import Environment, TimeStep, StepType
-import launchpad as lp
 
 from tinyfive.multi_machine import multi_machine
 from .agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
@@ -1472,9 +1471,9 @@ def run_single_threaded(config: AlphaDevConfig, agent: MCTS):
 
 def run_distributed(config: AlphaDevConfig, agent: DistributedMCTS):
     # build the distributed agent
-    program: lp.Program = agent.build()
+    program = agent.build(config.distributed_backend_config)
     # run the distributed agent
-    lp.launch(program, launch_type=config.lp_launch_type, terminal=config.lp_terminal)
+    program.launch()
 
 def run_alphadev(config: AlphaDevConfig):
     # -- define agent
@@ -1490,6 +1489,9 @@ def run_alphadev(config: AlphaDevConfig):
     # -- save
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+    )
     # -- load config
     import sys
     args = sys.argv[1:]

@@ -77,9 +77,9 @@ class AlphaDevConfig(object):
     max_replay_size: int = 1000000
     importance_sampling_exponent: float = 0.2
     priority_exponent: float = 0.6
-    lp_launch_type: str = 'local_mp'
-    lp_terminal: str = 'tmux_session'
-    lp_tmux_session_name: str = 'thesis'
+    redis_host: str = 'localhost'
+    redis_port: int = 6379
+    redis_db: int = 0
     
     # Logging
     use_wandb: bool = True
@@ -144,6 +144,13 @@ class AlphaDevConfig(object):
         
         self.logger_factory = make_logger_factory(self)
         self.env_observers, self.search_observers = make_observer_factories(self)
+        
+        self.distributed_backend_config = {
+            'type': 'redis',
+            'host': self.redis_host,
+            'port': self.redis_port,
+            'db': self.redis_db
+        }
     
     @classmethod
     def from_yaml(cls, path) -> 'AlphaDevConfig':

@@ -14,7 +14,7 @@
 
 """Defines the distributed MCTS agent topology via Launchpad."""
 
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional, Sequence, Dict
 
 import acme
 from acme import datasets
@@ -33,7 +33,6 @@ import acme.utils
 import acme.utils.observers
 import acme.utils.observers.base
 import dm_env
-import launchpad as lp
 import reverb
 import sonnet as snt
 
@@ -43,6 +42,7 @@ from .acting import MCTSActor
 from .search import PUCTSearchPolicy
 from .observers import MCTSObserver
 from .loggers import LoggerService, LoggerServiceWrapper
+from .service import Program, ReverbService, RPCService, RPCClient
 
 
 class MCTS(agent.Agent):
@@ -413,37 +413,49 @@ class DistributedMCTS:
         return acme.EnvironmentLoop(
             environment, actor, counter=counter, logger=logger, observers=observers)
 
-    def build(self, name='MCTS'):
+    def build(self, connection_config: Dict[str, str]):
         """Builds the distributed agent topology."""
-        program = lp.Program(name=name)
+        program = Program()
 
         with program.group('replay'):
-            replay = program.add_node(lp.ReverbNode(self.replay), label='replay')
+            replay = program.add_service(ReverbService(self.replay))
 
         with program.group('counter'):
-            counter = program.add_node(
-                lp.CourierNode(counting.Counter), label='counter')
-        
+            counter: RPCClient = program.add_service(
+                RPCService(conn_config=connection_config,
+                           instance_factory=counting.Counter))
+
         with program.group('logger'):
-            # logger factory defines a write method
-            # LoggerService overrides it with a log method
-            # LoggerServiceWrapper re-overrides it with a write method to
-            # match the interface of the rest of the code
-            # ugly hack but this is a limitation of launchpad
-            logger = program.add_node(
-                lp.CourierNode(LoggerService, self._logger_factory), label='logger')
+            logger = program.add_service(
+                RPCService(
+                    conn_config=connection_config,
+                    instance_factory=self._logger_factory,
+                    )
+                )
 
         with program.group('learner'):
-            learner = program.add_node(
-                lp.CourierNode(self.learner, replay, counter, logger), label='learner')
+            learner = program.add_service(
+                RPCService(
+                    conn_config=connection_config,
+                    instance_factory=self.learner,
+                    args=(replay, counter, logger))
+                )
 
         with program.group('evaluator'):
-            program.add_node(
-                lp.CourierNode(self.evaluator, learner, counter, logger), label='evaluator')
+            program.add_service(
+                RPCService(
+                    conn_config=connection_config,
+                    instance_factory=self.evaluator,
+                    args=(learner, counter, logger))
+                )
 
         with program.group('actor'):
             for _ in range(self._num_actors):
-                program.add_node(
-                    lp.CourierNode(self.actor, replay, learner, counter, logger), label='actor')
+                program.add_service(
+                    RPCService(
+                        conn_config=connection_config,
+                        instance_factory=self.actor,
+                        args=(replay, learner, counter, logger))
+                    )
 
         return program

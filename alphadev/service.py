@@ -3,23 +3,41 @@ Lightweight implementation of Service objects that wrap different components
 of the distributed training pipeline.
 """
 import reverb
+import socket
 import redis
 import signal
 import pickle
 import threading
 import contextlib
 import multiprocessing
+import portpicker
 from uuid import uuid4 as uuid
 
 import logging
 base_logger = logging.getLogger(__name__)
+base_logger.setLevel(logging.DEBUG)
+no_logger = logging.getLogger('no_logger')
+no_logger.setLevel(logging.INFO)
 
-class _RedisRPCClient:
+address_table = set()
+
+class MaybeLogger:
+    def __init__(self, logger=None):
+        self._logger = logger or no_logger
+    
+    @property
+    def logger(self):
+        return self._logger
+    
+    def set_logger(self, logger):
+        self._logger = logger
+
+class _RedisRPCClient(MaybeLogger):
     """Redis implementation of the RPC client."""
     def __init__(self, redis_config, server_queue, logger=None):
         self._redis_config = redis_config
         self._server_queue = server_queue
-        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{server_queue}')
+        MaybeLogger.__init__(self, logger)
     
     def connect(self):
         self._client = redis.Redis(
@@ -28,12 +46,12 @@ class _RedisRPCClient:
             db=self._redis_config['db']
         )
         self._client.ping()
-        self._logger.debug('Connected to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
+        self.logger.debug('Connected to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
     
     def close(self):
         if hasattr(self, '_client'):
             self._client.close()
-            self._logger.debug('Closed connection to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
+            self.logger.debug('Closed connection to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
     
     def rpc(self, payload):
         self.connect()
@@ -46,35 +64,35 @@ class _RedisRPCClient:
             }
             rpc_call_bin = pickle.dumps(rpc_call)
             self._client.rpush(self._server_queue, rpc_call_bin)
-            self._logger.debug('Sent RPC call to Redis server: %s', rpc_call)
+            self.logger.debug('Sent RPC call to Redis server: %s', rpc_call)
         except redis.exceptions.ConnectionError as e:
-            self._logger.error('Failed to send RPC call to Redis server: %s', e)
+            self.logger.error('Failed to send RPC call to Redis server: %s', e)
             raise RuntimeError('Failed to send RPC call to Redis server') from e
         try:
             # Wait for the response
             response = self._client.blpop(call_id, timeout=5)
             if response:
-                self._logger.debug('Received response from Redis server: %s', response)
+                self.logger.debug('Received response from Redis server: %s', response)
                 return pickle.loads(response[1])
             else:
-                self._logger.error('No response received from Redis server')
+                self.logger.error('No response received from Redis server')
                 raise RuntimeError('No response received from Redis server')
         except redis.exceptions.TimeoutError as e:
-            self._logger.error('Timeout while waiting for response from Redis server: %s', e)
+            self.logger.error('Timeout while waiting for response from Redis server: %s', e)
             raise RuntimeError('Timeout while waiting for response from Redis server') from e
         finally:
             self.close()
 
-class _RedisRPCService:
+class _RedisRPCService(MaybeLogger):
     """Redis implementation of the RPC service."""
     def __init__(self, redis_config, label, logger=None):
+        MaybeLogger.__init__(self, logger)
         self._redis_config = redis_config
         self._label = label
         self._server_queue = f'{label}_queue'
         self._close_key = f'{label}_close'
         self.connect()
         self._client.set(self._close_key, 0)
-        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{label}')
     
     def connect(self):
         self._client = redis.Redis(
@@ -91,7 +109,7 @@ class _RedisRPCService:
     def set_close(self):
         # Set the close key to 1 to signal the service to stop
         self._client.set(self._close_key, 1)
-        self._logger.debug('Set close key for Redis service: %s', self._close_key)
+        self.logger.debug('Set close key for Redis service: %s', self._close_key)
     
     @property
     def should_close(self):
@@ -106,9 +124,9 @@ class _RedisRPCService:
         try:
             payload_bin = pickle.dumps(payload)
             self._client.rpush(key, payload_bin)
-            self._logger.debug('Returned RPC call to Redis server: %s', payload)
+            self.logger.debug('Returned RPC call to Redis server: %s', payload)
         except redis.exceptions.ConnectionError as e:
-            self._logger.error('Failed to return RPC call to Redis server: %s', e)
+            self.logger.error('Failed to return RPC call to Redis server: %s', e)
             raise RuntimeError('Failed to return RPC call to Redis server') from e
     
     def next(self, timeout=5):
@@ -119,7 +137,7 @@ class _RedisRPCService:
             
             if msg_bin:
                 msg = pickle.loads(msg_bin[1])
-                self._logger.debug('Received request from Redis server: %s', msg)
+                self.logger.debug('Received request from Redis server: %s', msg)
                 return_id = msg['id']
                 payload = msg['payload']
                 return lambda p: self._return_rpc(return_id, p), payload
@@ -128,7 +146,7 @@ class _RedisRPCService:
         except redis.exceptions.TimeoutError as e:
             return None, None
 
-class RPCClient:
+class RPCClient(MaybeLogger):
     """
     Exposes a handle for each public method of registered at the corresponding service.
 
@@ -138,19 +156,19 @@ class RPCClient:
     """
     
     def __init__(self, client, methods, logger=None):
+        MaybeLogger.__init__(self, logger)
         self._client = client
         self._methods = methods
         self._set_handlers(methods)
-        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}')
     
-    class _Handler:
+    class _Handler(MaybeLogger):
         """
         Handle the request by calling the corresponding method on the client.
         """
         def __init__(self, method, client, logger=None):
+            MaybeLogger.__init__(self, logger)
             self._method = method
             self._client = client
-            self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{method}')
         
         def __call__(self, *args, **kwargs):
             
@@ -182,7 +200,7 @@ class RPCClient:
             # Create a callable attribute for each method
             setattr(self, method, self._Handler(method, self._client))
 
-class RPCService:
+class RPCService(MaybeLogger):
     """
     Each service object exposes a handle for each public method of the underlying 
     component. 
@@ -199,22 +217,26 @@ class RPCService:
     """
     _registered_methods = {}
     
-    def __init__(self, label:str, conn_config:dict, instance_factory:callable,
+    def __init__(self, 
+                 conn_config:dict,
+                 instance_factory:callable,
+                 args:tuple=(),
                  worker_polling_interval:float=1.0,
                  logger=None):
-        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{label}')
-        self._label = label
+        MaybeLogger.__init__(self, logger)
         self._conn_config = conn_config
         self._worker_polling_interval = worker_polling_interval
-        self._service = self._make_service(conn_config)
-        self._registered_methods = self._discover_methods(instance_factory)
         self._instance_factory = instance_factory
+        self._instance_args = args
+        self._registered_methods = self._discover_methods(instance_factory)
+        self._service = self._make_service(conn_config)
         self._should_run = self._registered_methods.pop('run', None) is not None
         
     def _make_service(self, conn_config):
         type_ = conn_config.pop('type', 'redis')
+        label = self._instance_factory.__name__ + uuid().hex[:4]
         if type_ == 'redis':
-            return _RedisRPCService(conn_config, self._label, self._logger.getChild('service'))
+            return _RedisRPCService(conn_config, label, self.logger.getChild('service'))
         else:
             raise ValueError(f'Unknown service type: {type_}')
     
@@ -243,7 +265,7 @@ class RPCService:
         Run the service. This method is called by the main thread when the
         service is started.
         """
-        instance = self._instance_factory()
+        instance = self._instance_factory(*self._instance_args)
         if self._should_run:
             # span a worker thread to run the instance
             self._runner = threading.Thread(target=instance.run)
@@ -255,7 +277,7 @@ class RPCService:
         self._worker_thread = threading.Thread(target=self._worker)
         self._worker_thread.daemon = False 
         self._worker_thread.start()
-        self._logger.info('Service %s started', self._label)
+        self.logger.info('Service %s started', self._service._label)
     
     def stop(self):
         """
@@ -267,7 +289,7 @@ class RPCService:
             self._runner.join(timeout=5)
         self._worker_thread.join(timeout=5)
         self._service.close()
-        self._logger.info('Service %s stopped', self._label)
+        self.logger.info('Service %s stopped', self._service._label)
     
     def create_handle(self):
         """
@@ -276,20 +298,22 @@ class RPCService:
         return RPCClient(self._service.get_client(), self._registered_methods.keys())
     
     def _discover_methods(self, instance_factory):
-        instance = instance_factory()
+        instance = instance_factory(*self._instance_args)
         methods = {}
         for method_name in dir(instance):
             method = getattr(instance, method_name)
             if callable(method) and not method_name.startswith('_'):
                 methods[method_name] = method
-                self._logger.info('Exposing method: %s', method_name)
+                self.logger.info('Exposing method: %s', method_name)
             elif method_name == '__call__':
                 # also expose the __call__ method, if any
                 methods['__CALL__'] = method
-                self._logger.info('Exposing method: %s', method_name)
+                self.logger.info('Exposing method: %s', method_name)
+            elif method_name == '__CALL__' and callable(method):
+                raise ValueError('__CALL__ is a reserved method name.')
         return methods
 
-class ReverbService():
+class ReverbService(MaybeLogger):
     """
     Reverb service that is given a reverb table constructor and creates a reverb server
     
@@ -306,11 +330,12 @@ class ReverbService():
             checkpoint_time_delta_minutes: Time between async (non-blocking)
                 checkpointing calls.
         """
+        MaybeLogger.__init__(self)
         # credits to dm-launchpad for the implementation, too bad it is not maintained anymore
         self._priority_tables_fn = priority_tables_fn
         self._checkpoint_ctor = checkpoint_ctor
         self._checkpoint_time_delta_minutes = checkpoint_time_delta_minutes
-        # reverb can resolve the address itself.
+        self._port = portpicker.pick_unused_port()
     
     def run(self):
         """
@@ -324,6 +349,7 @@ class ReverbService():
             checkpointer = self._checkpoint_ctor()
         self._server = reverb.Server(
             tables=priority_tables,
+            port=self._port,
             checkpointer=checkpointer,
         )
     
@@ -334,7 +360,7 @@ class ReverbService():
         self._server.stop()
     
     def create_handle(self):
-        return self._server.localhost_client()
+        return reverb.Client(f'localhost:{self._port}')
 
 class Program(object):
     """
@@ -346,13 +372,16 @@ class Program(object):
         self._current_group = None
         self._group_members = 0
     
-    def add_service(self, service: RPCService):
+    def add_service(self, service: RPCService, label: str = ""):
         """
         Add a service to the program.
         """
-        new_label = f'{self._current_group}/{self._group_members}.{service._label}'
-        service._label = new_label
+        new_label = f'{self._current_group}/{self._group_members}'
+        if label is not None:
+            new_label += '.' + label
+        service.set_logger(base_logger.getChild(f'{new_label}'))
         self._services[new_label] = service
+        base_logger.info('Service %s added', new_label)
         return service.create_handle()
     
     def launch(self):
@@ -376,7 +405,7 @@ class Program(object):
                 service.terminate()
                 service.join(timeout=5)
             except Exception as e:
-                base_logger.error('Failed to stop service %s: %s', service._label, e)
+                base_logger.error('Failed to stop service %s', e)
                 continue
         self._services.clear()
     
