@@ -859,10 +859,12 @@ class RepresentationNet(snn.Module):
     def __call__(self, inputs: CPUState):
         # logger.debug("representation_net program shape %s", inputs['program'].shape)
         # inputs is the observation dict
+        logger.debug('RepresentationNet: inputs %s', inputs.keys())
         batch_size = inputs['program'].shape[0]
 
         program_encoding = None
         if self._hparams.representation.use_program:
+            logger.debug('RepresentationNet: encoding program')
             program_encoding = self._encode_program(inputs, batch_size)
 
         if (
@@ -875,6 +877,7 @@ class RepresentationNet(snn.Module):
         # encode the locations (registers and memory) in the CPU state
         locations_encoding = None
         if self._hparams.representation.use_locations:
+            logger.debug('RepresentationNet: encoding locations')
             locations_encoding = self._make_locations_encoding_onehot(
                 inputs, batch_size
             )
@@ -889,6 +892,7 @@ class RepresentationNet(snn.Module):
             raise NotImplementedError(
                 'permutation embedding is not implemented and will not be. keeping for completeness.')
         # aggregate the locations and the program to produce a single output vector
+        logger.debug('RepresentationNet: aggregating locations and program and returning')
         return self.aggregate_locations_program(
             locations_encoding, permutation_embedding, program_encoding, batch_size
         )
@@ -898,11 +902,15 @@ class RepresentationNet(snn.Module):
         program = inputs['program']
         # logger.debug("encode_program: program shape %s", program.shape)
         max_program_size = inputs['program'].shape[1] # TODO: this might not be a constant
+        logger.debug("encode_program: casting program to int32")
         program_length = tf.cast(inputs['program_length'], tf.int32)
+        logger.debug("encode_program: making program onehot")
         program_onehot = self.make_program_onehot(
             program, batch_size, max_program_size
         )
+        logger.debug("encode_program: program_onehot shape %s", program_onehot.shape)
         program_encoding = self.apply_program_mlp_embedder(program_onehot)
+        logger.debug("encode_program: program_encoding shape %s", program_encoding.shape)
         program_encoding = self.apply_program_attention_embedder(program_encoding)
         # select the embedding corresponding to the current instruction in the corr. CPU state
         return self.pad_program_encoding( # size B x num_inputs x embedding_dim
@@ -1008,7 +1016,9 @@ class RepresentationNet(snn.Module):
         return program_encoding
 
     def apply_program_mlp_embedder(self, program_encoding):
+        logger.debug("apply_program_mlp_embedder program shape %s", program_encoding.shape)
         program_encoding = self.program_mlp_embedder(program_encoding)
+        logger.debug("apply_program_mlp_embedder program encoded")
         return program_encoding
 
     def apply_program_attention_embedder(self, program_encoding):
@@ -1209,6 +1219,7 @@ class AlphaDevNetwork(snn.Module):
     
     @staticmethod
     def _return_with_reward_logits(prediction: NetworkOutput) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+        logger.debug("AlphaDevNetwork: return_with_reward_logits")
         return (
             prediction.policy_logits,
             prediction.value,
@@ -1251,9 +1262,9 @@ class AlphaDevNetwork(snn.Module):
         logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
         # inputs is the observation dict
         embedding: tf.Tensor = self._representation_net(inputs)
-        # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
+        logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
         prediction: NetworkOutput = self._prediction_net(embedding)
-        # logger.debug("AlphaDevNetwork: prediction obtained")
+        logger.debug("AlphaDevNetwork: prediction obtained")
         return self._return_fn(prediction)
 
 
@@ -1361,42 +1372,34 @@ class AssemblyGameModel(models.Model):
 # #################
 # Agent definition
 # #################
+class environment_factory:
+    def __init__(self, task_spec: TaskSpec): self._task_spec = task_spec
+    def __call__(self): return AssemblyGame(task_spec=self._task_spec)
+class network_factory:
+    def __init__(self, hparams: ml_collections.ConfigDict, task_spec: TaskSpec): self._hparams = hparams; self._task_spec = task_spec
+    def __call__(self, env_spec: DiscreteArray): return AlphaDevNetwork(hparams=self._hparams, task_spec=self._task_spec)
+class model_factory:
+    def __init__(self, task_spec: TaskSpec): self._task_spec = task_spec
+    def __call__(self, env_spec: EnvironmentSpec): return AssemblyGameModel(task_spec=self._task_spec, name='AssemblyGameModel')
+class optimizer_factory:
+    def __init__(self, learning_rate: float, momentum: float): self._learning_rate = learning_rate; self._momentum = momentum
+    def __call__(self): return snn.optimizers.Momentum(learning_rate=self._learning_rate, momentum=self._momentum)
 
 def make_agent(config: AlphaDevConfig):
     # -- create factories
-    def environment_factory(): # no args
-        return AssemblyGame(
-            task_spec=config.task_spec,
-        )
-    def network_factory(env_spec: DiscreteArray): 
-        # env_spec here is env.actions 
-        # (i.e. enumeration of available actions). we ignore it
-        return AlphaDevNetwork(
-            hparams=config.hparams,
-            task_spec=config.task_spec,
-        )
-
-    def model_factory(env_spec: EnvironmentSpec): # env_spec
-        # again. we ignore the env_spec.
-        return AssemblyGameModel(
-            task_spec=config.task_spec,
-            name='AssemblyGameModel',
-        )
-
-    def optimizer_factory():
-        return snn.optimizers.Momentum(
-            learning_rate=config.lr_init,
-            momentum=config.momentum,
-        )
+    env_factory = environment_factory(config.task_spec)
+    net_factory = network_factory(config.hparams, config.task_spec)
+    mod_factory = model_factory(config.task_spec)
+    opt_factory = optimizer_factory(config.lr_init, config.momentum)
     # -- search policy
     search_policy = PUCTSearchPolicy(config.pb_c_base, config.pb_c_init)
     
     if config.distributed:
         return DistributedMCTS(
-            environment_factory=environment_factory,
-            network_factory=network_factory,
-            model_factory=model_factory,
-            optimizer_factory=optimizer_factory,
+            environment_factory=env_factory,
+            network_factory=net_factory,
+            model_factory=mod_factory,
+            optimizer_factory=opt_factory,
             search_policy=search_policy,
             temperature_fn=config.temperature_fn,
             num_actors=config.num_actors,
@@ -1412,7 +1415,7 @@ def make_agent(config: AlphaDevConfig):
             n_step=config.n_step,
             learning_rate=config.lr_init,
             discount=config.discount,
-            environment_spec=make_environment_spec(environment_factory()),
+            environment_spec=make_environment_spec(env_factory()),
             variable_update_period=config.variable_update_period,
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger_factory=config.logger_factory,
@@ -1422,14 +1425,14 @@ def make_agent(config: AlphaDevConfig):
     else:
         cfg_logger = config.logger_factory()
         return MCTS(
-            network=network_factory(None),
-            model=model_factory(None),
-            optimizer=optimizer_factory(),
+            network=net_factory(None),
+            model=mod_factory(None),
+            optimizer=opt_factory(),
             n_step=config.n_step,
             discount=config.discount,
             replay_capacity=config.max_replay_size, # TODO
             num_simulations=config.num_simulations,
-            environment_spec=make_environment_spec(environment_factory()),
+            environment_spec=make_environment_spec(env_factory()),
             search_policy=search_policy,
             temperature_fn=config.temperature_fn,
             batch_size=config.batch_size,
@@ -1489,6 +1492,9 @@ def run_alphadev(config: AlphaDevConfig):
     # -- save
 
 if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.set_start_method("spawn")
+    
     logging.basicConfig(
         level=logging.INFO,
     )

@@ -142,7 +142,7 @@ class AlphaDevConfig(object):
             observe_reward_components=self.hparams.categorical_value_loss,
         )
         
-        self.logger_factory = make_logger_factory(self)
+        self.logger_factory = logger_factory(self)
         self.env_observers, self.search_observers = make_observer_factories(self)
         
         self.distributed_backend_config = {
@@ -163,37 +163,52 @@ class AlphaDevConfig(object):
     def visit_softmax_temperature_fn(steps): 
         return 1.0 if steps < 500e3 else 0.5 if steps < 750e3 else 0.25
 
-def make_logger_factory(config: AlphaDevConfig):
-    def _make_logger() -> Logger:
-        if config.use_wandb:
+class logger_factory:
+    def __init__(self, config: AlphaDevConfig):
+        self.config = config
+    
+    def __call__(self) -> Logger:
+        if self.config.use_wandb:
             print('Creating wandb logger')
             wandb_config = {
-                'project': config.wandb_project,
-                'entity': config.wandb_entity,
-                'name': config.experiment_name,
-                'tags': config.wandb_tags,
-                'notes': config.wandb_notes,
-                'mode': config.wandb_mode,
+                'project': self.config.wandb_project,
+                'entity': self.config.wandb_entity,
+                'name': self.config.experiment_name,
+                'tags': self.config.wandb_tags,
+                'notes': self.config.wandb_notes,
+                'mode': self.config.wandb_mode,
             }
-            if config.wanbd_run_id is not None:
-                wandb_config['run_id'] = config.wanbd_run_id
+            if self.config.wanbd_run_id is not None:
+                wandb_config['run_id'] = self.config.wanbd_run_id
             logger = WandbLogger(wandb_config)
         else:
             print('Creating terminal logger')
-            logger = make_default_logger(config.experiment_name, time_delta=0.0)
+            logger = make_default_logger(self.config.experiment_name, time_delta=0.0)
         
         return logger
-    return _make_logger
 
-def make_observer_factories(config: AlphaDevConfig):
-    def make_env_observers(logger):
-        return [] # TODO: add environment observers
-    def make_search_observers(logger):
-        search_observers = []
-        if config.observe_mcts_policy:
-            search_observers.append(
-                MCTSPolicyObserver(logger, epsilon=config.mcts_observer_ratio)
-            )
-        return search_observers
+    @property
+    def __name__(self):
+        return 'logger_factory'
+
+class env_observer_factory:
+    def __init__(self, config: AlphaDevConfig):
+        self.config = config
     
-    return make_env_observers, make_search_observers
+    def __call__(self, logger: Logger):
+        return []
+
+class search_observer_factory:
+    def __init__(self, config: AlphaDevConfig):
+        self.config = config
+    
+    def __call__(self, logger: Logger) -> MCTSPolicyObserver:
+        observers = []
+        if self.config.observe_mcts_policy:
+            observers.append(
+                MCTSPolicyObserver(logger, epsilon=self.config.mcts_observer_ratio)
+            )
+        return observers
+    
+def make_observer_factories(config: AlphaDevConfig):
+    return env_observer_factory(config), search_observer_factory(config)

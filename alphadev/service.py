@@ -93,6 +93,7 @@ class _RedisRPCService(MaybeLogger):
         self._close_key = f'{label}_close'
         self.connect()
         self._client.set(self._close_key, 0)
+        self.close()
     
     def connect(self):
         self._client = redis.Redis(
@@ -105,6 +106,7 @@ class _RedisRPCService(MaybeLogger):
     def close(self):
         if hasattr(self, '_client'):
             self._client.close()
+            del self._client
     
     def set_close(self):
         # Set the close key to 1 to signal the service to stop
@@ -220,6 +222,7 @@ class RPCService(MaybeLogger):
     def __init__(self, 
                  conn_config:dict,
                  instance_factory:callable,
+                 instance_cls:type=None,
                  args:tuple=(),
                  worker_polling_interval:float=1.0,
                  logger=None):
@@ -228,7 +231,7 @@ class RPCService(MaybeLogger):
         self._worker_polling_interval = worker_polling_interval
         self._instance_factory = instance_factory
         self._instance_args = args
-        self._registered_methods = self._discover_methods(instance_factory)
+        self._registered_methods = self._discover_methods(instance_cls)
         self._service = self._make_service(conn_config)
         self._should_run = self._registered_methods.pop('run', None) is not None
         
@@ -249,6 +252,7 @@ class RPCService(MaybeLogger):
             # Extract the return function and payload from the incoming request
             return_func, payload = self._service.next(timeout=self._worker_polling_interval)
             if payload is None:
+                self.logger.debug('No payload received, continuing to poll')
                 continue
             method = payload.pop('method')
             arguments = payload.pop('arguments')
@@ -265,6 +269,7 @@ class RPCService(MaybeLogger):
         Run the service. This method is called by the main thread when the
         service is started.
         """
+        
         instance = self._instance_factory(*self._instance_args)
         if self._should_run:
             # span a worker thread to run the instance
@@ -275,7 +280,7 @@ class RPCService(MaybeLogger):
         self._service.connect()
         # start the worker thread
         self._worker_thread = threading.Thread(target=self._worker)
-        self._worker_thread.daemon = False 
+        self._worker_thread.daemon = True
         self._worker_thread.start()
         self.logger.info('Service %s started', self._service._label)
     
@@ -295,13 +300,12 @@ class RPCService(MaybeLogger):
         """
         Create a handle for the service.
         """
-        return RPCClient(self._service.get_client(), self._registered_methods.keys())
+        return RPCClient(self._service.get_client(), list(self._registered_methods.keys()))
     
-    def _discover_methods(self, instance_factory):
-        instance = instance_factory(*self._instance_args)
+    def _discover_methods(self, instance_cls):
         methods = {}
-        for method_name in dir(instance):
-            method = getattr(instance, method_name)
+        for method_name in dir(instance_cls):
+            method = getattr(instance_cls, method_name)
             if callable(method) and not method_name.startswith('_'):
                 methods[method_name] = method
                 self.logger.info('Exposing method: %s', method_name)
@@ -367,8 +371,8 @@ class Program(object):
     Program class that manages the services and returns their handles.
     """
     def __init__(self):
-        self._services = {}
-        self._service_processes = {}
+        self._services = []
+        self._service_processes = []
         self._current_group = None
         self._group_members = 0
     
@@ -377,10 +381,11 @@ class Program(object):
         Add a service to the program.
         """
         new_label = f'{self._current_group}/{self._group_members}'
+        self._group_members += 1
         if label is not None:
             new_label += '.' + label
         service.set_logger(base_logger.getChild(f'{new_label}'))
-        self._services[new_label] = service
+        self._services.append((new_label, service))
         base_logger.info('Service %s added', new_label)
         return service.create_handle()
     
@@ -388,24 +393,23 @@ class Program(object):
         """
         Run all the services in the program in a separate process.
         """
-        for name, service in self._services.items():
-            base_logger.info('Starting service %s', name)
+        for name, service in self._services:
+            base_logger.info('Starting Service %s', name)
             proc = multiprocessing.Process(target=service.run)
             proc.start()
-            self._service_processes[name] = proc
-            base_logger.info('Service %s started', name)
+            self._service_processes.append((name, proc))
     
     def stop(self):
         """
         Stop all the services in the program.
         """
-        for service in self._service_processes.values():
+        for name, service in reversed(self._service_processes):
             try:
                 # send a SIGINT signal to the process
                 service.terminate()
                 service.join(timeout=5)
             except Exception as e:
-                base_logger.error('Failed to stop service %s', e)
+                base_logger.error('Failed to stop service %s %s', name, e)
                 continue
         self._services.clear()
     

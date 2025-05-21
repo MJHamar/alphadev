@@ -252,15 +252,15 @@ class DistributedMCTS:
         logger = LoggerServiceWrapper(logger)
         # Create the networks.
         network = self._network_factory(self._env_spec.actions)
-
+        print('learner network created')
         tf2_utils.create_variables(network, [self._env_spec.observations])
-
+        print('learner make dataset server_address:', replay.server_address)
         # The dataset object to learn from.
         dataset = datasets.make_reverb_dataset(
             server_address=replay.server_address,
             batch_size=self._batch_size,
             prefetch_size=self._prefetch_size)
-
+        print('learner make dataset done')
         # Create the optimizer.
         optimizer = self._optimizer_factory()
 
@@ -303,7 +303,9 @@ class DistributedMCTS:
         mcts_observers = self._mcts_observers(logger)
 
         # Create variable client for communicating with the learner.
+        print('actor create variables')
         tf2_utils.create_variables(network, [self._env_spec.observations])
+        print('actor create variables done')
         variable_client = tf2_variable_utils.VariableClient(
             client=variable_source,
             variables={'network': network.trainable_variables},
@@ -422,14 +424,19 @@ class DistributedMCTS:
 
         with program.group('counter'):
             counter: RPCClient = program.add_service(
-                RPCService(conn_config=connection_config,
-                           instance_factory=counting.Counter))
+                RPCService(
+                    conn_config=connection_config,
+                    instance_factory=counting.Counter,
+                    instance_cls=counting.Counter,
+                )
+            )
 
         with program.group('logger'):
             logger = program.add_service(
                 RPCService(
                     conn_config=connection_config,
                     instance_factory=self._logger_factory,
+                    instance_cls=loggers.Logger,
                     )
                 )
 
@@ -438,6 +445,7 @@ class DistributedMCTS:
                 RPCService(
                     conn_config=connection_config,
                     instance_factory=self.learner,
+                    instance_cls=learning.AZLearner,
                     args=(replay, counter, logger))
                 )
 
@@ -446,6 +454,7 @@ class DistributedMCTS:
                 RPCService(
                     conn_config=connection_config,
                     instance_factory=self.evaluator,
+                    instance_cls=acme.EnvironmentLoop,
                     args=(learner, counter, logger))
                 )
 
@@ -455,6 +464,7 @@ class DistributedMCTS:
                     RPCService(
                         conn_config=connection_config,
                         instance_factory=self.actor,
+                        instance_cls=acme.EnvironmentLoop,
                         args=(replay, learner, counter, logger))
                     )
 
