@@ -2,11 +2,13 @@
 Lightweight implementation of Service objects that wrap different components
 of the distributed training pipeline.
 """
-import abc
 import reverb
 import redis
+import signal
 import pickle
 import threading
+import contextlib
+import multiprocessing
 from uuid import uuid4 as uuid
 
 import logging
@@ -207,6 +209,8 @@ class RPCService:
         type_ = conn_config.pop('type', 'redis')
         if type_ == 'redis':
             return _RedisRPCService(conn_config, self._label, self._logger.getChild('service'))
+        else:
+            raise ValueError(f'Unknown service type: {type_}')
     
     @property
     def _should_stop(self):
@@ -245,7 +249,7 @@ class RPCService:
         self._service.connect()
         # start the worker thread
         self._worker_thread = threading.Thread(target=self._worker)
-        self._worker_thread.daemon = True
+        self._worker_thread.daemon = False 
         self._worker_thread.start()
         self._logger.info('Service %s started', self._label)
     
@@ -256,15 +260,14 @@ class RPCService:
         """
         self._service.set_close()
         if self._should_run:
-            self._runner.join()
-        self._worker_thread.join()
+            self._runner.join(timeout=5)
+        self._worker_thread.join(timeout=5)
         self._service.close()
         self._logger.info('Service %s stopped', self._label)
     
     def create_handle(self):
         """
-        Create a handle for the service. This method is called by the main
-        thread when the service is started.
+        Create a handle for the service.
         """
         return RPCClient(self._service.get_client(), self._registered_methods.keys())
     
@@ -328,3 +331,68 @@ class ReverbService():
     
     def create_handle(self):
         return self._server.localhost_client()
+
+class Program(object):
+    """
+    Program class that manages the services and returns their handles.
+    """
+    def __init__(self):
+        self._services = {}
+        self._service_processes = {}
+        self._current_group = None
+        self._group_members = 0
+    
+    def add_service(self, service: RPCService):
+        """
+        Add a service to the program.
+        """
+        new_label = f'{self._current_group}/{self._group_members}.{service._label}'
+        service._label = new_label
+        self._services[new_label] = service
+        return service.create_handle()
+    
+    def launch(self):
+        """
+        Run all the services in the program in a separate process.
+        """
+        for name, service in self._services.items():
+            base_logger.info('Starting service %s', name)
+            proc = multiprocessing.Process(target=service.run)
+            proc.start()
+            self._service_processes[name] = proc
+            base_logger.info('Service %s started', name)
+    
+    def stop(self):
+        """
+        Stop all the services in the program.
+        """
+        for service in self._service_processes.values():
+            try:
+                # send a SIGINT signal to the process
+                service.terminate()
+                service.join(timeout=5)
+            except Exception as e:
+                base_logger.error('Failed to stop service %s: %s', service._label, e)
+                continue
+        self._services.clear()
+    
+    @contextlib.contextmanager
+    def group(self, label: str):
+        """
+        Creates a group for a collection of homogeneous nodes.
+        
+        credits to dm-launchpad for the implementation.
+        """
+        if not label:
+            raise ValueError('Label should not be empty.')
+        if self._current_group:
+            raise ValueError('group() cannot be nested.')
+        try:
+            self._current_group = label
+            self._group_members = 0
+            yield
+        finally:
+            # Try/finally is to make sure that the current_group is correctly
+            # reset even if an exception occurs.
+            self._current_group = None
+            self._group_members = 0
