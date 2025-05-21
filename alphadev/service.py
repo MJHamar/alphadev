@@ -39,24 +39,23 @@ class _RedisRPCClient:
         self.connect()
         try:
             # Send the payload to the Redis server
-            call_id = uuid()
+            call_id = uuid().hex
             rpc_call = {
                 'id': call_id,
                 'payload': payload
             }
-            self._client.rpush(self._server_queue, rpc_call)
+            rpc_call_bin = pickle.dumps(rpc_call)
+            self._client.rpush(self._server_queue, rpc_call_bin)
             self._logger.debug('Sent RPC call to Redis server: %s', rpc_call)
         except redis.exceptions.ConnectionError as e:
             self._logger.error('Failed to send RPC call to Redis server: %s', e)
             raise RuntimeError('Failed to send RPC call to Redis server') from e
-        finally:
-            self.close()
         try:
             # Wait for the response
             response = self._client.blpop(call_id, timeout=5)
             if response:
                 self._logger.debug('Received response from Redis server: %s', response)
-                return response[0]
+                return pickle.loads(response[1])
             else:
                 self._logger.error('No response received from Redis server')
                 raise RuntimeError('No response received from Redis server')
@@ -97,15 +96,16 @@ class _RedisRPCService:
     @property
     def should_close(self):
         # Check if the close key is set to 1
-        return self._client.get(self._close_key) != 0
+        return self._client.get(self._close_key) == 0
     
     def get_client(self):
         return _RedisRPCClient(self._redis_config, self._server_queue)
     
-    def return_rpc(self, key, payload):
+    def _return_rpc(self, key, payload):
         # Return the payload to the Redis server
         try:
-            self._client.rpush(key, payload)
+            payload_bin = pickle.dumps(payload)
+            self._client.rpush(key, payload_bin)
             self._logger.debug('Returned RPC call to Redis server: %s', payload)
         except redis.exceptions.ConnectionError as e:
             self._logger.error('Failed to return RPC call to Redis server: %s', e)
@@ -115,17 +115,18 @@ class _RedisRPCService:
         # wait for the next request from the Redis server
         # or return None if timeout is reached
         try:
-            msg = self._client.blpop(self._server_queue, timeout=timeout)
-            if msg:
+            msg_bin = self._client.blpop(self._server_queue, timeout=timeout)
+            
+            if msg_bin:
+                msg = pickle.loads(msg_bin[1])
                 self._logger.debug('Received request from Redis server: %s', msg)
-                msg = msg[0]
                 return_id = msg['id']
                 payload = msg['payload']
                 return lambda p: self._return_rpc(return_id, p), payload
             else:
-                return None
+                return None, None
         except redis.exceptions.TimeoutError as e:
-            return None
+            return None, None
 
 class RPCClient:
     """
@@ -161,12 +162,17 @@ class RPCClient:
                     'kwargs': kwargs
                 }
             }
-            payload_bin = pickle.dumps(payload)
             # Send the payload to the client and block until a response is received.
-            result_bin = self._client.rpc(payload_bin)
-            assert result_bin is not None and len(result_bin) > 0, 'No result received from client'
-            result = pickle.loads(result_bin)
+            result = self._client.rpc(payload)
             return result
+    
+    def __call__(self, *args, **kwargs):
+        """
+        Call the method on the client.
+        """
+        if '__CALL__' not in self._methods:
+            raise AttributeError(f'\'RPCClient\' has no __call__ method registered.')
+        return getattr(self, '__CALL__')(*args, **kwargs)
     
     def _set_handlers(self, methods):
         """
@@ -196,6 +202,7 @@ class RPCService:
     def __init__(self, label:str, conn_config:dict, instance_factory:callable,
                  worker_polling_interval:float=1.0,
                  logger=None):
+        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{label}')
         self._label = label
         self._conn_config = conn_config
         self._worker_polling_interval = worker_polling_interval
@@ -203,7 +210,6 @@ class RPCService:
         self._registered_methods = self._discover_methods(instance_factory)
         self._instance_factory = instance_factory
         self._should_run = self._registered_methods.pop('run', None) is not None
-        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{label}')
         
     def _make_service(self, conn_config):
         type_ = conn_config.pop('type', 'redis')
@@ -220,19 +226,17 @@ class RPCService:
         while not self._should_stop:
             # Extract the return function and payload from the incoming request
             return_func, payload = self._service.next(timeout=self._worker_polling_interval)
+            if payload is None:
+                continue
             method = payload.pop('method')
-            arguments = payload.pop('arguments', b'')
-            assert len(args) > 0, 'No arguments provided'
-            # unpickle the args
-            arguments = pickle.loads(arguments)
+            arguments = payload.pop('arguments')
+            assert isinstance(arguments, dict), 'arugments should be a dict'
             args = arguments['args']
             kwargs = arguments['kwargs']
             # call the method
             result = self._registered_methods[method](*args, **kwargs)
-            # pickle the result
-            result_bin = pickle.dumps(result)
             # Call the return function with the payload
-            return_func(result_bin)
+            return_func(result)
     
     def run(self):
         """
@@ -281,7 +285,7 @@ class RPCService:
                 self._logger.info('Exposing method: %s', method_name)
             elif method_name == '__call__':
                 # also expose the __call__ method, if any
-                methods[method_name] = method
+                methods['__CALL__'] = method
                 self._logger.info('Exposing method: %s', method_name)
         return methods
 
