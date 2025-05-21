@@ -10,13 +10,14 @@ import threading
 from uuid import uuid4 as uuid
 
 import logging
-logger = logging.getLogger(__name__)
+base_logger = logging.getLogger(__name__)
 
 class _RedisRPCClient:
     """Redis implementation of the RPC client."""
-    def __init__(self, redis_config, server_queue):
+    def __init__(self, redis_config, server_queue, logger=None):
         self._redis_config = redis_config
         self._server_queue = server_queue
+        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{server_queue}')
     
     def connect(self):
         self._client = redis.Redis(
@@ -25,12 +26,12 @@ class _RedisRPCClient:
             db=self._redis_config['db']
         )
         self._client.ping()
-        logger.debug('Connected to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
+        self._logger.debug('Connected to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
     
     def close(self):
         if hasattr(self, '_client'):
             self._client.close()
-            logger.debug('Closed connection to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
+            self._logger.debug('Closed connection to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
     
     def rpc(self, payload):
         self.connect()
@@ -42,9 +43,9 @@ class _RedisRPCClient:
                 'payload': payload
             }
             self._client.rpush(self._server_queue, rpc_call)
-            logger.debug('Sent RPC call to Redis server: %s', rpc_call)
+            self._logger.debug('Sent RPC call to Redis server: %s', rpc_call)
         except redis.exceptions.ConnectionError as e:
-            logger.error('Failed to send RPC call to Redis server: %s', e)
+            self._logger.error('Failed to send RPC call to Redis server: %s', e)
             raise RuntimeError('Failed to send RPC call to Redis server') from e
         finally:
             self.close()
@@ -52,26 +53,27 @@ class _RedisRPCClient:
             # Wait for the response
             response = self._client.blpop(call_id, timeout=5)
             if response:
-                logger.debug('Received response from Redis server: %s', response)
+                self._logger.debug('Received response from Redis server: %s', response)
                 return response[0]
             else:
-                logger.error('No response received from Redis server')
+                self._logger.error('No response received from Redis server')
                 raise RuntimeError('No response received from Redis server')
         except redis.exceptions.TimeoutError as e:
-            logger.error('Timeout while waiting for response from Redis server: %s', e)
+            self._logger.error('Timeout while waiting for response from Redis server: %s', e)
             raise RuntimeError('Timeout while waiting for response from Redis server') from e
         finally:
             self.close()
 
 class _RedisRPCService:
     """Redis implementation of the RPC service."""
-    def __init__(self, redis_config, label):
+    def __init__(self, redis_config, label, logger=None):
         self._redis_config = redis_config
         self._label = label
         self._server_queue = f'{label}_queue'
         self._close_key = f'{label}_close'
         self.connect()
         self._client.set(self._close_key, 0)
+        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{label}')
     
     def connect(self):
         self._client = redis.Redis(
@@ -88,7 +90,7 @@ class _RedisRPCService:
     def set_close(self):
         # Set the close key to 1 to signal the service to stop
         self._client.set(self._close_key, 1)
-        logger.debug('Set close key for Redis service: %s', self._close_key)
+        self._logger.debug('Set close key for Redis service: %s', self._close_key)
     
     @property
     def should_close(self):
@@ -102,9 +104,9 @@ class _RedisRPCService:
         # Return the payload to the Redis server
         try:
             self._client.rpush(key, payload)
-            logger.debug('Returned RPC call to Redis server: %s', payload)
+            self._logger.debug('Returned RPC call to Redis server: %s', payload)
         except redis.exceptions.ConnectionError as e:
-            logger.error('Failed to return RPC call to Redis server: %s', e)
+            self._logger.error('Failed to return RPC call to Redis server: %s', e)
             raise RuntimeError('Failed to return RPC call to Redis server') from e
     
     def next(self, timeout=5):
@@ -113,7 +115,7 @@ class _RedisRPCService:
         try:
             msg = self._client.blpop(self._server_queue, timeout=timeout)
             if msg:
-                logger.debug('Received request from Redis server: %s', msg)
+                self._logger.debug('Received request from Redis server: %s', msg)
                 msg = msg[0]
                 return_id = msg['id']
                 payload = msg['payload']
@@ -132,20 +134,23 @@ class RPCClient:
     underlying component.
     """
     
-    def __init__(self, client, methods):
+    def __init__(self, client, methods, logger=None):
         self._client = client
         self._methods = methods
         self._set_handlers(methods)
+        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}')
     
     class _Handler:
         """
         Handle the request by calling the corresponding method on the client.
         """
-        def __init__(self, method, client):
+        def __init__(self, method, client, logger=None):
             self._method = method
             self._client = client
+            self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{method}')
         
         def __call__(self, *args, **kwargs):
+            
             # Call the method on the client
             payload = {
                 'method': self._method,
@@ -187,7 +192,8 @@ class RPCService:
     _registered_methods = {}
     
     def __init__(self, label:str, conn_config:dict, instance_factory:callable,
-                 worker_polling_interval:float=1.0):
+                 worker_polling_interval:float=1.0,
+                 logger=None):
         self._label = label
         self._conn_config = conn_config
         self._worker_polling_interval = worker_polling_interval
@@ -195,11 +201,12 @@ class RPCService:
         self._registered_methods = self._discover_methods(instance_factory)
         self._instance_factory = instance_factory
         self._should_run = self._registered_methods.pop('run', None) is not None
+        self._logger = logger or base_logger.getChild(f'{self.__class__.__name__}.{label}')
         
     def _make_service(self, conn_config):
         type_ = conn_config.pop('type', 'redis')
         if type_ == 'redis':
-            return _RedisRPCService(conn_config, self._label)
+            return _RedisRPCService(conn_config, self._label, self._logger.getChild('service'))
     
     @property
     def _should_stop(self):
@@ -240,7 +247,7 @@ class RPCService:
         self._worker_thread = threading.Thread(target=self._worker)
         self._worker_thread.daemon = True
         self._worker_thread.start()
-        logger.info('Service %s started', self._label)
+        self._logger.info('Service %s started', self._label)
     
     def stop(self):
         """
@@ -252,7 +259,7 @@ class RPCService:
             self._runner.join()
         self._worker_thread.join()
         self._service.close()
-        logger.info('Service %s stopped', self._label)
+        self._logger.info('Service %s stopped', self._label)
     
     def create_handle(self):
         """
@@ -268,9 +275,11 @@ class RPCService:
             method = getattr(instance, method_name)
             if callable(method) and not method_name.startswith('_'):
                 methods[method_name] = method
+                self._logger.info('Exposing method: %s', method_name)
             elif method_name == '__call__':
                 # also expose the __call__ method, if any
                 methods[method_name] = method
+                self._logger.info('Exposing method: %s', method_name)
         return methods
 
 class ReverbService():
@@ -316,7 +325,6 @@ class ReverbService():
         Stop the reverb server and clean up the resources used by the service.
         """
         self._server.stop()
-        logger.info('Reverb server stopped.')
     
     def create_handle(self):
         return self._server.localhost_client()
