@@ -9,8 +9,11 @@ import tensorflow as tf
 import numpy as np
 import ml_collections
 import functools
+from acme.specs import DiscreteArray
 
-from .utils import TaskSpec, CPUState, DistributionSupport
+from .config import AlphaDevConfig
+from .utils import TaskSpec, CPUState
+from .distribution import DistributionSupport
 
 import logging
 logger = logging.getLogger(__name__)
@@ -705,3 +708,6 @@ class AlphaDevNetwork(snn.Module):
         logger.debug("AlphaDevNetwork: prediction obtained")
         return self._return_fn(prediction)
 
+class NetworkFactory:
+    def __init__(self, config: AlphaDevConfig): self._hparams = config.hparams; self._task_spec = config.task_spec
+    def __call__(self, _: DiscreteArray): return AlphaDevNetwork(hparams=self._hparams, task_spec=self._task_spec)
