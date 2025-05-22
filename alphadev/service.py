@@ -13,6 +13,7 @@ import contextlib
 import multiprocessing
 from time import sleep
 from uuid import uuid4 as uuid
+import subprocess
 
 import logging
 base_logger = logging.getLogger(__name__)
@@ -430,6 +431,38 @@ class ReverbService(MaybeLogger):
     
     def create_handle(self):
         return reverb.Client(f'localhost:{self._port}')
+
+class SubprocessService(MaybeLogger):
+    """
+    Subprocess service that runs a command in a separate process.
+    
+    The command is run in a separate process and the output is logged to the
+    logger.
+    """
+    def __init__(self, command_builder, args, logger=None):
+        MaybeLogger.__init__(self, logger)
+        self._args, self._handle = command_builder(args)
+        self._label = f'subproc.{command_builder.__name__}'
+        self._process = None
+    
+    def run(self):
+        """
+        Run the command in a separate process.
+        """
+        self._process = subprocess.Popen(self._args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.logger.info('Subprocess %s started', self._label)
+        # log the output of the process
+        for line in iter(self._process.stdout.readline, b''):
+            self.logger.info(line.decode().strip())
+        self._process.stdout.close()
+        self._process.wait()
+        self.logger.info('Subprocess %s stopped', self._label)
+
+    def create_handle(self):
+        """
+        Create a handle for the subprocess.
+        """
+        return self._handle
 
 class Program(object):
     """

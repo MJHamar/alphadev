@@ -12,9 +12,12 @@ Inference server for AlphaDev. Intended to be run as a separate process.
     - Send the results back to the clients
 """
 import os
+import sys
+import yaml
 import time
 import tree
 import tensorflow as tf
+import ml_collections
 from acme.tf import variable_utils as tf2_variable_utils
 import threading
 
@@ -133,3 +136,16 @@ class InferenceClient():
         """
         # Call the inference server with the given arguments
         return self._client.rpc({'args': args, 'kwargs': kwargs}, timeout=20)
+
+def main():
+    """Run the inference server as a standalone process."""
+    config_path = sys.argv[1]
+    with open(config_path, 'r') as f:
+        config_dict = yaml.safe_load(f)
+    config = ml_collections.ConfigDict(config_dict)
+    service = InferenceService(config)
+    logger.info("Starting inference service...")
+    service.run()
+
+if __name__ == '__main__':
+    main()

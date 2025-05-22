@@ -94,7 +94,6 @@ def make_variable_service(config: AlphaDevConfig):
         instance_factory=VariableService,
         args=(config, ),
         instance_cls=VariableService,
-        is_persistent=True,
         logger=logger,
     )
 def make_variable_client(config: AlphaDevConfig):
