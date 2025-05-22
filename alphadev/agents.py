@@ -259,20 +259,19 @@ class DistributedMCTS:
         Runs the inference service in a separate process.
         """
         # create a temporary file where we write the inference config.
-        with TemporaryFile() as f:
-            yaml.dump(config.__dict__(), f)
-            f.flush()
-            f.seek(0)
-            # parameterize the subprocess call
-            subp = SubprocessFactory([
-                sys.executable,
-                '-m',
-                'alphadev.inference_service',
-                os.path.abspath(f.name)
-            ])
-            # create a handle for the inference service
-            handle = InferenceClient(config)
-            return subp, handle
+        temp = TemporaryFile()
+        yaml.dump(config.__dict__(), temp)
+        temp.flush(); temp.seek(0)
+        # parameterize the subprocess call
+        subp = SubprocessFactory([
+            sys.executable,
+            '-m',
+            'alphadev.inference_service',
+            os.path.abspath(temp.name)
+        ])
+        # create a handle for the inference service
+        handle = InferenceClient(config)
+        return subp, handle, temp
 
     def learner(self, replay: reverb.Client, counter: counting.Counter,
                 logger: loggers.Logger):

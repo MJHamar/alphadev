@@ -2,6 +2,7 @@
 Lightweight implementation of Service objects that wrap different components
 of the distributed training pipeline.
 """
+import os
 import abc
 import reverb
 import socket
@@ -441,7 +442,7 @@ class SubprocessService(MaybeLogger):
     """
     def __init__(self, command_builder, args, logger=None):
         MaybeLogger.__init__(self, logger)
-        self._args, self._handle = command_builder(args)
+        self._args, self._handle, self._tempfile = command_builder(args)
         self._label = f'subproc.{command_builder.__name__}'
         self._process = None
     
@@ -456,6 +457,7 @@ class SubprocessService(MaybeLogger):
             self.logger.info(line.decode().strip())
         self._process.stdout.close()
         self._process.wait()
+        self._tempfile.unlink()
         self.logger.info('Subprocess %s stopped', self._label)
 
     def create_handle(self):
