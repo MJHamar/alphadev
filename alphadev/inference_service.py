@@ -21,6 +21,9 @@ import threading
 from .config import AlphaDevConfig
 from .network import AlphaDevNetwork
 from .service import RPCClient, _RedisRPCService, _RedisRPCClient
+from .environment import environment_spec_from_config
+from .variable_service import make_variable_client
+from .service import make_client_backend, make_service_backend
 
 import logging
 logger = logging.getLogger(__name__)
@@ -30,46 +33,25 @@ class InferenceService:
     def __init__(self, config: AlphaDevConfig):
         self.config = config
         self.network = AlphaDevNetwork(config)
-        
-        self.variable_client = self._make_variable_client()
-        
-        self._listener_service = self._make_service()
-        
+        # create variables for the network
+        tf2_variable_utils.create_variables(self.network, environment_spec_from_config(config))
+        # create a client for the variable storage
+        self.variable_client = make_variable_client(config)
+        # update the network weights
+        self.variable_client.update()
+        # make a listener service to listen for requests
+        self._listener_service = make_service_backend(
+            conn_config=self.config.connection_config,
+            label=self.config.inference_service_name,
+            logger=logger.getChild('listener'),
+        )
+        # initialise state.
         self.requests = []
         self.request_callbacks = []
         self._lock = threading.Lock()
         self.start_time = time.time()
         self.batch_size = config.batch_size
         self.accumulation_period = config.inference_accumulation_period
-    
-    def _make_variable_client(self):
-        conn_config = self.config.connection_config
-        service_name = self.config.variable_service_name
-        type_ = conn_config.get('type', 'redis')
-        variable_logger = logger.getChild('variable_client')
-        if type_ == 'redis':
-            connector = _RedisRPCClient(conn_config, service_name, variable_logger.getChild('redis'))
-        else:
-            raise ValueError(f"Unknown connection type: {type_}")
-        
-        client = RPCClient(connector, methods=['get_variables', 'has_variables'], logger=variable_logger)
-        return tf2_variable_utils.VariableClient(
-            client=client,
-            variables={'network': self.network.trainable_variables},
-            update_period=self.config.variable_update_period
-        )
-    
-    def _make_service(self):
-        """Create the RPC service for the inference server.
-        This service will listen for incoming requests
-        """
-        conn_config = self.config.connection_config
-        service_name = self.config.inference_service_name
-        type_ = conn_config.get('type', 'redis')
-        if type_ == 'redis':
-            return _RedisRPCService(conn_config, service_name)
-        else:
-            raise ValueError(f"Unknown connection type: {type_}")
     
     def _batch_requests(self):
         """Batch the requests for inference."""
@@ -138,3 +120,16 @@ class InferenceService:
                 self._process_requests(batch_requests, batch_callbacks)
                 # Get the next batch of requests
                 batch_requests, batch_callbacks = self._batch_requests()
+
+class InferenceClient():
+    def __init__(self, config: AlphaDevConfig):
+        self._config = config
+        self._service_name = config.inference_service_name
+        self._client = make_client_backend(self._config.connection_config, f'{self._service_name}_queue', logger.getChild('client'))
+    
+    def __call__(self, *args, **kwargs):
+        """Call the inference server with the given arguments.
+        Block until the result is available.
+        """
+        # Call the inference server with the given arguments
+        return self._client.rpc({'args': args, 'kwargs': kwargs}, timeout=20)

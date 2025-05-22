@@ -2,6 +2,7 @@
 Lightweight implementation of Service objects that wrap different components
 of the distributed training pipeline.
 """
+import abc
 import reverb
 import socket
 import redis
@@ -30,7 +31,37 @@ class MaybeLogger:
     def set_logger(self, logger):
         self._logger = logger
 
-class _RedisRPCClient(MaybeLogger):
+class _ClientBackend:
+    @abc.abstractmethod
+    def connect(self): pass
+    @abc.abstractmethod
+    def close(self): pass
+    @abc.abstractmethod
+    @contextlib.contextmanager
+    def connection(self): pass
+    @abc.abstractmethod
+    def rpc(self, payload, timeout=5): pass
+
+class _ServiceBackend:
+    @abc.abstractmethod
+    def connect(self): pass
+    @abc.abstractmethod
+    def close(self): pass
+    @abc.abstractmethod
+    @contextlib.contextmanager
+    def connection(self): pass
+    @abc.abstractmethod
+    def set_close(self): pass
+    @abc.abstractmethod
+    def should_close(self): pass
+    @abc.abstractmethod
+    def get_client(self): pass
+    @abc.abstractmethod
+    def _return_rpc(self, key, payload): pass
+    @abc.abstractmethod
+    def next(self, timeout=5): pass
+
+class _RedisRPCClient(_ClientBackend, MaybeLogger):
     """Redis implementation of the RPC client."""
     def __init__(self, redis_config, server_queue, logger=None):
         self._redis_config = redis_config
@@ -60,7 +91,7 @@ class _RedisRPCClient(MaybeLogger):
         finally:
             self.close()
     
-    def rpc(self, payload):
+    def rpc(self, payload, timeout=5):
         with self.connection() as client:
             try:
                 # Send the payload to the Redis server
@@ -77,7 +108,7 @@ class _RedisRPCClient(MaybeLogger):
                 raise RuntimeError('Failed to send RPC call to Redis server') from e
             try:
                 # Wait for the response
-                response = client.blpop(call_id, timeout=5)
+                response = client.blpop(call_id, timeout=timeout)
                 if response:
                     self.logger.debug('Received response from Redis server: %s', response)
                     return pickle.loads(response[1])
@@ -88,7 +119,7 @@ class _RedisRPCClient(MaybeLogger):
                 self.logger.error('Timeout while waiting for response from Redis server: %s', e)
                 raise RuntimeError('Timeout while waiting for response from Redis server') from e
 
-class _RedisRPCService(MaybeLogger):
+class _RedisRPCService(_ServiceBackend, MaybeLogger):
     """Redis implementation of the RPC service."""
     def __init__(self, redis_config, label, logger=None):
         MaybeLogger.__init__(self, logger)
@@ -165,6 +196,22 @@ class _RedisRPCService(MaybeLogger):
                     return None, None
             except redis.exceptions.TimeoutError as e:
                 return None, None
+
+def make_service_backend(conn_config, label, logger) -> _ServiceBackend:
+    type_ = conn_config.get('type', 'redis')
+    if type_ == 'redis':
+        return _RedisRPCService(conn_config, label,
+                                logger=logger.getChild('service') if logger is not None else None)
+    else:
+        raise ValueError(f'Unknown service type: {type_}')
+
+def make_client_backend(conn_config, label, logger=None) -> _ClientBackend:
+        type_ = conn_config.get('type', 'redis')
+        if type_ == 'redis':
+            return _RedisRPCClient(conn_config, label,
+                                   logger=logger.getChild('redis') if logger is not None else None)
+        else:
+            raise ValueError(f"Unknown connection type: {type_}")
 
 class RPCClient(MaybeLogger):
     """
@@ -249,16 +296,13 @@ class RPCService(MaybeLogger):
         self._instance_factory = instance_factory
         self._instance_args = args
         self._registered_methods = self._discover_methods(instance_cls)
-        self._service = self._make_service(conn_config)
+        self._service = make_service_backend(
+            conn_config=conn_config,
+            label=instance_cls.__name__ + '.' + uuid().hex[:4],
+            logger=logger
+        )
         self._should_run = self._registered_methods.pop('run', None) is not None
         
-    def _make_service(self, conn_config):
-        type_ = conn_config.get('type', 'redis')
-        label = self._instance_factory.__name__ + uuid().hex[:4]
-        if type_ == 'redis':
-            return _RedisRPCService(conn_config, label, self.logger.getChild('service'))
-        else:
-            raise ValueError(f'Unknown service type: {type_}')
     
     @property
     def _should_stop(self):

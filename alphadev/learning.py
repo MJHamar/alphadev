@@ -81,7 +81,7 @@ class AZLearner(acme.Learner):
         counts = self._counter.increment(**{'step': 1})
         if counts['step'] % self._variable_update_period == 0:
             logger.debug(f"updating variables at step {counts['step']}")
-            self._variable_service.update({'step': counts['step'], 'variables': self.get_variables()})
+            self._variable_service.update(self.get_variables())
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
         """Exposes the variables for actors to update from."""
