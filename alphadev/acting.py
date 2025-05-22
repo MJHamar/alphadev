@@ -17,7 +17,7 @@ Reimplementation of `acme.agents.tf.mcts.acting` that doesn't such so much.
 
 """A MCTS actor."""
 
-from typing import Optional, Tuple, Sequence, Callable
+from typing import Optional, Tuple, Sequence, Callable, Union
 
 from acme.utils import counting
 from acme import adders
@@ -37,6 +37,7 @@ import tree
 
 from .observers import MCTSObserver
 from .search import visit_count_policy
+from .inference_service import InferenceClient
 
 import logging
 logger = logging.getLogger(__name__)
@@ -50,16 +51,18 @@ class MCTSActor(acmeMCTSActor):
         self,
         environment_spec: specs.EnvironmentSpec,
         model: models.Model,
-        network: snt.Module,
+        network: Union[InferenceClient, snt.Module],
         discount: float,
         num_simulations: int,
         search_policy: callable,
         temperature_fn: callable,
+        variable_client: Optional[InferenceClient] = None,
         adder: Optional[adders.Adder] = None,
-        variable_client: Optional[tf2_variable_utils.VariableClient] = None,
         counter: Optional[counting.Counter] = None,
         observers: Optional[Sequence[MCTSObserver]] = [],
     ):
+        assert variable_client is None or isinstance(network, snt.Module), \
+            'If a variable client is provided, the network must be an snt.Module.'
         super().__init__(
             environment_spec=environment_spec,
             model=model,
@@ -78,10 +81,16 @@ class MCTSActor(acmeMCTSActor):
         self, observation: types.Observation) -> Tuple[types.Probs, types.Value]:
         """Performs a forward pass of the policy-value network."""
         # fix over acme implementation: accepts structured observations
-        logits, value = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
+        if self._add_batch_dim:
+            logits, value = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0)), observation)
+        else:
+            logits, value = self._network(observation)
 
         # Convert to numpy & take softmax.
-        logits = logits.numpy().squeeze(axis=0)
+        if self._add_batch_dim:
+            logits = logits.numpy().squeeze(axis=0)
+        else:
+            logits = logits.numpy()
         value = value.numpy().item()
         probs = special.softmax(logits)
 

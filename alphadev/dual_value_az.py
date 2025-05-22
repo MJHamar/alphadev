@@ -91,10 +91,16 @@ class DualValueMCTSActor(MCTSActor):
     # override the _forward method to account for the correctness and latency logits from the network.
     def _forward(self, observation):
         """Performs a forward pass of the policy-value network."""
-        logits, value, _, _ = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
+        if self._add_batch_dim:
+            logits, value, _, _ = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
+        else:
+            logits, value, _, _ = self._network(observation)
 
         # Convert to numpy & take softmax.
-        logits = logits.numpy().squeeze(axis=0)
+        if self._add_batch_dim:
+            logits = logits.numpy().squeeze(axis=0)
+        else:
+            logits = logits.numpy()
         value = value.numpy().item()
         probs = special.softmax(logits)
 
