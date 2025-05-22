@@ -3,6 +3,7 @@ import yaml
 import dataclasses
 import ml_collections
 import numpy as np
+import portpicker
 
 from acme.utils.loggers import make_default_logger, Logger
 
@@ -80,6 +81,9 @@ class AlphaDevConfig(object):
     redis_host: str = 'localhost'
     redis_port: int = 6379
     redis_db: int = 0
+    inference_service_name: str = 'inference'
+    variable_service_name: str = 'variable'
+    replay_server_port: int = None
     
     # Logging
     use_wandb: bool = True
@@ -151,6 +155,9 @@ class AlphaDevConfig(object):
             'port': self.redis_port,
             'db': self.redis_db
         }
+        
+        if self.replay_server_port is None:
+            self.replay_server_port = portpicker.pick_unused_port()
     
     @classmethod
     def from_yaml(cls, path) -> 'AlphaDevConfig':

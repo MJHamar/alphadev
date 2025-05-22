@@ -10,7 +10,6 @@ import pickle
 import threading
 import contextlib
 import multiprocessing
-import portpicker
 from time import sleep
 from uuid import uuid4 as uuid
 
@@ -19,8 +18,6 @@ base_logger = logging.getLogger(__name__)
 base_logger.setLevel(logging.DEBUG)
 no_logger = logging.getLogger('no_logger')
 no_logger.setLevel(logging.INFO)
-
-address_table = set()
 
 class MaybeLogger:
     def __init__(self, logger=None):
@@ -54,35 +51,42 @@ class _RedisRPCClient(MaybeLogger):
             self._client.close()
             self.logger.debug('Closed connection to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
     
-    def rpc(self, payload):
-        self.connect()
+    @contextlib.contextmanager
+    def connection(self):
+        """Context manager for the Redis client."""
         try:
-            # Send the payload to the Redis server
-            call_id = uuid().hex
-            rpc_call = {
-                'id': call_id,
-                'payload': payload
-            }
-            rpc_call_bin = pickle.dumps(rpc_call)
-            self._client.rpush(self._server_queue, rpc_call_bin)
-            self.logger.debug('Sent RPC call to Redis server: %s', rpc_call)
-        except redis.exceptions.ConnectionError as e:
-            self.logger.error('Failed to send RPC call to Redis server: %s', e)
-            raise RuntimeError('Failed to send RPC call to Redis server') from e
-        try:
-            # Wait for the response
-            response = self._client.blpop(call_id, timeout=5)
-            if response:
-                self.logger.debug('Received response from Redis server: %s', response)
-                return pickle.loads(response[1])
-            else:
-                self.logger.error('No response received from Redis server')
-                raise RuntimeError('No response received from Redis server')
-        except redis.exceptions.TimeoutError as e:
-            self.logger.error('Timeout while waiting for response from Redis server: %s', e)
-            raise RuntimeError('Timeout while waiting for response from Redis server') from e
+            self.connect()
+            yield self._client
         finally:
             self.close()
+    
+    def rpc(self, payload):
+        with self.connection() as client:
+            try:
+                # Send the payload to the Redis server
+                call_id = uuid().hex
+                rpc_call = {
+                    'id': call_id,
+                    'payload': payload
+                }
+                rpc_call_bin = pickle.dumps(rpc_call)
+                client.rpush(self._server_queue, rpc_call_bin)
+                self.logger.debug('Sent RPC call to Redis server: %s', rpc_call)
+            except redis.exceptions.ConnectionError as e:
+                self.logger.error('Failed to send RPC call to Redis server: %s', e)
+                raise RuntimeError('Failed to send RPC call to Redis server') from e
+            try:
+                # Wait for the response
+                response = client.blpop(call_id, timeout=5)
+                if response:
+                    self.logger.debug('Received response from Redis server: %s', response)
+                    return pickle.loads(response[1])
+                else:
+                    self.logger.error('No response received from Redis server')
+                    raise RuntimeError('No response received from Redis server')
+            except redis.exceptions.TimeoutError as e:
+                self.logger.error('Timeout while waiting for response from Redis server: %s', e)
+                raise RuntimeError('Timeout while waiting for response from Redis server') from e
 
 class _RedisRPCService(MaybeLogger):
     """Redis implementation of the RPC service."""
@@ -109,45 +113,58 @@ class _RedisRPCService(MaybeLogger):
             self._client.close()
             del self._client
     
+    @contextlib.contextmanager
+    def connection(self):
+        """Context manager for the Redis client."""
+        try:
+            self.connect()
+            yield self._client
+        finally:
+            self.close()
+    
     def set_close(self):
-        # Set the close key to 1 to signal the service to stop
-        self._client.set(self._close_key, 1)
-        self.logger.debug('Set close key for Redis service: %s', self._close_key)
+        with self.connection() as client:
+            # Set the close key to 1 to signal the service to stop
+            client.set(self._close_key, 1)
+            self.logger.debug('Set close key for Redis service: %s', self._close_key)
     
     @property
     def should_close(self):
         # Check if the close key is set to 1
-        return self._client.get(self._close_key) == 0
+        with self.connection() as client:
+            return client.get(self._close_key) == 0
     
     def get_client(self):
         return _RedisRPCClient(self._redis_config, self._server_queue)
     
     def _return_rpc(self, key, payload):
-        # Return the payload to the Redis server
-        try:
-            payload_bin = pickle.dumps(payload)
-            self._client.rpush(key, payload_bin)
-            self.logger.debug('Returned RPC call to Redis server: %s', payload)
-        except redis.exceptions.ConnectionError as e:
-            self.logger.error('Failed to return RPC call to Redis server: %s', e)
-            raise RuntimeError('Failed to return RPC call to Redis server') from e
+        with self.connection() as client:
+            # Return the payload to the Redis server
+            try:
+                payload_bin = pickle.dumps(payload)
+                client.rpush(key, payload_bin)
+                self.logger.debug('Returned RPC call to Redis server: %s', payload)
+            except redis.exceptions.ConnectionError as e:
+                self.logger.error('Failed to return RPC call to Redis server: %s', e)
+                raise RuntimeError('Failed to return RPC call to Redis server') from e
     
     def next(self, timeout=5):
         # wait for the next request from the Redis server
         # or return None if timeout is reached
-        try:
-            msg_bin = self._client.blpop(self._server_queue, timeout=timeout)
-            
-            if msg_bin:
-                msg = pickle.loads(msg_bin[1])
-                self.logger.debug('Received request from Redis server: %s', msg)
-                return_id = msg['id']
-                payload = msg['payload']
-                return lambda p: self._return_rpc(return_id, p), payload
-            else:
+        with self.connection() as client:
+            try:
+                msg_bin = client.blpop(self._server_queue, timeout=timeout)
+                
+                if msg_bin:
+                    msg = pickle.loads(msg_bin[1])
+                    self.logger.debug('Received request from Redis server: %s', msg)
+                    return_id = msg['id']
+                    payload = msg['payload']
+                    return lambda p: self._return_rpc(return_id, p), payload
+                else:
+                    return None, None
+            except redis.exceptions.TimeoutError as e:
                 return None, None
-        except redis.exceptions.TimeoutError as e:
-            return None, None
 
 class RPCClient(MaybeLogger):
     """
@@ -236,7 +253,7 @@ class RPCService(MaybeLogger):
         self._should_run = self._registered_methods.pop('run', None) is not None
         
     def _make_service(self, conn_config):
-        type_ = conn_config.pop('type', 'redis')
+        type_ = conn_config.get('type', 'redis')
         label = self._instance_factory.__name__ + uuid().hex[:4]
         if type_ == 'redis':
             return _RedisRPCService(conn_config, label, self.logger.getChild('service'))
@@ -324,7 +341,7 @@ class ReverbService(MaybeLogger):
     When create_handle is called, it returns a reverb client that can be used to 
     interact with the reverb server.
     """
-    def __init__(self, priority_tables_fn, checkpoint_ctor=None, checkpoint_time_delta_minutes=None):
+    def __init__(self, priority_tables_fn, port, checkpoint_ctor=None, checkpoint_time_delta_minutes=None):
         """
         Args:
             priority_tables_fn: A mapping from table name to function used to
@@ -339,7 +356,7 @@ class ReverbService(MaybeLogger):
         self._priority_tables_fn = priority_tables_fn
         self._checkpoint_ctor = checkpoint_ctor
         self._checkpoint_time_delta_minutes = checkpoint_time_delta_minutes
-        self._port = portpicker.pick_unused_port()
+        self._port = port
     
     def run(self):
         """
