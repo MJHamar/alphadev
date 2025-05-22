@@ -1,6 +1,5 @@
 """Definition of the AlphaZero learner with a dual value head."""
 import tensorflow as tf
-from acme.agents.tf.mcts.learning import AZLearner
 from acme.agents.tf.mcts import types
 from acme.agents.tf.mcts import models
 import dm_env
@@ -12,6 +11,7 @@ import dataclasses
 from .distribution import DistributionSupport
 from .acting import MCTSActor
 from .search import mcts, DvNode, Node, visit_count_policy
+from .learning import AZLearner
 
 import logging
 logger = logging.getLogger(__name__)
