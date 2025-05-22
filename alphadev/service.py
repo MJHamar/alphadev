@@ -266,10 +266,12 @@ class RPCService(MaybeLogger):
                  instance_factory:callable,
                  instance_cls:type=None,
                  args:tuple=(),
+                 fork_worker:bool=True,
                  worker_polling_interval:float=1.0,
                  logger=None):
         MaybeLogger.__init__(self, logger)
         self._conn_config = conn_config
+        self._fork_worker = fork_worker
         self._worker_polling_interval = worker_polling_interval
         self._instance_factory = instance_factory
         self._instance_args = args
@@ -280,7 +282,7 @@ class RPCService(MaybeLogger):
             logger=logger
         )
         self._should_run = self._registered_methods.pop('run', None) is not None
-        
+        assert fork_worker or self._should_run, 'fork_worker should be True if run is not defined'
     
     @property
     def _should_stop(self):

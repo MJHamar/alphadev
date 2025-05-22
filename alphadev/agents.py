@@ -386,7 +386,9 @@ class DistributedMCTS:
 
         # Build environment, model, network.
         environment = self._environment_factory()
+        print('evaluator environment created', type(environment))
         model = self._model_factory(self._env_spec)
+        print('evaluator model created: type: %s' % type(model))
 
         mcts_observers = self._mcts_observers(logger)
 
@@ -480,7 +482,8 @@ class DistributedMCTS:
                     conn_config=config.distributed_backend_config,
                     instance_factory=self.evaluator,
                     instance_cls=acme.EnvironmentLoop,
-                    args=(inference, counter, logger))
+                    args=(inference, counter, logger),
+                    fork_worker=False)
                 )
 
         # with program.group('actor'):

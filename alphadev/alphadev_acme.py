@@ -150,7 +150,7 @@ def run_alphadev(config: AlphaDevConfig):
 
 if __name__ == '__main__':
     import multiprocessing
-    multiprocessing.set_start_method("spawn")
+    multiprocessing.set_start_method("spawn", force=True)
     
     # -- load config
     import sys

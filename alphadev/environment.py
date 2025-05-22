@@ -12,6 +12,7 @@ from .utils import (
     x86_enumerate_actions, x86_opcode2int, x86_signatures, x86_to_riscv,
     REG_T, MEM_T, IMM_T, Program, CPUState,
 )
+import multiprocessing as mp
 
 # #################
 # Action Spaces 
@@ -301,6 +302,7 @@ class AssemblyGame(Environment):
             task_spec: Task specification for the environment.
             inputs: Inputs to the environment.
         """
+        print(mp.current_process().pid, 'AssemblyGame.__init__')
         self._task_spec = task_spec
         self._inputs = task_spec.inputs.inputs
         self._output_mask = task_spec.inputs.output_mask
@@ -330,10 +332,12 @@ class AssemblyGame(Environment):
         )
     
     def _eval_output(self, output: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
+        print(mp.current_process().pid, 'AssemblyGame._eval_output output:', output.shape)
         masked_output = tf.multiply(output, self._output_mask)
         hits = tf.equal(masked_output, self._outputs)
         num_hits = tf.math.count_nonzero(hits)
         all_hits = tf.equal(num_hits, self._max_num_hits)
+        print(mp.current_process().pid, 'AssemblyGame._eval_output all_hits:', all_hits, 'num_hits:', num_hits)
         return tf.cast(all_hits, dtype=tf.float32), tf.cast(num_hits, dtype=tf.float32)
     
     def _eval_latency(self) -> tf.Tensor:
@@ -391,23 +395,27 @@ class AssemblyGame(Environment):
     
     def _update_state(self):
         # first we make an observation
+        print(mp.current_process().pid, 'AssemblyGame. make observation')
         observation = self._make_observation()
         # then we check if the program is correct
+        print(mp.current_process().pid, 'AssemblyGame._check_invalid')
         self._is_invalid = self._check_invalid()
         if self._is_invalid:
             self._is_correct = False; self._num_hits = 0
         else:
+            print(mp.current_process().pid, 'AssemblyGame._eval_output')
             self._is_correct, self._num_hits = self._eval_output(observation['memory'])
         # terminality check
         is_terminal = self._is_correct or self._is_invalid
         
         # we can now compute the reward
+        print(mp.current_process().pid, 'AssemblyGame._compute_reward')
         reward, latency, correctness = self._compute_reward(include_latency=is_terminal)
         
         step_type = StepType.FIRST if len(self._program) == 0 else (
                         StepType.MID if not is_terminal else
                             StepType.LAST)
-        
+        print(mp.current_process().pid, 'AssemblyGame.make timestep')
         ts = TimeStep(
             step_type=step_type,
             # too many components in acme hard-code the structure of TimeStep, and not
@@ -421,14 +429,18 @@ class AssemblyGame(Environment):
             # skip latency and correctness
         )
         self._last_ts = ts
+        print(mp.current_process().pid, 'AssemblyGame._update_state done')
         return ts
     
     def reset(self, state: Union[TimeStep, CPUState, None]=None) -> TimeStep:
+        print(mp.current_process().pid, 'AssemblyGame.reset state is none:', state is None)
         # deletes the program and resets the
         # CPU state to the original inputs
         # logger.debug("AssemblyGame.reset: state is None %s", state is None)
         if state is None:
+            print(mp.current_process().pid, 'AssemblyGame.reset: reset emulator')
             self._emulator.reset_state()
+            print(mp.current_process().pid, 'AssemblyGame.reset: reset program')
             self._reset_program()
         else:
             # decode the program and execute it.
@@ -459,8 +471,10 @@ class AssemblyGame(Environment):
                 self._emulator.exe(program=self._program.asm_program)
         # calculate the number of hits we have currently,
         # so reset doesn't accidentally return positive reward
+        print(mp.current_process().pid, 'AssemblyGame.reset: _eval_output')
         self._prev_num_hits, _ = self._eval_output(self._emulator.memory)
         # update the state
+        print(mp.current_process().pid, 'AssemblyGame.reset: _update_state')
         return self._update_state()
     
     def step(self, actions:Union[List[int], int]) -> TimeStep:
@@ -620,9 +634,10 @@ class AssemblyGameModel(models.Model):
     
     def reset(self, initial_state: Optional[CPUState] = None):
         """Resets the model, optionally to an initial state."""
-        # logger.debug("AssemblyGameModel: reset")
+        print(mp.current_process().pid, "AssemblyGameModel: reset")
         self._needs_reset = False
         self._environment.reset(initial_state)
+        print(mp.current_process().pid, "AssemblyGameModel: reset done")
 
     @property
     def needs_reset(self) -> bool:
