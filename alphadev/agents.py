@@ -15,6 +15,7 @@
 """Defines the distributed MCTS agent topology via Launchpad."""
 
 from typing import Callable, Optional, Sequence, Dict
+import pickle
 
 import acme
 from acme import datasets
@@ -36,9 +37,11 @@ import dm_env
 import reverb
 import sonnet as snt
 from tempfile import TemporaryFile
+import tree
 import yaml
 import sys
 import os
+from uuid import uuid4 as uuid
 
 import numpy as np
 from .dual_value_az import DualValueAZLearner, DualValueMCTSActor
@@ -50,7 +53,6 @@ from .service import Program, ReverbService, RPCService, RPCClient, SubprocessSe
 from .config import AlphaDevConfig
 from .inference_service import InferenceClient
 from .variable_service import VariableService, make_variable_client
-from .utils import SubprocessFactory
 
 
 class MCTS(agent.Agent):
@@ -259,19 +261,17 @@ class DistributedMCTS:
         Runs the inference service in a separate process.
         """
         # create a temporary file where we write the inference config.
-        temp = TemporaryFile()
-        yaml.dump(config.__dict__(), temp)
-        temp.flush(); temp.seek(0)
+        fname = os.path.abspath(os.path.curdir) + '/inference_config' + uuid().hex[:4] + '.yaml'
+        
+        pickle.dump(config, open(fname, 'wb'))
         # parameterize the subprocess call
-        subp = SubprocessFactory([
-            sys.executable,
+        subp = [sys.executable,
             '-m',
             'alphadev.inference_service',
-            os.path.abspath(temp.name)
-        ])
+            fname]
         # create a handle for the inference service
         handle = InferenceClient(config)
-        return subp, handle, temp
+        return subp, handle, fname
 
     def learner(self, replay: reverb.Client, counter: counting.Counter,
                 logger: loggers.Logger):
@@ -426,31 +426,31 @@ class DistributedMCTS:
         program = Program()
 
         with program.group('replay'):
-            replay = program.add_service(ReverbService(self.replay))
+            replay = program.add_service(ReverbService(
+                priority_tables_fn=self.replay, port=config.replay_server_port))
             
         with program.group('inference'):
             inference = program.add_service(
                 SubprocessService(
-                    command_builder=self.inference, args=(config, ), 
-                    logger=logger)
+                    command_builder=self.inference, args=(config, ),)
             )
 
-        with program.group('variable'):
-            # Create the variable service.
-            # we do not take the default handle but rather create one that is compatible
-            program.add_service(RPCService(
-                conn_config=config.connection_config,
-                instance_factory=VariableService,
-                args=(config, ),
-                instance_cls=VariableService,
-                logger=logger,
-            ))
-            variable_service = make_variable_client(config)
+        # with program.group('variable'):
+        #     # Create the variable service.
+        #     # we do not take the default handle but rather create one that is compatible
+        #     program.add_service(RPCService(
+        #         conn_config=config.distributed_backend_config,
+        #         instance_factory=VariableService,
+        #         args=(config, ),
+        #         instance_cls=VariableService,
+        #         logger=logger,
+        #     ))
+        #     variable_service = make_variable_client(config)
 
         with program.group('counter'):
             counter: RPCClient = program.add_service(
                 RPCService(
-                    conn_config=config.connection_config,
+                    conn_config=config.distributed_backend_config,
                     instance_factory=counting.Counter,
                     instance_cls=counting.Counter,
                 )
@@ -459,38 +459,38 @@ class DistributedMCTS:
         with program.group('logger'):
             logger = program.add_service(
                 RPCService(
-                    conn_config=config.connection_config,
+                    conn_config=config.distributed_backend_config,
                     instance_factory=self._logger_factory,
                     instance_cls=loggers.Logger,
                     )
                 )
 
-        with program.group('learner'):
-            learner = program.add_service(
-                RPCService(
-                    conn_config=config.connection_config,
-                    instance_factory=self.learner,
-                    instance_cls=learning.AZLearner,
-                    args=(replay, counter, logger, variable_service))
-                )
+        # with program.group('learner'):
+        #     learner = program.add_service(
+        #         RPCService(
+        #             conn_config=config.distributed_backend_config,
+        #             instance_factory=self.learner,
+        #             instance_cls=learning.AZLearner,
+        #             args=(replay, counter, logger, variable_service))
+        #         )
 
         with program.group('evaluator'):
             program.add_service(
                 RPCService(
-                    conn_config=config.connection_config,
+                    conn_config=config.distributed_backend_config,
                     instance_factory=self.evaluator,
                     instance_cls=acme.EnvironmentLoop,
                     args=(inference, counter, logger))
                 )
 
-        with program.group('actor'):
-            for _ in range(self._num_actors):
-                program.add_service(
-                    RPCService(
-                        conn_config=config.connection_config,
-                        instance_factory=self.actor,
-                        instance_cls=acme.EnvironmentLoop,
-                        args=(inference, replay, counter, logger))
-                    )
+        # with program.group('actor'):
+        #     for _ in range(self._num_actors):
+        #         program.add_service(
+        #             RPCService(
+        #                 conn_config=config.distributed_backend_config,
+        #                 instance_factory=self.actor,
+        #                 instance_cls=acme.EnvironmentLoop,
+        #                 args=(inference, replay, counter, logger))
+        #             )
 
         return program

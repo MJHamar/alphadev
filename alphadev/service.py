@@ -35,20 +35,12 @@ class MaybeLogger:
 
 class _ClientBackend:
     @abc.abstractmethod
-    def connect(self): pass
-    @abc.abstractmethod
-    def close(self): pass
-    @abc.abstractmethod
     @contextlib.contextmanager
     def connection(self): pass
     @abc.abstractmethod
     def rpc(self, payload, timeout=5): pass
 
 class _ServiceBackend:
-    @abc.abstractmethod
-    def connect(self): pass
-    @abc.abstractmethod
-    def close(self): pass
     @abc.abstractmethod
     @contextlib.contextmanager
     def connection(self): pass
@@ -70,28 +62,20 @@ class _RedisRPCClient(_ClientBackend, MaybeLogger):
         self._server_queue = server_queue
         MaybeLogger.__init__(self, logger)
     
-    def connect(self):
-        self._client = redis.Redis(
-            host=self._redis_config['host'],
-            port=self._redis_config['port'],
-            db=self._redis_config['db']
-        )
-        self._client.ping()
-        self.logger.debug('Connected to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
-    
-    def close(self):
-        if hasattr(self, '_client'):
-            self._client.close()
-            self.logger.debug('Closed connection to Redis server at %s:%s', self._redis_config['host'], self._redis_config['port'])
-    
     @contextlib.contextmanager
     def connection(self):
         """Context manager for the Redis client."""
         try:
-            self.connect()
-            yield self._client
+            client = redis.Redis(
+                host=self._redis_config['host'],
+                port=self._redis_config['port'],
+                db=self._redis_config['db']
+            )
+            client.ping()
+            yield client
         finally:
-            self.close()
+            client.close()
+            del client
     
     def rpc(self, payload, timeout=5):
         with self.connection() as client:
@@ -129,31 +113,23 @@ class _RedisRPCService(_ServiceBackend, MaybeLogger):
         self._label = label
         self._server_queue = f'{label}_queue'
         self._close_key = f'{label}_close'
-        self.connect()
-        self._client.set(self._close_key, 0)
-        self.close()
-    
-    def connect(self):
-        self._client = redis.Redis(
-            host=self._redis_config['host'],
-            port=self._redis_config['port'],
-            db=self._redis_config['db']
-        )
-        self._client.ping()
-    
-    def close(self):
-        if hasattr(self, '_client'):
-            self._client.close()
-            del self._client
+        with self.connection() as client:
+            client.set(self._close_key, 0)
     
     @contextlib.contextmanager
     def connection(self):
         """Context manager for the Redis client."""
         try:
-            self.connect()
-            yield self._client
+            client = redis.Redis(
+                host=self._redis_config['host'],
+                port=self._redis_config['port'],
+                db=self._redis_config['db']
+            )
+            client.ping()
+            yield client
         finally:
-            self.close()
+            client.close()
+            del client
     
     def set_close(self):
         with self.connection() as client:
@@ -339,8 +315,6 @@ class RPCService(MaybeLogger):
             self._runner = threading.Thread(target=instance.run)
             self._runner.daemon = True
             self._runner.start()
-        # start the service
-        self._service.connect()
         # start the worker thread
         self._worker_thread = threading.Thread(target=self._worker)
         self._worker_thread.daemon = True
@@ -442,7 +416,7 @@ class SubprocessService(MaybeLogger):
     """
     def __init__(self, command_builder, args, logger=None):
         MaybeLogger.__init__(self, logger)
-        self._args, self._handle, self._tempfile = command_builder(args)
+        self._args, self._handle, self._tempfile = command_builder(*args)
         self._label = f'subproc.{command_builder.__name__}'
         self._process = None
     
@@ -450,14 +424,10 @@ class SubprocessService(MaybeLogger):
         """
         Run the command in a separate process.
         """
-        self._process = subprocess.Popen(self._args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._process = subprocess.Popen(self._args)
         self.logger.info('Subprocess %s started', self._label)
-        # log the output of the process
-        for line in iter(self._process.stdout.readline, b''):
-            self.logger.info(line.decode().strip())
-        self._process.stdout.close()
         self._process.wait()
-        self._tempfile.unlink()
+        os.remove(self._tempfile)
         self.logger.info('Subprocess %s stopped', self._label)
 
     def create_handle(self):

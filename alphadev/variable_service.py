@@ -17,7 +17,7 @@ class VariableService():
     def __init__(self, config: AlphaDevConfig):
         self._config = config
         self._variable_key = f'{config.variable_service_name}_variables'
-        self._redis_config = config.connection_config
+        self._redis_config = config.distributed_backend_config
         assert self._redis_config['type'] == 'redis', "Only redis is supported for variable storage"
     
     def connect(self):
@@ -65,7 +65,7 @@ class VariableServiceClient(RPCClient):
     def __init__(self, config: AlphaDevConfig):
         self._config = config
         self._service_name = config.variable_service_name
-        self._redis_config = config.connection_config
+        self._redis_config = config.distributed_backend_config
         assert self._redis_config['type'] == 'redis', "Only redis is supported for variable storage"
         super().__init__(
             client=_RedisRPCClient(
@@ -90,7 +90,7 @@ class VariableServiceClient(RPCClient):
 
 def make_variable_service(config: AlphaDevConfig):
     return RPCService(
-        conn_config=config.connection_config,
+        conn_config=config.distributed_backend_config,
         instance_factory=VariableService,
         args=(config, ),
         instance_cls=VariableService,

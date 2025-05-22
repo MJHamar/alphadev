@@ -13,12 +13,13 @@ Inference server for AlphaDev. Intended to be run as a separate process.
 """
 import os
 import sys
-import yaml
+import pickle
 import time
 import tree
 import tensorflow as tf
 import ml_collections
 from acme.tf import variable_utils as tf2_variable_utils
+from acme.tf import utils as tf2_utils
 import threading
 
 from .config import AlphaDevConfig
@@ -35,16 +36,20 @@ logger.setLevel(logging.DEBUG)
 class InferenceService:
     def __init__(self, config: AlphaDevConfig):
         self.config = config
-        self.network = AlphaDevNetwork(config)
+        self.network = AlphaDevNetwork(config.hparams, config.task_spec, name='inference_network')
         # create variables for the network
-        tf2_variable_utils.create_variables(self.network, environment_spec_from_config(config))
+        tf2_utils.create_variables(self.network, [environment_spec_from_config(config).observations])
         # create a client for the variable storage
-        self.variable_client = make_variable_client(config)
+        variable_service_client = make_variable_client(config)
+        self.variable_client = tf2_variable_utils.VariableClient(
+            client=variable_service_client,
+            variables={'network': self.network.trainable_variables},
+            update_period=config.variable_update_period)
         # update the network weights
         self.variable_client.update()
         # make a listener service to listen for requests
         self._listener_service = make_service_backend(
-            conn_config=self.config.connection_config,
+            conn_config=self.config.distributed_backend_config,
             label=self.config.inference_service_name,
             logger=logger.getChild('listener'),
         )
@@ -59,7 +64,7 @@ class InferenceService:
     def _batch_requests(self):
         """Batch the requests for inference."""
         if len(self.requests) == 0:
-            return None
+            return None, None
         batch_requests = []
         batch_callbacks = []
         with self._lock: # lock the requests queue
@@ -110,13 +115,14 @@ class InferenceService:
         # Start the listener in a separate thread
         listener_thread = threading.Thread(target=self._listener)
         listener_thread.start()
-        
+        logger.info("Starting inference server at %s", self.config.inference_service_name)
         while not self._should_stop:
             # sleep while the listener is gathering data
             time.sleep(self.accumulation_period)
             # get the first batch
             batch_requests, batch_callbacks = self._batch_requests()
             while batch_requests is not None:
+                logger.debug("Processing batch of %d requests", len(batch_requests))
                 # Pull the model weights from the variable storage
                 self._update_weights()
                 # Run inference on the batch
@@ -128,7 +134,8 @@ class InferenceClient():
     def __init__(self, config: AlphaDevConfig):
         self._config = config
         self._service_name = config.inference_service_name
-        self._client = make_client_backend(self._config.connection_config, f'{self._service_name}_queue', logger.getChild('client'))
+        self._client = make_client_backend(
+            self._config.distributed_backend_config, f'{self._service_name}_queue', logger.getChild('client'))
     
     def __call__(self, *args, **kwargs):
         """Call the inference server with the given arguments.
@@ -140,12 +147,13 @@ class InferenceClient():
 def main():
     """Run the inference server as a standalone process."""
     config_path = sys.argv[1]
-    with open(config_path, 'r') as f:
-        config_dict = yaml.safe_load(f)
-    config = ml_collections.ConfigDict(config_dict)
+    with open(config_path, 'rb') as f:
+        config: AlphaDevConfig = pickle.load(f)
+    assert isinstance(config, AlphaDevConfig), "Config must be an instance of AlphaDevConfig"
     service = InferenceService(config)
     logger.info("Starting inference service...")
     service.run()
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.DEBUG)
     main()

@@ -91,6 +91,7 @@ class DualValueMCTSActor(MCTSActor):
     # override the _forward method to account for the correctness and latency logits from the network.
     def _forward(self, observation):
         """Performs a forward pass of the policy-value network."""
+        logger.debug("Forward pass called")
         if self._add_batch_dim:
             logits, value, _, _ = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
         else:
@@ -103,11 +104,12 @@ class DualValueMCTSActor(MCTSActor):
             logits = logits.numpy()
         value = value.numpy().item()
         probs = special.softmax(logits)
-
+        logger.debug(f"Forward pass finished, probs: {probs.shape}, value: {value.shape}")
         return probs, value
 
     def select_action(self, observation: types.Observation) -> types.Action:
         """Computes the agent's policy via MCTS."""
+        logger.debug("Select action called")
         if self._model.needs_reset:
             self._model.reset(observation)
 

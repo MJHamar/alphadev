@@ -131,7 +131,7 @@ def run_single_threaded(config: AlphaDevConfig, agent: MCTS):
 
 def run_distributed(config: AlphaDevConfig, agent: DistributedMCTS):
     # build the distributed agent
-    program = agent.build(config.distributed_backend_config)
+    program = agent.build(config)
     # run the distributed agent
     program.launch()
 

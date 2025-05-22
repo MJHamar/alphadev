@@ -84,6 +84,7 @@ class AlphaDevConfig(object):
     inference_service_name: str = 'inference'
     variable_service_name: str = 'variable'
     replay_server_port: int = None
+    inference_accumulation_period: int = 0.1
     
     # Logging
     use_wandb: bool = True

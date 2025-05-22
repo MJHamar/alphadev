@@ -654,4 +654,4 @@ class ModelFactory:
     def __call__(self, env_spec: EnvironmentSpec): return AssemblyGameModel(task_spec=self._task_spec, name='AssemblyGameModel')
 
 def environment_spec_from_config(config: AlphaDevConfig) -> EnvironmentSpec:
-    return acme_make_environment_spec(EnvironmentFactory(config))
+    return acme_make_environment_spec(EnvironmentFactory(config)())
