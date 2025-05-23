@@ -96,7 +96,6 @@ class DualValueMCTSActor(MCTSActor):
             
             logits, value, _, _ = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
         else:
-            logger.debug(f"Observation: {observation}")
             logits, value, _, _ = self._network(observation)
 
         # Convert to numpy & take softmax.
@@ -106,7 +105,7 @@ class DualValueMCTSActor(MCTSActor):
             logits = logits.numpy()
         value = value.numpy().item()
         probs = special.softmax(logits)
-        logger.debug(f"Forward pass finished, probs: {probs.shape}, value: {value.shape}")
+        logger.debug(f"Forward pass finished, probs: {probs.shape}, value: {value}")
         return probs, value
 
     def select_action(self, observation: types.Observation) -> types.Action:

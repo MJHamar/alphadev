@@ -436,7 +436,6 @@ class DistributedMCTS:
                 SubprocessService(
                     command_builder=self.inference, args=(config, ),)
             )
-        program._services.pop()
 
         # with program.group('variable'):
         #     # Create the variable service.

@@ -89,21 +89,23 @@ class _RedisRPCClient(_ClientBackend, MaybeLogger):
                 }
                 rpc_call_bin = pickle.dumps(rpc_call)
                 client.rpush(self._server_queue, rpc_call_bin)
-                self.logger.debug('Sent RPC call to Redis server: %s', rpc_call)
+                self.logger.debug('Sent RPC call to Redis server: %s', str(rpc_call)[:50])
             except redis.exceptions.ConnectionError as e:
                 self.logger.error('Failed to send RPC call to Redis server: %s', e)
                 raise RuntimeError('Failed to send RPC call to Redis server') from e
             try:
                 # Wait for the response
+                self.logger.debug('RedisClient waiting for response at %s', call_id)
                 response = client.blpop(call_id, timeout=timeout)
                 if response:
-                    self.logger.debug('Received response from Redis server: %s', response)
-                    return pickle.loads(response[1])
+                    response = pickle.loads(response[1])
+                    self.logger.debug('Received response from Redis server: %s', str(response)[:50])
+                    return response
                 else:
-                    self.logger.error('No response received from Redis server')
+                    self.logger.error('id: %s No response received from Redis server', call_id)
                     raise RuntimeError('No response received from Redis server')
             except redis.exceptions.TimeoutError as e:
-                self.logger.error('Timeout while waiting for response from Redis server: %s', e)
+                self.logger.error('id: %s Timeout while waiting for response from Redis server: %s', call_id, e)
                 raise RuntimeError('Timeout while waiting for response from Redis server') from e
 
 class _RedisRPCService(_ServiceBackend, MaybeLogger):
@@ -151,9 +153,9 @@ class _RedisRPCService(_ServiceBackend, MaybeLogger):
         with self.connection() as client:
             # Return the payload to the Redis server
             try:
+                self.logger.debug('RedisServer callback writing to %s with %s', key, str(payload)[:50])
                 payload_bin = pickle.dumps(payload)
                 client.rpush(key, payload_bin)
-                self.logger.debug('Returned RPC call to Redis server: %s', payload)
             except redis.exceptions.ConnectionError as e:
                 self.logger.error('Failed to return RPC call to Redis server: %s', e)
                 raise RuntimeError('Failed to return RPC call to Redis server') from e
@@ -167,7 +169,7 @@ class _RedisRPCService(_ServiceBackend, MaybeLogger):
                 
                 if msg_bin:
                     msg = pickle.loads(msg_bin[1])
-                    self.logger.debug('Received request from Redis server: %s', msg)
+                    self.logger.debug('Received request from Redis server: %s', str(msg)[:50])
                     return_id = msg['id']
                     payload = msg['payload']
                     return lambda p: self._return_rpc(return_id, p), payload
@@ -294,7 +296,6 @@ class RPCService(MaybeLogger):
             # Extract the return function and payload from the incoming request
             return_func, payload = self._service.next(timeout=self._worker_polling_interval)
             if payload is None:
-                self.logger.debug('No payload received, continuing to poll')
                 continue
             method = payload.pop('method')
             arguments = payload.pop('arguments')
@@ -313,6 +314,10 @@ class RPCService(MaybeLogger):
         """
         # TODO: make signal handler to stop the service
         instance = self._instance_factory(*self._instance_args)
+        # bind methods to the instance
+        for method_name in self._registered_methods.keys():
+            self._registered_methods[method_name] = getattr(instance, method_name)
+        
         if self._should_run:
             # start the worker thread
             self._worker_thread = threading.Thread(target=self._worker)
