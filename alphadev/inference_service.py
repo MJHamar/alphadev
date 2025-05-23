@@ -31,7 +31,7 @@ from .service import make_client_backend, make_service_backend
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class InferenceService:
     def __init__(self, config: AlphaDevConfig):

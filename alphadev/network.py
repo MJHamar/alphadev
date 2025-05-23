@@ -300,12 +300,10 @@ class RepresentationNet(snn.Module):
     def __call__(self, inputs: CPUState):
         # logger.debug("representation_net program shape %s", inputs['program'].shape)
         # inputs is the observation dict
-        logger.debug('RepresentationNet: inputs %s', inputs.keys())
         batch_size = inputs['program'].shape[0]
 
         program_encoding = None
         if self._hparams.representation.use_program:
-            logger.debug('RepresentationNet: encoding program')
             program_encoding = self._encode_program(inputs, batch_size)
 
         if (
@@ -318,7 +316,6 @@ class RepresentationNet(snn.Module):
         # encode the locations (registers and memory) in the CPU state
         locations_encoding = None
         if self._hparams.representation.use_locations:
-            logger.debug('RepresentationNet: encoding locations')
             locations_encoding = self._make_locations_encoding_onehot(
                 inputs, batch_size
             )
@@ -333,25 +330,18 @@ class RepresentationNet(snn.Module):
             raise NotImplementedError(
                 'permutation embedding is not implemented and will not be. keeping for completeness.')
         # aggregate the locations and the program to produce a single output vector
-        logger.debug('RepresentationNet: aggregating locations and program and returning')
         return self.aggregate_locations_program(
             locations_encoding, permutation_embedding, program_encoding, batch_size
         )
 
     def _encode_program(self, inputs: CPUState, batch_size):
-        # logger.debug("encode_program shape %s", inputs['program'].shape)
         program = inputs['program']
-        # logger.debug("encode_program: program shape %s", program.shape)
         max_program_size = inputs['program'].shape[1] # TODO: this might not be a constant
-        logger.debug("encode_program: casting program to int32")
         program_length = tf.cast(inputs['program_length'], tf.int32)
-        logger.debug("encode_program: making program onehot")
         program_onehot = self.make_program_onehot(
             program, batch_size, max_program_size
         )
-        logger.debug("encode_program: program_onehot shape %s", program_onehot.shape)
         program_encoding = self.apply_program_mlp_embedder(program_onehot)
-        logger.debug("encode_program: program_encoding shape %s", program_encoding.shape)
         program_encoding = self.apply_program_attention_embedder(program_encoding)
         # select the embedding corresponding to the current instruction in the corr. CPU state
         return self.pad_program_encoding( # size B x num_inputs x embedding_dim
@@ -457,9 +447,7 @@ class RepresentationNet(snn.Module):
         return program_encoding
 
     def apply_program_mlp_embedder(self, program_encoding):
-        logger.debug("apply_program_mlp_embedder program shape %s", program_encoding.shape)
         program_encoding = self.program_mlp_embedder(program_encoding)
-        logger.debug("apply_program_mlp_embedder program encoded")
         return program_encoding
 
     def apply_program_attention_embedder(self, program_encoding):
@@ -660,7 +648,6 @@ class AlphaDevNetwork(snn.Module):
     
     @staticmethod
     def _return_with_reward_logits(prediction: NetworkOutput) -> Tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
-        logger.debug("AlphaDevNetwork: return_with_reward_logits")
         return (
             prediction.policy_logits,
             prediction.value,
@@ -700,12 +687,12 @@ class AlphaDevNetwork(snn.Module):
     
     def __call__(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
         """Computes and returns the policy and value logits for the AZLearner."""
-        logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
+        # logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
         # inputs is the observation dict
         embedding: tf.Tensor = self._representation_net(inputs)
-        logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
+        # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
         prediction: NetworkOutput = self._prediction_net(embedding)
-        logger.debug("AlphaDevNetwork: prediction obtained")
+        # logger.debug("AlphaDevNetwork: prediction obtained")
         return self._return_fn(prediction)
 
 class NetworkFactory:
