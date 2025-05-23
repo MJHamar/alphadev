@@ -52,7 +52,7 @@ from .loggers import LoggerService, LoggerServiceWrapper
 from .service import Program, ReverbService, RPCService, RPCClient, SubprocessService
 from .config import AlphaDevConfig
 from .inference_service import InferenceClient
-from .variable_service import VariableService, make_variable_client
+from .variable_service import VariableService
 
 
 class MCTS(agent.Agent):
@@ -437,17 +437,7 @@ class DistributedMCTS:
                     command_builder=self.inference, args=(config, ),)
             )
 
-        # with program.group('variable'):
-        #     # Create the variable service.
-        #     # we do not take the default handle but rather create one that is compatible
-        #     program.add_service(RPCService(
-        #         conn_config=config.distributed_backend_config,
-        #         instance_factory=VariableService,
-        #         args=(config, ),
-        #         instance_cls=VariableService,
-        #         logger=logger,
-        #     ))
-        #     variable_service = make_variable_client(config)
+        variable_service = VariableService(config)
 
         with program.group('counter'):
             counter: RPCClient = program.add_service(

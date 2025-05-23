@@ -26,7 +26,7 @@ from .config import AlphaDevConfig
 from .network import AlphaDevNetwork
 from .service import RPCClient, _RedisRPCService, _RedisRPCClient
 from .environment import environment_spec_from_config
-from .variable_service import make_variable_client
+from .variable_service import VariableService
 from .service import make_client_backend, make_service_backend
 
 import logging
@@ -40,13 +40,13 @@ class InferenceService:
         # create variables for the network
         tf2_utils.create_variables(self.network, [environment_spec_from_config(config).observations])
         # create a client for the variable storage
-        self._variable_storage = make_variable_client(config)
+        self._variable_storage = VariableService(config)
         self.variable_client = tf2_variable_utils.VariableClient(
             client=self._variable_storage,
             variables={'network': self.network.trainable_variables},
             update_period=config.variable_update_period)
         # update the network weights
-        self.variable_client.update()
+        self._update_weights()
         # make a listener service to listen for requests
         self._listener_service = make_service_backend(
             conn_config=self.config.distributed_backend_config,
@@ -133,7 +133,7 @@ class InferenceService:
             while batch_requests is not None:
                 logger.debug("Processing batch of %d requests", len(batch_requests))
                 # Pull the model weights from the variable storage
-                # self._update_weights()
+                self._update_weights()
                 # Run inference on the batch
                 self._process_requests(batch_requests, batch_callbacks)
                 # Get the next batch of requests
