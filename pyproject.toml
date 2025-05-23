@@ -45,6 +45,7 @@ dependencies = [
     "tensorflow-probability",
     "tqdm",
     "wandb",
+    "redis",
 
     # tinyfive submodule (editable install from local path):
     "tinyfive @ {root:uri}/tinyfive" # Changed from file:./tinyfive
