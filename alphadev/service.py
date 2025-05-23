@@ -12,6 +12,7 @@ import pickle
 import threading
 import contextlib
 import multiprocessing
+multiprocessing.set_start_method('spawn', force=True)
 from time import sleep
 from uuid import uuid4 as uuid
 import subprocess
@@ -310,18 +311,20 @@ class RPCService(MaybeLogger):
         Run the service. This method is called by the main thread when the
         service is started.
         """
-        
+        # TODO: make signal handler to stop the service
         instance = self._instance_factory(*self._instance_args)
         if self._should_run:
+            # start the worker thread
+            self._worker_thread = threading.Thread(target=self._worker)
+            self._worker_thread.daemon = True
+            self._worker_thread.start()
             # span a worker thread to run the instance
-            self._runner = threading.Thread(target=instance.run)
-            self._runner.daemon = True
-            self._runner.start()
-        # start the worker thread
-        self._worker_thread = threading.Thread(target=self._worker)
-        self._worker_thread.daemon = True
-        self._worker_thread.start()
-        self.logger.info('Service %s started', self._service._label)
+            self.logger.info('%s running service', self._service._label)
+            instance.run()
+        else:
+            # start the worker in the main thread
+            self.logger.info('%s start listening for requests', self._service._label)
+            self._worker()
     
     def stop(self):
         """
@@ -332,7 +335,6 @@ class RPCService(MaybeLogger):
         if self._should_run:
             self._runner.join(timeout=5)
         self._worker_thread.join(timeout=5)
-        self._service.close()
         self.logger.info('Service %s stopped', self._service._label)
     
     def create_handle(self):
@@ -397,8 +399,8 @@ class ReverbService(MaybeLogger):
         )
         # keep the server running
         base_logger.info('Reverb server started on port %s', self._port)
-        while True:
-            sleep(10)
+        self._server.wait()
+        base_logger.info('Reverb server stopped')
     
     def stop(self):
         """
@@ -470,19 +472,32 @@ class Program(object):
             proc = multiprocessing.Process(target=service.run)
             proc.start()
             self._service_processes.append((name, proc))
+        
     
     def stop(self):
         """
         Stop all the services in the program.
         """
-        for name, service in reversed(self._service_processes):
-            try:
-                # send a SIGINT signal to the process
-                service.terminate()
-                service.join(timeout=5)
-            except Exception as e:
-                base_logger.error('Failed to stop service %s %s', name, e)
+        base_logger.info('Waiting for services to stop')
+        while True:
+            for name, proc in self._service_processes:
+                proc: multiprocessing.Process = proc
+                if proc.is_alive():
+                    # base_logger.info('Service %s is still running', name)
+                    continue
+                else:
+                    base_logger.info('Service %s has stopped', name)
+                    proc.join()
+                    break
+            else:
+                sleep(1)
                 continue
+            break
+        base_logger.info('A service has stopped, stopping all services')
+        for name, proc in self._service_processes:
+            base_logger.info('Stopping service %s', name)
+            proc.terminate()
+            proc.join()
         self._services.clear()
     
     @contextlib.contextmanager

@@ -134,6 +134,7 @@ def run_distributed(config: AlphaDevConfig, agent: DistributedMCTS):
     program = agent.build(config)
     # run the distributed agent
     program.launch()
+    program.stop()
 
 def run_alphadev(config: AlphaDevConfig):
     # -- define agent

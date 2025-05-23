@@ -142,7 +142,10 @@ class InferenceClient():
         Block until the result is available.
         """
         # Call the inference server with the given arguments
-        return self._client.rpc({'args': args, 'kwargs': kwargs}, timeout=20)
+        payload = {'args': args, 'kwargs': kwargs}
+        # convert tensors to numpy arrays
+        payload = tf2_utils.to_numpy(payload)
+        return self._client.rpc(payload, timeout=20)
 
 def main():
     """Run the inference server as a standalone process."""

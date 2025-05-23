@@ -93,8 +93,10 @@ class DualValueMCTSActor(MCTSActor):
         """Performs a forward pass of the policy-value network."""
         logger.debug("Forward pass called")
         if self._add_batch_dim:
+            
             logits, value, _, _ = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
         else:
+            logger.debug(f"Observation: {observation}")
             logits, value, _, _ = self._network(observation)
 
         # Convert to numpy & take softmax.
