@@ -11,7 +11,7 @@ from .config import AlphaDevConfig
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class VariableService():
     """Variable service that stores variables in a Redis database.
@@ -52,14 +52,11 @@ class VariableService():
     
     def has_variables(self):
         """Check if the variable storage has variables."""
-        logger.debug(f"Checking if variables exist in {self._variable_key}")
         with self.connection() as conn:
             variables_bin = conn.exists(self._variable_key)
             if variables_bin == 0:
-                logger.debug("No variables found")
                 return False
             else:
-                logger.debug("Variables found")
                 return True
     
     def get_variables(self):
@@ -71,5 +68,4 @@ class VariableService():
                 raise ValueError("No variables found in variable storage")
             else:
                 variables = pickle.loads(variables_bin)
-                logger.debug("Variables found")
                 return variables

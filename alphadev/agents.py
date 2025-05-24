@@ -48,7 +48,6 @@ from .dual_value_az import DualValueAZLearner, DualValueMCTSActor
 from .acting import MCTSActor
 from .search import PUCTSearchPolicy
 from .observers import MCTSObserver
-from .loggers import LoggerService, LoggerServiceWrapper
 from .service import Program, ReverbService, RPCService, RPCClient, SubprocessService
 from .config import AlphaDevConfig
 from .inference_service import InferenceClient
@@ -107,7 +106,7 @@ class MCTS(agent.Agent):
 
         # Now create the agent components: actor & learner.
         counter = counting.Counter(None)
-        
+
         mcts_observers = mcts_observers(logger)
 
         if use_dual_value_network:
@@ -222,7 +221,7 @@ class DistributedMCTS:
         self._variable_update_period = variable_update_period
         self._use_dual_value_network = use_dual_value_network
         self._temperature_fn = temperature_fn
-        
+
         # set up logging
         if logger_factory is not None:
             self._logger_factory = logger_factory
@@ -262,7 +261,7 @@ class DistributedMCTS:
         """
         # create a temporary file where we write the inference config.
         fname = os.path.abspath(os.path.curdir) + '/inference_config' + uuid().hex[:4] + '.yaml'
-        
+
         pickle.dump(config, open(fname, 'wb'))
         # parameterize the subprocess call
         subp = [sys.executable,
@@ -274,10 +273,9 @@ class DistributedMCTS:
         return subp, handle, fname
 
     def learner(self, replay: reverb.Client, counter: counting.Counter,
+                variable_service: VariableService,
                 logger: loggers.Logger):
         """The learning part of the agent."""
-        # wrap the logger
-        logger = LoggerServiceWrapper(logger)
         # Create the networks.
         network = self._network_factory(self._env_spec.actions)
         print('learner network created')
@@ -299,6 +297,8 @@ class DistributedMCTS:
                 optimizer=optimizer,
                 dataset=dataset,
                 discount=self._discount,
+                variable_service=variable_service,
+                varibale_update_period=self._variable_update_period,
                 logger=logger,
                 counter=counter,
             )
@@ -308,25 +308,25 @@ class DistributedMCTS:
                 discount=self._discount,
                 dataset=dataset,
                 optimizer=optimizer,
+                variable_service=variable_service,
+                varibale_update_period=self._variable_update_period,
                 logger=logger,
                 counter=counter,
             )
 
     def actor(
         self,
-        replay: reverb.Client,
         inference: InferenceClient,
+        replay: reverb.Client,
         counter: counting.Counter,
         logger: loggers.Logger,
     ) -> acme.EnvironmentLoop:
         """The actor process."""
-        # wrap the logger
-        logger = LoggerServiceWrapper(logger)
 
         # Build environment, model, network.
         environment = self._environment_factory()
         model = self._model_factory(self._env_spec)
-        
+
         mcts_observers = self._mcts_observers(logger)
 
         # Component to add things into replay.
@@ -372,6 +372,7 @@ class DistributedMCTS:
             actor=actor,
             counter=counter,
             logger=logger,
+            label='actor',
             observers=observers)
 
     def evaluator(
@@ -381,8 +382,6 @@ class DistributedMCTS:
         logger: loggers.Logger,
     ):
         """The evaluation process."""
-        # wrap the logger
-        logger = LoggerServiceWrapper(logger)
 
         # Build environment, model, network.
         environment = self._environment_factory()
@@ -417,11 +416,11 @@ class DistributedMCTS:
                 counter=counter,
                 observers=mcts_observers,
             )
-        
+
         observers = self._observers(logger)
 
         return acme.EnvironmentLoop(
-            environment, actor, counter=counter, logger=logger, observers=observers)
+            environment, actor, counter=counter, logger=logger, observers=observers, label='evaluator')
 
     def build(self, config: AlphaDevConfig):
         """Builds the distributed agent topology."""
@@ -430,7 +429,7 @@ class DistributedMCTS:
         with program.group('replay'):
             replay = program.add_service(ReverbService(
                 priority_tables_fn=self.replay, port=config.replay_server_port))
-            
+
         with program.group('inference'):
             inference = program.add_service(
                 SubprocessService(
@@ -457,14 +456,14 @@ class DistributedMCTS:
                     )
                 )
 
-        # with program.group('learner'):
-        #     learner = program.add_service(
-        #         RPCService(
-        #             conn_config=config.distributed_backend_config,
-        #             instance_factory=self.learner,
-        #             instance_cls=learning.AZLearner,
-        #             args=(replay, counter, logger, variable_service))
-        #         )
+        with program.group('learner'):
+            program.add_service(
+                RPCService(
+                    conn_config=config.distributed_backend_config,
+                    instance_factory=self.learner,
+                    instance_cls=learning.AZLearner,
+                    args=(replay, counter, logger, variable_service))
+                )
 
         with program.group('evaluator'):
             program.add_service(
@@ -476,14 +475,14 @@ class DistributedMCTS:
                     fork_worker=False)
                 )
 
-        # with program.group('actor'):
-        #     for _ in range(self._num_actors):
-        #         program.add_service(
-        #             RPCService(
-        #                 conn_config=config.distributed_backend_config,
-        #                 instance_factory=self.actor,
-        #                 instance_cls=acme.EnvironmentLoop,
-        #                 args=(inference, replay, counter, logger))
-        #             )
+        with program.group('actor'):
+            for _ in range(self._num_actors):
+                program.add_service(
+                    RPCService(
+                        conn_config=config.distributed_backend_config,
+                        instance_factory=self.actor,
+                        instance_cls=acme.EnvironmentLoop,
+                        args=(inference, replay, counter, logger))
+                    )
 
         return program

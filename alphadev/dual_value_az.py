@@ -1,17 +1,16 @@
 """Definition of the AlphaZero learner with a dual value head."""
 import tensorflow as tf
 from acme.agents.tf.mcts import types
-from acme.agents.tf.mcts import models
-import dm_env
 import tree
 import numpy as np
 from scipy import special
-import dataclasses
 
 from .distribution import DistributionSupport
 from .acting import MCTSActor
-from .search import mcts, DvNode, Node, visit_count_policy
+from .search import mcts, DvNode, visit_count_policy
 from .learning import AZLearner
+from .service import RPCClient
+from .variable_service import VariableService
 
 import logging
 logger = logging.getLogger(__name__)
@@ -31,14 +30,6 @@ def scalar_loss(prediction:tf.Tensor, target:tf.Tensor, value_max, num_bins) -> 
 
 
 class DualValueAZLearner(AZLearner):
-    # we only override the _step method
-    def __init__(self,
-                 network,
-                 optimizer,
-                 dataset,
-                 discount,
-                 logger = None, counter = None):
-        super().__init__(network, optimizer, dataset, discount, logger, counter)
     
     @tf.function
     def _step(self) -> tf.Tensor:

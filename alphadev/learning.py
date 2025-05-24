@@ -9,7 +9,7 @@ from acme.utils import loggers
 from acme.utils import counting
 from acme.tf import utils as tf2_utils
 
-from .service import RPCClient
+from .variable_service import VariableService
 
 import logging
 logger = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ class AZLearner(acme.Learner):
         optimizer: snn.Optimizer,
         dataset: tf.data.Dataset,
         discount: float,
-        variable_service: RPCClient,
+        variable_service: VariableService,
         varibale_update_period: int = 10,
         logger: Optional[loggers.Logger] = None,
         counter: Optional[counting.Counter] = None,
