@@ -146,22 +146,20 @@ class NonZeroRewardObserver(EnvLoopObserver):
         os.makedirs(self._trajectory_save_path, exist_ok=True)
         self._num_saves = 0
         self._current_trajectory = []
+        self._should_save = False
     
     def observe_first(self, env, timestep, action=None):
         self._current_trajectory = [timestep]
+        self._should_save = False
     
     def observe(self, env, timestep, action=None):
         self._current_trajectory.append(timestep)
-        if timestep.reward != 0:
-            print(f"Non-zero reward observed: {timestep.reward} at step {timestep.step_type}")
+        if timestep.reward[0] != 0:
+            print(f"Non-zero reward observed: {timestep.reward[0]}, program length: {len(env._program)}")
+            self._should_save = True
     
     def get_metrics(self):
-        try:
-            last_reward = self._current_trajectory[-1].reward[0]
-        except:
-            print("WARINING: NonZeroRewardObserver is only compatible with environments that return an array of rewards.")
-            return {}
-        if last_reward != 0:
+        if self._should_save:
             # save the trajectory
             save_path = os.path.join(
                 self._trajectory_save_path,
