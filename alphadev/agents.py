@@ -316,10 +316,11 @@ class DistributedMCTS:
 
     def actor(
         self,
-        inference: InferenceClient,
         replay: reverb.Client,
         counter: counting.Counter,
         logger: loggers.Logger,
+        inference: InferenceClient = None,  # if none we use the network factory
+        variable_service: VariableService = None,
     ) -> acme.EnvironmentLoop:
         """The actor process."""
 
@@ -328,6 +329,19 @@ class DistributedMCTS:
         model = self._model_factory(self._env_spec)
 
         mcts_observers = self._mcts_observers(logger)
+        
+        network = inference
+        variable_client = None
+        if inference is None:
+            network = self._network_factory(self._env_spec.actions)
+            # If no inference client is provided, we create a new network.
+            tf2_utils.create_variables(network, [self._env_spec.observations])
+            # also create the variable service
+            variable_client = tf2_variable_utils.VariableClient(
+                client=variable_service,
+                variables={'network': network.trainable_variables},
+                update_period=self._variable_update_period,
+            )
 
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
@@ -340,12 +354,13 @@ class DistributedMCTS:
             actor = DualValueMCTSActor(
                 environment_spec=self._env_spec,
                 model=model,
-                network=inference,
+                network=network,
                 discount=self._discount,
                 adder=adder,
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
+                variable_client=variable_client,
                 counter=counter,
                 observers=mcts_observers,
             )
@@ -354,12 +369,13 @@ class DistributedMCTS:
             actor = MCTSActor(
                 environment_spec=self._env_spec,
                 model=model,
-                network=inference,
+                network=network,
                 discount=self._discount,
                 adder=adder,
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
+                variable_client=variable_client,
                 counter=counter,
                 observers=mcts_observers,
             )
@@ -377,29 +393,42 @@ class DistributedMCTS:
 
     def evaluator(
         self,
-        inference: InferenceClient,
         counter: counting.Counter,
         logger: loggers.Logger,
+        inference: InferenceClient=None, # if none we use the network factory
+        variable_service: VariableService = None,
     ):
         """The evaluation process."""
 
         # Build environment, model, network.
         environment = self._environment_factory()
-        print('evaluator environment created', type(environment))
         model = self._model_factory(self._env_spec)
-        print('evaluator model created: type: %s' % type(model))
 
         mcts_observers = self._mcts_observers(logger)
-
+        
+        network = inference
+        variable_client = None
+        if inference is None:
+            network = self._network_factory(self._env_spec.actions)
+            # If no inference client is provided, we create a new network.
+            tf2_utils.create_variables(network, [self._env_spec.observations])
+            # also create the variable service
+            variable_client = tf2_variable_utils.VariableClient(
+                client=variable_service,
+                variables={'network': network.trainable_variables},
+                update_period=self._variable_update_period,
+            )
+        
         if self._use_dual_value_network:
             actor = DualValueMCTSActor(
                 environment_spec=self._env_spec,
                 model=model,
-                network=inference,
+                network=network,
                 discount=self._discount,
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
+                variable_client=variable_client,
                 counter=counter,
                 observers=mcts_observers,
             )
@@ -408,11 +437,12 @@ class DistributedMCTS:
             actor = MCTSActor(
                 environment_spec=self._env_spec,
                 model=model,
-                network=inference,
+                network=network,
                 discount=self._discount,
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
+                variable_client=variable_client,
                 counter=counter,
                 observers=mcts_observers,
             )
@@ -430,11 +460,11 @@ class DistributedMCTS:
             replay = program.add_service(ReverbService(
                 priority_tables_fn=self.replay, port=config.replay_server_port))
 
-        with program.group('inference'):
-            inference = program.add_service(
-                SubprocessService(
-                    command_builder=self.inference, args=(config, ),)
-            )
+        # with program.group('inference'):
+        #     inference = program.add_service(
+        #         SubprocessService(
+        #             command_builder=self.inference, args=(config, ),)
+        #     )
 
         variable_service = VariableService(config)
 
@@ -471,7 +501,8 @@ class DistributedMCTS:
                     conn_config=config.distributed_backend_config,
                     instance_factory=self.evaluator,
                     instance_cls=acme.EnvironmentLoop,
-                    args=(inference, counter, logger),
+                    args=(counter, logger, None, variable_service),
+                    # args=(counter, logger, inference, None),
                     fork_worker=False)
                 )
 
@@ -482,7 +513,8 @@ class DistributedMCTS:
                         conn_config=config.distributed_backend_config,
                         instance_factory=self.actor,
                         instance_cls=acme.EnvironmentLoop,
-                        args=(inference, replay, counter, logger))
+                        args=(replay, counter, logger, None, variable_service))
+                        # args=(replay, counter, logger, inference, None))
                     )
 
         return program

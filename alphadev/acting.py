@@ -56,7 +56,7 @@ class MCTSActor(acmeMCTSActor):
         num_simulations: int,
         search_policy: callable,
         temperature_fn: callable,
-        variable_client: Optional[InferenceClient] = None,
+        variable_client: Optional[tf2_variable_utils.VariableClient] = None,
         adder: Optional[adders.Adder] = None,
         counter: Optional[counting.Counter] = None,
         observers: Optional[Sequence[MCTSObserver]] = [],
@@ -136,3 +136,8 @@ class MCTSActor(acmeMCTSActor):
                 training_steps=training_steps, temperature=temperature)
 
         return action
+    
+    def update(self, wait: bool = False):
+        """Fetches the latest variables from the variable source, if needed."""
+        if self._variable_client and self._variable_client._client.has_variables():
+            self._variable_client.update(wait)

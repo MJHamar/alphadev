@@ -52,6 +52,7 @@ class VariableService():
     
     def has_variables(self):
         """Check if the variable storage has variables."""
+        logger.debug(f"Checking if variables exist in {self._variable_key}")
         with self.connection() as conn:
             variables_bin = conn.exists(self._variable_key)
             if variables_bin == 0:
@@ -59,7 +60,8 @@ class VariableService():
             else:
                 return True
     
-    def get_variables(self):
+    def get_variables(self, keys=None):
+        # NOTE: keys is unused because it is also unused in AZLearner.
         """Get the variables from the variable storage."""
         logger.debug(f"Getting variables from {self._variable_key}")
         with self.connection() as conn:
