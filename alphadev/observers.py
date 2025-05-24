@@ -89,3 +89,37 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
             'temperature': temperature,
             'steps': training_steps,
         })
+        
+# #############
+# EnvironmentObservers
+# #############
+from acme.utils.observers.base import EnvLoopObserver
+
+class CorrectProgramObserver(EnvLoopObserver):
+    """
+    Observer that logs the correctness of the program.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self._metrics = {}
+    
+    def observe_first(self, env, timestep, action=None):
+        self._metrics = {
+            'is_correct': False,
+            'num_hits': 0,
+            'num_steps': 0,
+        }
+    
+    def observe(self, env, timestep, action=None):
+        if timestep.last():
+            self._metrics['num_steps'] += 1
+            self._metrics['is_correct'] = env._is_correct
+            self._metrics['num_hits'] = env._num_hits
+        elif timestep.mid():
+            self._metrics['num_steps'] += 1
+            self._metrics['is_correct'] = env._is_correct
+            self._metrics['num_hits'] = env._num_hits
+    
+    def get_metrics(self):
+        return self._metrics

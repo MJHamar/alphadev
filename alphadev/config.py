@@ -8,7 +8,7 @@ import portpicker
 from acme.utils.loggers import make_default_logger, Logger
 
 from .utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
-from .observers import MCTSObserver, MCTSPolicyObserver
+from .observers import MCTSObserver, MCTSPolicyObserver, CorrectProgramObserver
 from .loggers import WandbLogger
 
 @dataclasses.dataclass
@@ -95,7 +95,7 @@ class AlphaDevConfig(object):
     wandb_mode: str = 'online'
     wanbd_run_id: Optional[str] = None
     # Observers
-    # TODO: add environment observers
+    observe_program_correctness: bool = True
     observe_mcts_policy: bool = True
     mcts_observer_ratio: float = 0.001
 
@@ -204,7 +204,12 @@ class env_observer_factory:
         self.config = config
     
     def __call__(self, logger: Logger):
-        return []
+        observers = []
+        if self.config.observe_program_correctness:
+            observers.append(
+                CorrectProgramObserver()
+            )
+        return observers
 
 class search_observer_factory:
     def __init__(self, config: AlphaDevConfig):
