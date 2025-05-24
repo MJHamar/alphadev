@@ -107,19 +107,25 @@ class CorrectProgramObserver(EnvLoopObserver):
     def observe_first(self, env, timestep, action=None):
         self._metrics = {
             'is_correct': False,
+            'is_invalid': False,
+            'invalid_reason': None,
+            'max_num_hits': 0,
             'num_hits': 0,
-            'num_steps': 0,
         }
     
     def observe(self, env, timestep, action=None):
         if timestep.last():
-            self._metrics['num_steps'] += 1
             self._metrics['is_correct'] = env._is_correct
+            self._metrics['is_invalid'] = env._is_invalid
+            self._metrics['invalid_reason'] = (
+                'toolong' if len(env._program) > env.max_program_length else
+                'invalid' if env._is_invalid else
+                'correct'
+            )
             self._metrics['num_hits'] = env._num_hits
-        elif timestep.mid():
-            self._metrics['num_steps'] += 1
-            self._metrics['is_correct'] = env._is_correct
-            self._metrics['num_hits'] = env._num_hits
+            self._metrics['max_num_hits'] = max(self._metrics['max_num_hits'], env._num_hits)
+        else:
+            self._metrics['max_num_hits'] = max(self._metrics['max_num_hits'], env._num_hits)
     
     def get_metrics(self):
         return self._metrics
