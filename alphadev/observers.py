@@ -1,6 +1,9 @@
+import os
+import time
 import numpy as np
-
+import pickle
 from acme.agents.tf.mcts.search import Node
+
 
 class MCTSObserver:
     """
@@ -129,3 +132,50 @@ class CorrectProgramObserver(EnvLoopObserver):
     
     def get_metrics(self):
         return self._metrics
+
+class NonZeroRewardObserver(EnvLoopObserver):
+    """
+    Observer that catches and saves non-zero rewards.
+    """
+    def __init__(self):
+        super().__init__()
+        self._trajectory_save_path = os.path.join(
+            os.getcwd(),
+            'saved_trajectories_' + time.strftime("%Y%m%d-%H%M%S", time.localtime() ),
+        )
+        os.makedirs(self._trajectory_save_path, exist_ok=True)
+        self._num_saves = 0
+        self._current_trajectory = []
+    
+    def observe_first(self, env, timestep, action=None):
+        self._current_trajectory = [timestep]
+    
+    def observe(self, env, timestep, action=None):
+        self._current_trajectory.append(timestep)
+        if timestep.reward != 0:
+            print(f"Non-zero reward observed: {timestep.reward} at step {timestep.step_type}")
+    
+    def get_metrics(self):
+        try:
+            last_reward = self._current_trajectory[-1].reward[0]
+        except:
+            print("WARINING: NonZeroRewardObserver is only compatible with environments that return an array of rewards.")
+            return {}
+        if last_reward != 0:
+            # save the trajectory
+            save_path = os.path.join(
+                self._trajectory_save_path,
+                f'trajectory_{self._num_saves}.pkl'
+            )
+            with open(save_path, 'wb') as f:
+                pickle.dump(self._current_trajectory, f)
+            print(f"Saved trajectory to {save_path}")
+            self._num_saves += 1
+            # return the number of saves
+            return {
+                'trajectory_saved': True,
+            }
+        else:
+            return {
+                'trajectory_saved': False,
+            }

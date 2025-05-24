@@ -8,7 +8,7 @@ import portpicker
 from acme.utils.loggers import make_default_logger, Logger
 
 from .utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
-from .observers import MCTSObserver, MCTSPolicyObserver, CorrectProgramObserver
+from .observers import MCTSObserver, MCTSPolicyObserver, CorrectProgramObserver, NonZeroRewardObserver
 from .loggers import WandbLogger
 
 @dataclasses.dataclass
@@ -96,6 +96,8 @@ class AlphaDevConfig(object):
     wanbd_run_id: Optional[str] = None
     # Observers
     observe_program_correctness: bool = True
+    save_non_zero_reward_trajectories: bool = True
+    # MCTS observers
     observe_mcts_policy: bool = True
     mcts_observer_ratio: float = 0.001
 
@@ -208,6 +210,10 @@ class env_observer_factory:
         if self.config.observe_program_correctness:
             observers.append(
                 CorrectProgramObserver()
+            )
+        if self.config.save_non_zero_reward_trajectories:
+            observers.append(
+                NonZeroRewardObserver()
             )
         return observers
 

@@ -364,11 +364,6 @@ class AssemblyGame(Environment):
                 latencies, self._task_spec.latency_quantile
             ) * self._task_spec.latency_reward_weight
         reward = max(correctness_reward - latency_reward, 0.0)
-        # if self._num_hits != self._prev_num_hits:
-        #     logger.debug(
-        #         "AssemblyGame._compute_reward: nh %s, pnh %s, r %s, l %s, c %s",
-        #         self._num_hits, self._prev_num_hits, reward, latency_reward, correctness_reward
-        #     )
         self._prev_num_hits = self._num_hits
         return reward, latency_reward, correctness_reward
     
