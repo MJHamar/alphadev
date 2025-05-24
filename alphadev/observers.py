@@ -118,7 +118,7 @@ class CorrectProgramObserver(EnvLoopObserver):
             self._metrics['is_correct'] = env._is_correct
             self._metrics['is_invalid'] = env._is_invalid
             self._metrics['invalid_reason'] = (
-                'toolong' if len(env._program) > env.max_program_length else
+                'toolong' if len(env._program) > env._task_spec.max_program_size else
                 'invalid' if env._is_invalid else
                 'correct'
             )
