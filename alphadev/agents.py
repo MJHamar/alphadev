@@ -492,7 +492,7 @@ class DistributedMCTS:
                     conn_config=config.distributed_backend_config,
                     instance_factory=self.learner,
                     instance_cls=learning.AZLearner,
-                    args=(replay, counter, logger, variable_service))
+                    args=(replay, counter, variable_service, logger))
                 )
 
         with program.group('evaluator'):
