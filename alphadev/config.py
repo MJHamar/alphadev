@@ -267,8 +267,8 @@ class DeviceAllocationConfig:
     
     def __init__(self, config: AlphaDevConfig):
         self.config = config
-        self.num_actors = config.num_actors
         self.inference_mode = config.make_inference_service
+        self.num_actors = config.num_actors if not self.inference_mode else 1
         self.gpus = tf.config.list_physical_devices('GPU')
         # determine the network size in a new process so that we don't interfere with the main process
         self.device_allocations = self.compute_device_allocations()
@@ -278,8 +278,8 @@ class DeviceAllocationConfig:
         return f"{process_type}_{index}"
     
     @staticmethod
-    def device_config_callback(process_type, gpu, memory):
-        print(f"Setting device for {process_type} to {gpu} with {memory} bytes.")
+    def device_config_callback(process_key, gpu, memory):
+        print(f"Setting device for {process_key} to {gpu} with {memory} bytes.")
         tf.config.set_visible_devices(gpu, 'GPU')
         tf.config.experimental.set_memory_growth(gpu, True)
         
@@ -355,57 +355,53 @@ class DeviceAllocationConfig:
         assert len(gpu_totals) == len(self.gpus), "Mismatch between number of GPUs and memory totals."
         
         gpu_available = dict(zip(self.gpus, gpu_totals))
-        
-        # TODO: would make more sense to distribute the memory without leaving any GPU vram empty
-        
+        gpu_totals = sum(gpu_available.values())
+        # device_allocations[self._make_process_key('inference_service')] = {
+        #     'gpu': learner_gpu,
+        #     'memory': actor_memory
+        # }
         learner_memory = self.compute_network_size(self.config.batch_size) * 3
         print(f"Learner process memory allocation: {learner_memory} bytes")
         if self.inference_mode:
-            actor_memory = self.compute_network_size(self.config.batch_size) * 1.2
+            actor_memory = self.compute_network_size(self.config.batch_size) * 2
             print(f"Inference service memory allocation: {actor_memory} bytes")
         else:
-            actor_memory = self.compute_network_size(1) * 1.2
-        print(f"Actor process memory allocation: {actor_memory} bytes")
-        # start with the learner process
+            actor_memory = self.compute_network_size(1) * 2
+            print(f"Actor process memory allocation: {actor_memory} bytes")
+        
+        min_slot_sizes = [learner_memory] + [actor_memory] * self.num_actors
+        process_types = [self.LEARNER_PROCESS] + [self.ACTOR_PROCESS] * self.num_actors
+        # iteratively, we distribute the processes (1 learner, N actors) evenly across the avilable GPUs,
+        # keeping track of the total memory demand for each GPU
+        gpu_allocations = {gpu: [] for gpu in self.gpus}
+        # allocate the learner to the first GPU
         learner_gpu = self.gpus[0]
-        device_allocations[self._make_process_key(self.LEARNER_PROCESS)] = {
-            'gpu': learner_gpu,
-            'memory': learner_memory
-        }
-        gpu_available[learner_gpu] -= learner_memory
-        print(f"Remaining memory for actors: {gpu_available}")
-        
-        if self.inference_mode:
-            if gpu_available[learner_gpu] < actor_memory:
-                print(f"{learner_gpu} does not have enough memory for inference service, switching to next GPU.")
-                gpu_available.pop(learner_gpu)
-                if len(gpu_available) == 0:
-                    raise RuntimeError("No more GPUs available for inference service, stopping allocation.")
-                learner_gpu = next(iter(gpu_available))
-            device_allocations[self._make_process_key('inference_service')] = {
-                'gpu': learner_gpu,
-                'memory': actor_memory
-            }
-            gpu_available[learner_gpu] -= actor_memory
-            print(f"Allocated {actor_memory} bytes to inference service on {learner_gpu}. Remaining memory: {gpu_available[learner_gpu]} bytes")
-        
-        # allocate memory for each actor process
-        crnt_gpu = learner_gpu
-        for i in range(self.num_actors+1):
-            remaining = gpu_available[crnt_gpu]
-            if remaining < actor_memory:
-                print(f"{crnt_gpu} does not have any memory left for actor {i}, switching to next GPU.")
-                gpu_available.pop(crnt_gpu)
-                if len(gpu_available) == 0:
-                    raise RuntimeError("No more GPUs available for actors, stopping allocation.")
-                crnt_gpu = next(iter(gpu_available))
-            device_allocations[self._make_process_key(self.ACTOR_PROCESS, i)] = {
-                'gpu': crnt_gpu,
-                'memory': actor_memory
-            }
-            gpu_available[crnt_gpu] -= actor_memory
-            print(f"Allocated {actor_memory} bytes to actor {i} on {crnt_gpu}. Remaining memory: {gpu_available[crnt_gpu]} bytes")
-        print(f"Final device allocations: {device_allocations}")
+        gpu_allocations[learner_gpu].append(0)
+        gpu_index = 1 if len(self.gpus) > 1 else 0
+        for i in range(1, self.num_actors + 1):
+            gpu = self.gpus[gpu_index]
+            gpu_allocations[gpu].append(i)
+            gpu_index = (gpu_index + 1) % len(self.gpus)
+        print(f"GPU allocations: {gpu_allocations}")
+        # now, gpu_allocations maps process indices to GPUs.
+        # we are ready to compute the device allocations
+        for gpu, indices in gpu_allocations.items():
+            gpu_memory = gpu_available[gpu]
+            slot_size = gpu_memory // len(indices)
+            for index in indices:
+                if slot_size < min_slot_sizes[index]:
+                    raise ValueError(
+                        f"Not enough memory on GPU {gpu} for process {process_types[index]}: "
+                        f"required {min_slot_sizes[index]} bytes, available {slot_size} bytes."
+                    )
+                process_type = process_types[index]
+                # decrement the index by 1 for the actor processes.
+                idx = index-1 if index > 0 else 0
+                device_allocations[self._make_process_key(process_type, idx)] = {
+                    'gpu': gpu,
+                    'memory': slot_size
+                }
+        print(f"Device allocations: {device_allocations}")
         return device_allocations
 
     def make_callbacks(self):
@@ -413,15 +409,15 @@ class DeviceAllocationConfig:
         Create callbacks for each component to set the device allocation.
         """
         callbacks = {}
-        for process_type, allocation in self.device_allocations.items():
+        for process_key, allocation in self.device_allocations.items():
             gpu = allocation['gpu']
             memory = allocation['memory']
-            callbacks[process_type] = functools.partial(
+            callbacks[process_key] = functools.partial(
                 self.device_config_callback,
-                process_type=process_type,
+                process_key=process_key,
                 gpu=gpu,
                 memory=memory
-            ) 
+            )
         return callbacks
 
     def get_callback(self, process_type: str, index: int = 0) -> Optional[Callable]:
