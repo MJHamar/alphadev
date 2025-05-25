@@ -42,6 +42,7 @@ def make_agent(config: AlphaDevConfig):
     
     if config.distributed:
         return DistributedMCTS(
+            device_config=config.device_config,
             environment_factory=env_factory,
             network_factory=net_factory,
             model_factory=mod_factory,

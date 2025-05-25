@@ -91,7 +91,7 @@ class AlphaDevConfig(object):
     # variable service
     variable_service_name: str = 'variable'
     # inference service
-    make_inference_service: bool = True # if False, all actors will have their own version of the network
+    make_inference_service: bool = False # if False, all actors will have their own version of the network
     inference_service_backend: Literal['redis', 'shm'] = 'redis'
     inference_service_name: str = 'inference'
     inference_accumulation_period: int = 1.0
