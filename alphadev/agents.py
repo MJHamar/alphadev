@@ -49,7 +49,7 @@ from .acting import MCTSActor
 from .search import PUCTSearchPolicy
 from .observers import MCTSObserver
 from .service import Program, ReverbService, RPCService, RPCClient, SubprocessService
-from .config import AlphaDevConfig
+from .config import AlphaDevConfig, DeviceAllocationConfig
 from .inference_service import InferenceClient
 from .variable_service import VariableService
 
@@ -166,6 +166,7 @@ class DistributedMCTS:
 
     def __init__(
         self,
+        device_config: DeviceAllocationConfig,
         environment_factory: Callable[[], dm_env.Environment],
         network_factory: Callable[[specs.DiscreteArray], snt.Module],
         model_factory: Callable[[specs.EnvironmentSpec], models.Model],
@@ -195,6 +196,9 @@ class DistributedMCTS:
 
         if environment_spec is None:
             environment_spec = specs.make_environment_spec(environment_factory())
+
+        # Internalize the device configuration.
+        self._device_config = device_config
 
         # These 'factories' create the relevant components on the workers.
         self._environment_factory = environment_factory
@@ -399,7 +403,6 @@ class DistributedMCTS:
         variable_service: VariableService = None,
     ):
         """The evaluation process."""
-
         # Build environment, model, network.
         environment = self._environment_factory()
         model = self._model_factory(self._env_spec)
@@ -460,12 +463,6 @@ class DistributedMCTS:
             replay = program.add_service(ReverbService(
                 priority_tables_fn=self.replay, port=config.replay_server_port))
 
-        # with program.group('inference'):
-        #     inference = program.add_service(
-        #         SubprocessService(
-        #             command_builder=self.inference, args=(config, ),)
-        #     )
-
         variable_service = VariableService(config)
 
         with program.group('counter'):
@@ -487,34 +484,52 @@ class DistributedMCTS:
                 )
 
         with program.group('learner'):
+            learner_device_setup = self._device_config.get_callback('learner')
             program.add_service(
                 RPCService(
                     conn_config=config.distributed_backend_config,
                     instance_factory=self.learner,
                     instance_cls=learning.AZLearner,
-                    args=(replay, counter, variable_service, logger))
+                    args=(replay, counter, variable_service, logger)),
+                device_setup=learner_device_setup,
                 )
 
+        if config.make_inference_service:
+            assert False, "Inference service doesn't work rn."
+            with program.group('inference'):
+                inference_device_setup = self._device_config.get_callback('inference')
+                # TODO: no subprocessing is needed.
+                inference = program.add_service(
+                    SubprocessService(
+                        command_builder=self.inference, args=(config, ),)
+                )
+            actor_args = (replay, counter, logger, inference, None)
+            eval_args = (counter, logger, inference, None)
+        else:
+            actor_args = (replay, counter, logger, None, variable_service)
+            eval_args = (counter, logger, None, variable_service)
+
         with program.group('evaluator'):
+            eval_device_setup = self._device_config.get_callback('evaluator')
             program.add_service(
                 RPCService(
                     conn_config=config.distributed_backend_config,
                     instance_factory=self.evaluator,
                     instance_cls=acme.EnvironmentLoop,
-                    args=(counter, logger, None, variable_service),
-                    # args=(counter, logger, inference, None),
-                    fork_worker=False)
+                    args=eval_args),
+                device_setup=eval_device_setup
                 )
 
         with program.group('actor'):
-            for _ in range(self._num_actors):
+            for idx in range(self._num_actors):
+                actor_device_setup = self._device_config.get_callback('actor', idx)
                 program.add_service(
                     RPCService(
                         conn_config=config.distributed_backend_config,
                         instance_factory=self.actor,
                         instance_cls=acme.EnvironmentLoop,
-                        args=(replay, counter, logger, None, variable_service))
-                        # args=(replay, counter, logger, inference, None))
+                        args=actor_args),
+                    device_setup=actor_device_setup,
                     )
 
         return program

@@ -445,6 +445,14 @@ class SubprocessService(MaybeLogger):
         """
         return self._handle
 
+def worker_process(name, runner:RPCService, device_setup:callable = None):
+    print(f'Starting worker process {name} [{os.getpid()}]')
+    if device_setup is not None:
+        print(f'Running device setup for {name} [{os.getpid()}]')
+        device_setup()
+    runner()
+    print(f'Worker process {name} [{os.getpid()}] finished running')
+
 class Program(object):
     """
     Program class that manages the services and returns their handles.
@@ -455,7 +463,7 @@ class Program(object):
         self._current_group = None
         self._group_members = 0
     
-    def add_service(self, service: RPCService, label: str = ""):
+    def add_service(self, service: RPCService, label: str = "", device_setup:callable = None):
         """
         Add a service to the program.
         """
@@ -464,7 +472,7 @@ class Program(object):
         if label is not None:
             new_label += '.' + label
         service.set_logger(base_logger.getChild(f'{new_label}'))
-        self._services.append((new_label, service))
+        self._services.append((new_label, service, device_setup))
         base_logger.info('Service %s added', new_label)
         return service.create_handle()
     
@@ -472,9 +480,13 @@ class Program(object):
         """
         Run all the services in the program in a separate process.
         """
-        for name, service in self._services:
+        for name, service, device_setup in self._services:
             base_logger.info('Starting Service %s', name)
-            proc = multiprocessing.Process(target=service.run)
+            proc = multiprocessing.Process(
+                target=worker_process,
+                args=(name, service.run, device_setup),
+                name=name
+            )
             proc.start()
             self._service_processes.append((name, proc))
         
