@@ -302,7 +302,7 @@ class DeviceAllocationConfig:
             env = EnvironmentFactory(self.config)()
             env_spec = make_environment_spec(env)
             tf2_utils.create_variables(
-                network, env_spec.observations,
+                network, [env_spec.observations],
                 batch_size=batch_size,
             )
             memory_info = tf.config.experimental.get_memory_info('GPU:0')
