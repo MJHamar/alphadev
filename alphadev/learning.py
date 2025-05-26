@@ -9,7 +9,7 @@ from acme.utils import loggers
 from acme.utils import counting
 from acme.tf import utils as tf2_utils
 
-from .variable_service import VariableService
+from .service.variable_service import VariableService
 
 import logging
 logger = logging.getLogger(__name__)

@@ -22,10 +22,10 @@ from acme.tf import variable_utils as tf2_variable_utils
 from acme.tf import utils as tf2_utils
 import threading
 
-from .config import AlphaDevConfig
-from .network import AlphaDevNetwork
+from ..config import AlphaDevConfig
+from ..network import AlphaDevNetwork
 from .service import RPCClient, _RedisRPCService, _RedisRPCClient
-from .environment import environment_spec_from_config
+from ..environment import environment_spec_from_config
 from .variable_service import VariableService
 from .service import make_client_backend, make_service_backend
 

@@ -48,10 +48,10 @@ from .dual_value_az import DualValueAZLearner, DualValueMCTSActor
 from .acting import MCTSActor
 from .search import PUCTSearchPolicy
 from .observers import MCTSObserver
-from .service import Program, ReverbService, RPCService, RPCClient, SubprocessService
+from .service.service import Program, ReverbService, RPCService, RPCClient, SubprocessService
 from .config import AlphaDevConfig, DeviceAllocationConfig
-from .inference_service import InferenceClient
-from .variable_service import VariableService
+from .service.inference_service import InferenceClient
+from .service.variable_service import VariableService
 
 
 class MCTS(agent.Agent):

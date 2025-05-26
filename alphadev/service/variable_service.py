@@ -7,7 +7,7 @@ import pickle
 import time
 import contextlib
 
-from .config import AlphaDevConfig
+from ..config import AlphaDevConfig
 
 import logging
 logger = logging.getLogger(__name__)

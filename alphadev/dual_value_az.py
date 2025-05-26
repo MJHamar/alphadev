@@ -9,8 +9,8 @@ from .distribution import DistributionSupport
 from .acting import MCTSActor
 from .search import mcts, DvNode, visit_count_policy
 from .learning import AZLearner
-from .service import RPCClient
-from .variable_service import VariableService
+from .service.service import RPCClient
+from .service.variable_service import VariableService
 
 import logging
 logger = logging.getLogger(__name__)
