@@ -1,3 +1,4 @@
+import os
 from typing import Callable, Union, Optional, Literal
 import functools
 import yaml
@@ -8,8 +9,7 @@ import portpicker
 import tensorflow as tf
 
 from acme.utils.loggers import make_default_logger, Logger
-import acme.tf.utils as tf2_utils
-from acme.specs import make_environment_spec
+
 
 from .utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
 from .observers import MCTSObserver, MCTSPolicyObserver, CorrectProgramObserver, NonZeroRewardObserver
@@ -95,6 +95,8 @@ class AlphaDevConfig(object):
     inference_service_backend: Literal['redis', 'shm'] = 'redis'
     inference_service_name: str = 'inference'
     inference_accumulation_period: int = 1.0
+    # device config
+    device_config_path: Optional[str] = 'device_config.yaml'
     
     # Logging
     use_wandb: bool = True
@@ -171,9 +173,16 @@ class AlphaDevConfig(object):
         
         if self.replay_server_port is None:
             self.replay_server_port = portpicker.pick_unused_port()
-        
+    
+    def verify_device_config(self):
         if self.distributed:
-            self.device_config = DeviceAllocationConfig(self)
+            if not os.path.exists(self.device_config_path):
+                raise FileNotFoundError(
+                    f"Device configuration file not found: {self.device_config_path}. "
+                    "Please make sure to run the device configuration script first."
+                )
+            with open(self.device_config_path, 'r') as f:
+                self.device_config = yaml.safe_load(f)
     
     @classmethod
     def from_yaml(cls, path) -> 'AlphaDevConfig':
@@ -244,185 +253,3 @@ class search_observer_factory:
     
 def make_observer_factories(config: AlphaDevConfig):
     return env_observer_factory(config), search_observer_factory(config)
-
-class DeviceAllocationConfig:
-    """
-    When using distributed training, this class is used to pre-compute the device allocation for each concurrent component.
-    
-    What we expect:
-    - 1 learner process.
-    - N+1 actor processes (N for experience replay, 1 for evaluation).
-    - OR, a single inference service that does inference for all actors.
-    
-    Before distributed training is launched, we perform the following steps:
-    1. Construct an instance of the network on CPU to determine its size.
-    2. Pre-compute device allocation for each component based on the number of components, number of available GPUs and the size of the network.
-        - For the learner process, we assume network_size * 3 memory demand.
-        - For each actor process, we assume network_size * 1.2 memory demand.
-    3. Prepare callbacks to be called by each component when their corresponding process is launched.
-    If no GPU is available, this is a NoOp.
-    """
-    ACTOR_PROCESS = 'actor'
-    LEARNER_PROCESS = 'learner'
-    
-    def __init__(self, config: AlphaDevConfig):
-        self.config = config
-        self.inference_mode = config.make_inference_service
-        self.num_actors = config.num_actors if not self.inference_mode else 1
-        self.gpus = tf.config.list_physical_devices('GPU')
-        # determine the network size in a new process so that we don't interfere with the main process
-        self.device_allocations = self.compute_device_allocations()
-        self.callbacks = self.make_callbacks()
-    
-    def _make_process_key(self, process_type: str, index: int = 0) -> str:
-        return f"{process_type}_{index}"
-    
-    @staticmethod
-    def device_config_callback(process_key, gpu, memory):
-        print(f"Setting device for {process_key} to {gpu} with {memory} bytes.")
-        tf.config.set_visible_devices(gpu, 'GPU')
-        tf.config.experimental.set_memory_growth(gpu, True)
-        
-        tf.config.experimental.set_virtual_device_configuration(
-            gpu,
-            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=memory)]
-        )
-    
-    def _compute_network_size(self, batch_size: int = 1) -> int:
-        """Compute the size of the network in bytes."""
-        from .network import NetworkFactory
-        from .environment import EnvironmentFactory
-        print("Computing network size...")
-        # create a new tf session temporarily to containerize this computation
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            print("Using GPU for network size computation.")
-            tf.config.experimental.set_memory_growth(gpus[0], True)
-            network = NetworkFactory(self.config)(None)
-            env = EnvironmentFactory(self.config)()
-            env_spec = make_environment_spec(env)
-            tf2_utils.create_variables(
-                network, [env_spec.observations],
-                batch_size=batch_size,
-            )
-            memory_info = tf.config.experimental.get_memory_info('GPU:0')
-            print("Peak Memory Usage:", memory_info['peak'])
-            return memory_info['peak']
-        else:
-            print("No GPU available, returning 0 for network size.")
-            return 0
-    
-    def compute_network_size(self, batch_size: int = 1) -> int:
-        import multiprocessing as mp
-        
-        with mp.Pool(1) as pool:
-            network_size = pool.apply(self._compute_network_size, args=(batch_size,))
-        
-        print(f"Network size: {network_size} bytes")
-        return network_size
-    
-    def _get_total_memory(self):
-        import subprocess
-        
-        try:
-            # nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits
-            output = subprocess.check_output(
-                ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
-                encoding='utf-8', stderr=subprocess.DEVNULL
-            )
-            mem_mb = output.strip().split('\n')
-            mem_bytes = [int(mb) * 1024 * 1024 for mb in mem_mb]
-            return mem_bytes
-        except subprocess.CalledProcessError:
-            print("Failed to get GPU memory info, returning empty list.")
-            return []
-    
-    def compute_device_allocations(self):
-        """
-        Compute the device allocations for each component.
-        """
-        if len(self.gpus) == 0:
-            print("No GPUs available, returning empty device allocations.")
-            return {}
-        
-        device_allocations = {}
-        
-        gpu_totals = self._get_total_memory()
-        print(f"Total GPU memory available: {gpu_totals} bytes")
-        if not gpu_totals:
-            print("No GPU memory information available, returning empty device allocations.")
-            return {}
-        assert len(gpu_totals) == len(self.gpus), "Mismatch between number of GPUs and memory totals."
-        
-        gpu_available = dict(zip(self.gpus, gpu_totals))
-        gpu_totals = sum(gpu_available.values())
-        # device_allocations[self._make_process_key('inference_service')] = {
-        #     'gpu': learner_gpu,
-        #     'memory': actor_memory
-        # }
-        learner_memory = self.compute_network_size(self.config.batch_size) * 3
-        print(f"Learner process memory allocation: {learner_memory} bytes")
-        if self.inference_mode:
-            actor_memory = self.compute_network_size(self.config.batch_size) * 2
-            print(f"Inference service memory allocation: {actor_memory} bytes")
-        else:
-            actor_memory = self.compute_network_size(1) * 2
-            print(f"Actor process memory allocation: {actor_memory} bytes")
-        
-        min_slot_sizes = [learner_memory] + [actor_memory] * self.num_actors
-        process_types = [self.LEARNER_PROCESS] + [self.ACTOR_PROCESS] * self.num_actors
-        # iteratively, we distribute the processes (1 learner, N actors) evenly across the avilable GPUs,
-        # keeping track of the total memory demand for each GPU
-        gpu_allocations = {gpu: [] for gpu in self.gpus}
-        # allocate the learner to the first GPU
-        learner_gpu = self.gpus[0]
-        gpu_allocations[learner_gpu].append(0)
-        gpu_index = 1 if len(self.gpus) > 1 else 0
-        for i in range(1, self.num_actors + 1):
-            gpu = self.gpus[gpu_index]
-            gpu_allocations[gpu].append(i)
-            gpu_index = (gpu_index + 1) % len(self.gpus)
-        print(f"GPU allocations: {gpu_allocations}")
-        # now, gpu_allocations maps process indices to GPUs.
-        # we are ready to compute the device allocations
-        for gpu, indices in gpu_allocations.items():
-            gpu_memory = gpu_available[gpu]
-            slot_size = gpu_memory // len(indices)
-            for index in indices:
-                if slot_size < min_slot_sizes[index]:
-                    raise ValueError(
-                        f"Not enough memory on GPU {gpu} for process {process_types[index]}: "
-                        f"required {min_slot_sizes[index]} bytes, available {slot_size} bytes."
-                    )
-                process_type = process_types[index]
-                # decrement the index by 1 for the actor processes.
-                idx = index-1 if index > 0 else 0
-                device_allocations[self._make_process_key(process_type, idx)] = {
-                    'gpu': gpu,
-                    'memory': slot_size
-                }
-        print(f"Device allocations: {device_allocations}")
-        return device_allocations
-
-    def make_callbacks(self):
-        """
-        Create callbacks for each component to set the device allocation.
-        """
-        callbacks = {}
-        for process_key, allocation in self.device_allocations.items():
-            gpu = allocation['gpu']
-            memory = allocation['memory']
-            callbacks[process_key] = functools.partial(
-                self.device_config_callback,
-                process_key=process_key,
-                gpu=gpu,
-                memory=memory
-            )
-        return callbacks
-
-    def get_callback(self, process_type: str, index: int = 0) -> Optional[Callable]:
-        """
-        Get the callback for a specific process type.
-        """
-        key = self._make_process_key(process_type, index)
-        return self.callbacks.get(key, None)

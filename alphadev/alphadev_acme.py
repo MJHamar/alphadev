@@ -153,4 +153,5 @@ if __name__ == '__main__':
         print("No config file provided. Using default config.", e)
         config = AlphaDevConfig()
     # -- run alphadev
+    config.verify_device_config()
     run_alphadev(config)

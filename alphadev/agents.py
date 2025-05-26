@@ -49,7 +49,8 @@ from .acting import MCTSActor
 from .search import PUCTSearchPolicy
 from .observers import MCTSObserver
 from .service.service import Program, ReverbService, RPCService, RPCClient, SubprocessService
-from .config import AlphaDevConfig, DeviceAllocationConfig
+from .config import AlphaDevConfig
+from .device_config import DeviceAllocationConfig
 from .service.inference_service import InferenceClient
 from .service.variable_service import VariableService
 
@@ -484,20 +485,28 @@ class DistributedMCTS:
                 )
 
         with program.group('learner'):
-            learner_device_setup = self._device_config.get_callback('learner')
+            learner_device_config = self._device_config.get(
+                DeviceAllocationConfig.make_process_key(
+                    DeviceAllocationConfig.LEARNER_PROCESS
+                )
+            , None)
             program.add_service(
                 RPCService(
                     conn_config=config.distributed_backend_config,
                     instance_factory=self.learner,
                     instance_cls=learning.AZLearner,
                     args=(replay, counter, variable_service, logger)),
-                device_setup=learner_device_setup,
+                device_config=learner_device_config,
                 )
 
         if config.make_inference_service:
             assert False, "Inference service doesn't work rn."
             with program.group('inference'):
-                inference_device_setup = self._device_config.get_callback('inference')
+                inference_device_config = self._device_config.get(
+                    DeviceAllocationConfig.make_process_key(
+                        DeviceAllocationConfig.ACTOR_PROCESS
+                    )
+                , None)
                 # TODO: no subprocessing is needed.
                 inference = program.add_service(
                     SubprocessService(
@@ -510,26 +519,34 @@ class DistributedMCTS:
             eval_args = (counter, logger, None, variable_service)
 
         with program.group('evaluator'):
-            eval_device_setup = self._device_config.get_callback('evaluator')
+            eval_device_config = self._device_config.get(
+                DeviceAllocationConfig.make_process_key(
+                    DeviceAllocationConfig.ACTOR_PROCESS, 0
+                ), None
+            )
             program.add_service(
                 RPCService(
                     conn_config=config.distributed_backend_config,
                     instance_factory=self.evaluator,
                     instance_cls=acme.EnvironmentLoop,
                     args=eval_args),
-                device_setup=eval_device_setup
+                device_config=eval_device_config
                 )
 
         with program.group('actor'):
             for idx in range(self._num_actors):
-                actor_device_setup = self._device_config.get_callback('actor', idx)
+                actor_device_config = self._device_config.get(
+                    DeviceAllocationConfig.make_process_key(
+                        DeviceAllocationConfig.ACTOR_PROCESS, idx
+                    )
+                , None)
                 program.add_service(
                     RPCService(
                         conn_config=config.distributed_backend_config,
                         instance_factory=self.actor,
                         instance_cls=acme.EnvironmentLoop,
                         args=actor_args),
-                    device_setup=actor_device_setup,
+                    device_config=actor_device_config,
                     )
 
         return program

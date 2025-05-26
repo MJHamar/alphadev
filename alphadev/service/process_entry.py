@@ -27,25 +27,33 @@ def parse_args():
             or
             (args.device_name is None and args.allocation_size is None)), \
                 "Both --device_name and --allocation_size must be provided together or not at all."
+    return args
 
 # parse arguments
 config = parse_args()
+print('arguments parsed:', config)
 print(f"{config.label} starting with executable {config.executable_path}.")
 # configure GPU runtime
 import tensorflow as tf
-tf.config.set_visible_devices([config.device_name], 'GPU')
-tf.config.experimental.set_memory_growth(config.device_name, True)
+if config.device_name is not None:
+    tf.config.set_visible_devices([config.device_name], 'GPU')
+    tf.config.experimental.set_memory_growth(config.device_name, True)
 
-tf.config.experimental.set_virtual_device_configuration(
-    config.device_name,
-    [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=config.allocation_size)]
-)
-print(f"{config.label} configured to use device {config.device_name} with allocation size {config.allocation_size} bytes.")
+    tf.config.experimental.set_virtual_device_configuration(
+        config.device_name,
+        [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=config.allocation_size)]
+    )
+    print(f"{config.label} configured to use device {config.device_name} with allocation size {config.allocation_size} bytes.")
+else:
+    print(f"{config.label} running without device configuration.")
 
 # load the executable
 import cloudpickle
 with open(config.executable_path, 'rb') as f:
     executable = cloudpickle.load(f)
+
+# clean stdin to avoid parsing unknown flags
+sys.argv = sys.argv[:1]
 
 # run the executable
 app.run(executable)

@@ -2,20 +2,20 @@
 Lightweight implementation of Service objects that wrap different components
 of the distributed training pipeline.
 """
+from typing import Dict
 import os
+import sys
 import abc
 import reverb
-import socket
 import redis
-import signal
 import pickle
 import threading
 import contextlib
-import multiprocessing
-multiprocessing.set_start_method('spawn', force=True)
 from time import sleep
 from uuid import uuid4 as uuid
 import subprocess
+import cloudpickle
+from tempfile import NamedTemporaryFile
 
 import logging
 base_logger = logging.getLogger(__name__)
@@ -307,7 +307,7 @@ class RPCService(MaybeLogger):
             # Call the return function with the payload
             return_func(result)
     
-    def run(self):
+    def run(self, *args, **kwargs):
         """
         Run the service. This method is called by the main thread when the
         service is started.
@@ -387,7 +387,7 @@ class ReverbService(MaybeLogger):
         self._checkpoint_time_delta_minutes = checkpoint_time_delta_minutes
         self._port = port
     
-    def run(self):
+    def run(self, *args, **kwargs):
         """
         Run the reverb server and start the checkpointing thread if needed.
         """
@@ -445,14 +445,6 @@ class SubprocessService(MaybeLogger):
         """
         return self._handle
 
-def worker_process(name, runner:RPCService, device_setup:callable = None):
-    print(f'Starting worker process {name} [{os.getpid()}]')
-    if device_setup is not None:
-        print(f'Running device setup for {name} [{os.getpid()}]')
-        device_setup()
-    runner()
-    print(f'Worker process {name} [{os.getpid()}] finished running')
-
 class Program(object):
     """
     Program class that manages the services and returns their handles.
@@ -463,16 +455,16 @@ class Program(object):
         self._current_group = None
         self._group_members = 0
     
-    def add_service(self, service: RPCService, label: str = "", device_setup:callable = None):
+    def add_service(self, service: RPCService, label: str = "", device_config:Dict[str, str] = None):
         """
         Add a service to the program.
         """
-        new_label = f'{self._current_group}/{self._group_members}'
+        new_label = f'{self._current_group}_{self._group_members}'
         self._group_members += 1
         if label is not None:
             new_label += '.' + label
         service.set_logger(base_logger.getChild(f'{new_label}'))
-        self._services.append((new_label, service, device_setup))
+        self._services.append((new_label, service, device_config))
         base_logger.info('Service %s added', new_label)
         return service.create_handle()
     
@@ -480,31 +472,43 @@ class Program(object):
         """
         Run all the services in the program in a separate process.
         """
-        for name, service, device_setup in self._services:
-            base_logger.info('Starting Service %s', name)
-            proc = multiprocessing.Process(
-                target=worker_process,
-                args=(name, service.run, device_setup),
-                name=name
-            )
-            proc.start()
-            self._service_processes.append((name, proc))
         
+        self._service_processes = []
+        for name, service, device_config in self._services:
+            base_logger.info('Configuring service %s', name)
+            with NamedTemporaryFile(prefix=f'service_{name}_', suffix='.pkl', delete=False) as fl:
+                cloudpickle.dump(service.run, fl)
+                args = ['--label', name]
+                if device_config is not None:
+                    args += ['--device_name', device_config['gpu'], '--allocation_size', str(device_config['memory'])]
+                fl.flush()
+                base_logger.info('Launching service: %s', name)
+                proc = subprocess.Popen([
+                    sys.executable,
+                    '-m', 'alphadev.service.process_entry',
+                    fl.name,
+                    *args
+                ])
+                # wait a second to ensure the file is not deleted prematurely
+                self._service_processes.append((name, proc))
+                sleep(1)
+        base_logger.info('All services launched.')
     
     def stop(self):
         """
         Stop all the services in the program.
         """
-        base_logger.info('Waiting for services to stop')
+        base_logger.info('Start monitoring services for termination...')
         while True:
             for name, proc in self._service_processes:
-                proc: multiprocessing.Process = proc
-                if proc.is_alive():
+                proc: subprocess.Popen = proc
+                rc = proc.poll()
+                if rc is None:
                     # base_logger.info('Service %s is still running', name)
                     continue
                 else:
-                    base_logger.info('Service %s has stopped', name)
-                    proc.join()
+                    base_logger.info('Service %s has stopped with exit code %s', name, rc)
+                    proc.wait()
                     break
             else:
                 sleep(1)
@@ -512,9 +516,12 @@ class Program(object):
             break
         base_logger.info('A service has stopped, stopping all services')
         for name, proc in self._service_processes:
+            proc: subprocess.Popen = proc
             base_logger.info('Stopping service %s', name)
             proc.terminate()
-            proc.join()
+            proc.wait()
+        
+        base_logger.info('All services stopped')
         self._services.clear()
     
     @contextlib.contextmanager
