@@ -31,7 +31,7 @@ class AZLearner(acme.Learner):
     ):
 
         # Logger and counter for tracking statistics / writing out to terminal.
-        self._counter = counting.Counter(counter, 'learner')
+        self._counter = counting.Counter(counter, 'learner', return_only_prefixed=True)
         self._logger = logger or loggers.TerminalLogger('learner', time_delta=30.)
 
         self._variable_service = variable_service
@@ -79,9 +79,10 @@ class AZLearner(acme.Learner):
         loss = self._step()
         self._logger.write({'loss': loss})
         counts = self._counter.increment(**{'step': 1})
+        print('counts', counts)
         if counts['step'] % self._variable_update_period == 0:
             logger.debug(f"updating variables at step {counts['step']}")
-            self._variable_service.update(self.get_variables())
+            self._variable_service.update(self.get_variables([]))
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:
         """Exposes the variables for actors to update from."""

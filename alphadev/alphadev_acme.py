@@ -9,6 +9,8 @@ import ml_collections
 
 from acme.specs import EnvironmentSpec, make_environment_spec, Array, BoundedArray, DiscreteArray
 from acme.agents.tf.mcts import models
+from acme.environment_loop import EnvironmentLoop
+from acme.utils.counting import Counter
 
 from tinyfive.multi_machine import multi_machine
 from .agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
@@ -17,6 +19,7 @@ from .config import AlphaDevConfig
 from .search import PUCTSearchPolicy
 from .network import AlphaDevNetwork, NetworkFactory
 from .environment import AssemblyGame, AssemblyGameModel, EnvironmentFactory, ModelFactory
+from .service.variable_service import VariableService
 
 import logging
 logger = logging.getLogger(__name__)
@@ -86,39 +89,32 @@ def make_agent(config: AlphaDevConfig):
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger=cfg_logger,
             mcts_observers=config.search_observers,
+            variable_service=VariableService(config),
+            variable_update_period=config.variable_update_period
         )
 
 def run_single_threaded(config: AlphaDevConfig, agent: MCTS):
     environment = AssemblyGame(config.task_spec)
     
-    num_episodes = config.training_steps
-    for episode in range(num_episodes):
-        # a. Reset environment and agent at start of episode
-        logger.info("Initializing episode...")
-        timestep = environment.reset()
-        agent._actor.observe_first(timestep)
-        
-        # b. Run episode
-        while not timestep.last():
-            # Agent selects an action
-            action = agent.select_action(timestep.observation)
-            # logger.info("ed %d: %s len %d act %d", episode, timestep.step_type, timestep.observation['program_length'], action)
-            # Environment steps
-            new_timestep = environment.step(action)
-            # logger.info("New timestep:", new_timestep)
-            # Agent observes the result
-            agent.observe(action=action, next_timestep=new_timestep)
-            # Update timestep
-            timestep = new_timestep
+    num_episodes = config.episode_accumulation_period
+    num_steps = config.training_steps
+    
+    env_observers = config.env_observers(agent.logger)
 
-        # c. Train the learner
-        logger.info("Final timestep reached: %s reward: %s", timestep.step_type, timestep.reward.numpy())
-        logger.info("Training agent...")
+    env_executor = EnvironmentLoop(
+        environment=environment,
+        actor=agent,
+        counter=agent.counter,
+        should_update=False,
+        logger=agent.logger,
+        observers=env_observers
+    )
+    for _ in range(num_steps):
+        # generate data
+        env_executor.run(num_episodes=num_episodes)
+        # update agent
         agent._learner.step()
-
-        # d. Log training information (optional)
-        logger.info(f"Episode {episode + 1}/{num_episodes} completed.")
-
+    
 def run_distributed(config: AlphaDevConfig, agent: DistributedMCTS):
     # build the distributed agent
     program = agent.build(config)

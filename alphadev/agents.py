@@ -71,6 +71,8 @@ class MCTS(agent.Agent):
         num_simulations: int,
         environment_spec: specs.EnvironmentSpec,
         batch_size: int,
+        variable_service: VariableService,
+        variable_update_period: int=10,
         use_dual_value_network: bool = False,
         logger: loggers.Logger = None,
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
@@ -106,7 +108,8 @@ class MCTS(agent.Agent):
         tf2_utils.create_variables(network, [environment_spec.observations])
 
         # Now create the agent components: actor & learner.
-        counter = counting.Counter(None)
+        self.counter = counting.Counter(None)
+        self.logger = logger
 
         mcts_observers = mcts_observers(logger)
 
@@ -120,7 +123,7 @@ class MCTS(agent.Agent):
                 num_simulations=num_simulations,
                 search_policy=search_policy,
                 temperature_fn=temperature_fn,
-                counter=counter,
+                counter=self.counter,
                 observers=mcts_observers,
             )
             learner = DualValueAZLearner(
@@ -128,8 +131,10 @@ class MCTS(agent.Agent):
                 optimizer=optimizer,
                 dataset=dataset,
                 discount=discount,
-                logger=logger,
-                counter=counter,
+                logger=self.logger,
+                counter=self.counter,
+                variable_service=variable_service,
+                varibale_update_period=variable_update_period,
             )
         else:
             actor = MCTSActor(
@@ -141,7 +146,7 @@ class MCTS(agent.Agent):
                 num_simulations=num_simulations,
                 search_policy=search_policy,
                 temperature_fn=temperature_fn,
-                counter=counter,
+                counter=self.counter,
                 observers=mcts_observers,
             )
             learner = learning.AZLearner(
@@ -149,16 +154,18 @@ class MCTS(agent.Agent):
                 optimizer=optimizer,
                 dataset=dataset,
                 discount=discount,
-                logger=logger,
-                counter=counter,
+                logger=self.logger,
+                counter=self.counter,
+                variable_service=variable_service,
+                variable_update_period=variable_update_period,
             )
 
         # The parent class combines these together into one 'agent'.
         super().__init__(
             actor=actor,
             learner=learner,
-            min_observations=10,
-            observations_per_step=1,
+            min_observations=100, # have at least some data in replay before starting the learner
+            observations_per_step=1,# deterministic and fully observable
         )
 
 

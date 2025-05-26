@@ -72,6 +72,9 @@ class AlphaDevConfig(object):
     lr_init: float = 2e-4
     momentum: float = 0.9
     
+    ### Single-threaded training
+    episode_accumulation_period: int = 2 # how many episodes to accumulate before training
+    
     ### Distributed training
     distributed: bool = True # whether to use distributed training
     prefetch_size: int = 4
