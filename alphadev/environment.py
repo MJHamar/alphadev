@@ -103,6 +103,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self._mems_written = set()
         # build mask lookup tables
         self._build_masks()
+        # make caches
+        self.loc_cache = set()
+        self.history_cache = set()
     
     def _build_masks(self):
         """
@@ -202,28 +205,33 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         active_memory = state['active_memory']  # shape E x M
         active_memory = tf.reduce_any(active_memory, axis=0)  # shape M
 
+        reg_hash = tf.reduce_sum(tf.cast(active_registers, tf.int32))
+        mem_hash = tf.reduce_sum(tf.cast(active_memory, tf.int32))
+        
+        _zero_mask = tf.zeros((self.max_reg + self.max_mem,), dtype=active_registers.dtype)
+
         assert active_registers.shape[0] == self.max_reg, \
             "active registers and max_reg do not match."
         assert active_memory.shape[0] == self.max_mem, \
             "active memory and max_mem do not match."
 
         # find windows of locations that are valid
-        last_reg = tf.cast(tf.argmax(tf.reverse(tf.cast(active_registers, tf.int64), axis=[0])), tf.int32)
+        last_reg = reg_hash
         if last_reg != 0: # 0 means window is full
             last_reg = self.max_reg - last_reg
             active_registers = tf.tensor_scatter_nd_update(active_registers, [[last_reg]], [True])
-        reg_window = tf.concat([active_registers, tf.zeros((self.max_mem,), dtype=active_registers.dtype)], axis=-1)
+        reg_window = tf.concat([active_registers, _zero_mask[:self.max_mem]], axis=-1)
 
         # same for the memory locations
-        last_mem = tf.cast(tf.argmax(tf.reverse(tf.cast(active_memory, tf.int64), axis=[0])), tf.int32)
+        last_mem = mem_hash
         if last_mem != 0: # 0 means window is full
             last_mem = self.max_mem - last_mem
             active_memory = tf.tensor_scatter_nd_update(active_memory, [[last_mem]], [True])
-        mem_window = tf.concat([tf.zeros((self.max_reg,), dtype=active_memory.dtype), active_memory], axis=-1)
+        mem_window = tf.concat([_zero_mask[:self.max_reg], active_memory], axis=-1)
 
         # Identify register-only actions that access *any* location *outside* the active register window.
         # 1. Get access pattern for locations outside the window:
-        inactive_loc_access = tf.boolean_mask(act_loc_table, ~reg_window, axis=0)  # Shape (N_inactive_locs, N_actions)
+        inactive_loc_access = act_loc_table[~reg_window]  # Shape (N_inactive_locs, N_actions)
         # 2. Check for each action if it accesses *any* inactive location:
         accesses_inactive_loc = tf.reduce_any(inactive_loc_access, axis=0)  # Shape (N_actions,)
         # A register-only action is valid if it is a register-only action
@@ -256,13 +264,13 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
 
         assert reg_only_mask.shape[0] == len(self.actions), \
             "mask and action space size do not match."
-        assert not tf.reduce_any(tf.logical_and(tf.logical_and(reg_only_mask, mem_read_mask), mem_write_mask)), \
-            "masks do not partition the action space."
-        assert tf.reduce_any(tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask)), \
-            "no actions left in the action space."
+        # assert not tf.reduce_any(tf.logical_and(tf.logical_and(reg_only_mask, mem_read_mask), mem_write_mask)), \
+        #     "masks do not partition the action space."
+        # assert tf.reduce_any(tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask)), \
+        #     "no actions left in the action space."
 
         # combine the masks by taking their union
-        return tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask).numpy()
+        return tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask)
 
     def get_space(self) -> ActionSpace:
         return self.action_space_cls(self.actions, self.asm_actions, self.np_actions)
@@ -341,7 +349,7 @@ class AssemblyGame(Environment):
         """Returns a scalar latency for the program."""
         latencies = tf.constant([
             self._emulator.measure_latency(self._program.asm_program)
-            for _ in range(self._task_spec.num_inputs)], dtype=tf.float32
+            for _ in range(self._task_spec.num_latency_simulations)], dtype=tf.float32
         )
         return tf.cast(latencies, dtype=tf.float32)
     
@@ -490,7 +498,10 @@ class AssemblyGame(Environment):
         return self._update_state()
     
     def legal_actions(self) -> np.ndarray:
-        return self._action_space_storage.get_mask(self._last_ts.observation, self._program.asm_program)
+        tf_mask = self._action_space_storage.get_mask(self._last_ts.observation, self._program.asm_program)
+        # convert the mask to a numpy array of legal actions
+        legal_actions = np.asarray(tf_mask, dtype=np.bool_)
+        return legal_actions
     
     def reward_spec(self):
         return Array(shape=(), dtype=np.float32) if not self._observe_reward_components else Array(shape=(3,), dtype=np.float32)

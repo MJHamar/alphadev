@@ -30,7 +30,7 @@ class AlphaDevConfig(object):
     correctness_reward_weight: float = 2.0
     latency_reward_weight: float = 0.5
     latency_quantile: float = 0.05
-    num_latency_simulations: int = 10
+    num_latency_simulations: int = 1
     ### Self-Play
     num_actors: int = 1 
     max_moves: int = 100
