@@ -3,7 +3,7 @@ import numpy as np
 from tinyfive.machine import machine
 from tinyfive.multi_machine import multi_machine, pseudo_asm_machine
 from alphadev.utils import x86_to_riscv, x86_enumerate_actions, TaskSpec, CPUState, IOExample
-from alphadev.alphadev_acme import x86ActionSpaceStorage, AssemblyGame
+from alphadev.environment import x86ActionSpaceStorage, AssemblyGame
 
 sort3_x86_asm = [
     "mov 0x4(%0), %%eax ".strip(),

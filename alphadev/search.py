@@ -143,7 +143,7 @@ def mcts(
 
     # Evaluate the prior policy for this state.
     prior, value = evaluation(observation)
-    assert prior.shape == (num_actions,)
+    assert prior.shape == (num_actions,), f"Expected prior shape {(num_actions,)}, got {prior.shape}."
 
     # Add exploration noise to the prior.
     noise = np.random.dirichlet(alpha=[dirichlet_alpha] * num_actions)

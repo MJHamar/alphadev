@@ -24,7 +24,6 @@ from acme import adders
 from acme import specs
 from acme.agents.tf.mcts.acting import MCTSActor as acmeMCTSActor
 from acme.agents.tf.mcts import models
-from acme.agents.tf.mcts import search
 from acme.agents.tf.mcts import types
 from acme.tf import variable_utils as tf2_variable_utils
 
@@ -36,7 +35,7 @@ import tensorflow as tf
 import tree
 
 from .observers import MCTSObserver
-from .search import visit_count_policy
+from .search import visit_count_policy, mcts
 from .service.inference_service import InferenceClient
 
 import logging
@@ -82,7 +81,7 @@ class MCTSActor(acmeMCTSActor):
         """Performs a forward pass of the policy-value network."""
         # fix over acme implementation: accepts structured observations
         if self._add_batch_dim:
-            logits, value = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0)), observation)
+            logits, value = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
         else:
             logits, value = self._network(observation)
 
@@ -102,7 +101,7 @@ class MCTSActor(acmeMCTSActor):
             self._model.reset(observation)
 
         # Compute a fresh MCTS plan.
-        root = search.mcts(
+        root = mcts(
             observation,
             model=self._model,
             search_policy=self._search_policy, # FIX: use the given search policy.
@@ -111,11 +110,13 @@ class MCTSActor(acmeMCTSActor):
             num_actions=self._num_actions,
             discount=self._discount,
         )
-        logger.debug(f"mcts finished")
         # Select an action according to the search policy.
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
-        training_steps = self._counter.get_counts()[self._counter.get_steps_key()]
+        if self._counter is None:
+            training_steps = 0
+        else:
+            training_steps = self._counter.get_counts()[self._counter.get_steps_key()]
         temperature = self._temperature_fn(training_steps)
         # get the action mask from the model
         if self._model.needs_reset:
