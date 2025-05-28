@@ -41,7 +41,7 @@ class CPUState(NamedTuple):
 class Program(NamedTuple):
     npy_program: np.ndarray # <max_program_size> x 3 (opcode, op1, op2)
     asm_program: List[Callable[[int], Any]] # list of pseudo-asm instructions
-    
+    int_program: List[int] 
     def __len__(self):
         return len(self.asm_program)
 
@@ -214,6 +214,10 @@ x86_signatures = {
 x86_opcode2int = {
     k: i for i, k in enumerate(x86_signatures.keys())
 }
+
+x86_source_source = {'cmp'}
+x86_source_dest = {'mv', 'lw', 'sw', 'cmovg', 'cmovge', 'cmovle', 'cmovl'}
+x86_dest_source = {}
 
 def x86_enumerate_actions(max_reg: int, max_mem: int) -> Dict[int, Tuple[str, Tuple[int, int]]]:
     def apply_opcode(opcode: str, operands: Tuple[int, int, int]) -> List[Tuple[str, Tuple[int, int]]]:
