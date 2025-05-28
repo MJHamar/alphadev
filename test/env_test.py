@@ -284,6 +284,7 @@ def test_assembly_game_pruning():
         # get the integer corresponding to the instruction
         action = reverse_action_loopup[(op, operands)]
         mask = game.legal_actions()
+        assert not mask.all(), f"Mask doesn't mask anything. Mask: {[f'{i}:{m}' for i, m in enumerate(mask)]}"
         assert mask[action] == True, f"Action {action} ({(op,operands)}) is not legal. Mask: {[f'{i}:{m}' for i, m in enumerate(mask)]}"
         timestep = game.step(action)
         print('ts reward', timestep.reward)

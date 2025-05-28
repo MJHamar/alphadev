@@ -1,4 +1,5 @@
 from typing import Dict, Any, Tuple, List, Callable, Union, Optional
+import functools
 import numpy as np
 import tensorflow as tf
 from dm_env import Environment, TimeStep, StepType
@@ -83,6 +84,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self.max_mem = max_mem
         self.actions: Dict[int, Dict[int, Tuple[str, Tuple[int,int]]]] =\
             x86_enumerate_actions(max_reg, max_mem)
+        self.all_actions = tf.constant(tf.range(len(self.actions), dtype=tf.int32))
         # pre-compute the assembly representation of the actions
         self.asm_actions = {
             i: x86_to_riscv(action[0], action[1], self.max_reg) for i, action in self.actions.items()
@@ -94,18 +96,11 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self._npy_reversed = {
             tuple(v): k for k, v in self.np_actions.items()
         }
+        self.np_action_space = np.stack(list(self.np_actions.values()))
         # there is a single action space for the given task
         self.action_space_cls = ActionSpace # these are still x86 instructions
-        # TODO: make sure we don't flood the memory with this
-        self.masks = {}
-        # for pruning the action space (one read and one write per memory location)
-        self._mems_read = set()
-        self._mems_written = set()
         # build mask lookup tables
         self._build_masks()
-        # make caches
-        self.loc_cache = set()
-        self.history_cache = set()
     
     def _build_masks(self):
         """
@@ -116,52 +111,32 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         Each row in a mask is a boolean array over the action space, indicating whether
         the action uses the register or memory location. 
         """
-        # we create a max_reg x action_space_size and 
-        # max_mem x action_space_size masks
-        action_space_size = len(self.actions)
-        # table mapping all registers and memory locations to the action space 
-        # a cell (i,j) is True if location i is accessed by action j.
-        act_loc_table = np.zeros(((self.max_reg + self.max_mem), action_space_size), dtype=np.bool_)
-        # mask for register locations
-        reg_locs = np.zeros((self.max_reg + self.max_mem), dtype=np.bool_)
-        reg_locs[:self.max_reg] = True
-        # mask for memory locations
-        mem_locs = np.zeros((self.max_reg + self.max_mem), dtype=np.bool_)
-        mem_locs[self.max_reg:] = True
-        # boolean mask for actions that only use register locations
-        reg_only_actions = np.zeros((action_space_size,), dtype=np.bool_)
-        # boolean mask for actions that read from memory locations
-        mem_read_actions = np.zeros((action_space_size,), dtype=np.bool_)
-        # boolean mask for actions that write to memory locations
-        mem_write_actions = np.zeros((action_space_size,), dtype=np.bool_)
-        for i, action in enumerate(self.actions.values()):
-            # iterate over the x86 instructions currently under consideration
-            x86_opcode, x86_operands = action
-            signature = x86_signatures[x86_opcode]
-            if signature == (REG_T, REG_T):
-                act_loc_table[x86_operands, i] = True
-                reg_only_actions[i] = True
-            else: # action that accesses memory.
-                mem_loc, reg_loc = x86_operands if signature == (MEM_T, REG_T) else reversed(x86_operands)
-                
-                act_loc_table[reg_loc, i] = True
-                act_loc_table[mem_loc, i] = True
-                if x86_opcode.startswith("l"): # load action
-                    mem_read_actions[i] = True
-                else:
-                    mem_write_actions[i] = True
-        
-        assert (reg_only_actions & mem_read_actions & mem_write_actions == 0).any(), \
-            "Action space was not partitioned correctly"
-        assert (reg_only_actions | mem_read_actions | mem_write_actions).all(), \
-            "Action space was not partitioned correctly"
-        
-        self.act_loc_table = tf.constant(act_loc_table)
-        self.reg_locs = tf.constant(reg_locs)
-        self.mem_locs = tf.constant(mem_locs)
-        self.reg_only_actions = tf.constant(reg_only_actions)
-        self.mem_read_actions = tf.constant(mem_read_actions)
-        self.mem_write_actions = tf.constant(mem_write_actions)
+        reg_access = np.zeros((len(self.actions),), dtype=np.int32) # largest register accessed by action
+        mem_access = np.zeros((len(self.actions),), dtype=np.int32) # largest memory accessed by action
+        is_mem_read = np.zeros((len(self.actions),), dtype=np.bool_) # 1 if action is a memory read, 0 otherwise
+        is_mem_write = np.zeros((len(self.actions),), dtype=np.bool_) # 1 if action is a memory write, 0 otherwise
+        for idx, action in self.actions.items():
+            opcode, operands = action[0], action[1] # NOTE: mem locs are offset by max_reg
+            if opcode == "lw": # mv mem, reg
+                reg_access[idx] = operands[1]
+                mem_access[idx] = operands[0] - self.max_reg
+                is_mem_read[idx] = True
+                is_mem_write[idx] = False
+            elif opcode == "sw": # mv reg, mem
+                reg_access[idx] = operands[0]
+                mem_access[idx] = operands[1] - self.max_reg
+                is_mem_read[idx] = False
+                is_mem_write[idx] = True
+            else: # all others are register-only actions
+                reg_access[idx] = max(operands)  # rd or rs1
+                mem_access[idx] = self.max_mem  # no memory access
+                is_mem_read[idx] = False; is_mem_write[idx] = False
+        # convert to tensors
+        self.reg_access = tf.constant(reg_access, dtype=tf.int32)  # shape (N_actions,)
+        self.mem_access = tf.constant(mem_access, dtype=tf.int32)  # shape (N_actions,)
+        self.mem_access_1hot = tf.one_hot(self.mem_access, depth=self.max_mem, on_value=True, off_value=False, dtype=tf.bool)
+        self.is_mem_read = tf.constant(is_mem_read, dtype=tf.bool)  # shape (N_actions,)
+        self.is_mem_write = tf.constant(is_mem_write, dtype=tf.bool)  # shape (N_actions,)
 
     def get_mask(self, state: Dict[str, tf.Tensor], history: List[Tuple[str, Tuple[int, int]]]) -> tf.Tensor:
         """
@@ -170,107 +145,62 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         Returns a boolean tensor over the action space, with True values indicating
         valid actions.
         """
-        _mems_read = set()
-        _mems_written = set()
+        _mems_read = [False] * (self.max_mem) # add an extra entry so reg-only actions can index it.
+        _mems_written = [False] * (self.max_mem) # add an extra entry so reg-only actions can index it.
 
         def update_history(opcode, operands):
             # update the history with the action.
             # NOTE: history at this point is in RISC-V format.
-            # both load and store actions have (absolute) address as position 2
+            # both load and store actions have (absolute) address at position 2
             # rd/rs1 imm rs1/2. It is also in bytes so we divide by 4
+            # NOTE: memory locations are not offset by max_reg here
             if opcode.startswith("LW"):  # (MEM_T, _)
-                _mems_read.add(operands[1]//4)
+                _mems_read[operands[1]//4] = True
             elif opcode.startswith("SW"):  # (_, MEM_T)
-                _mems_written.add(operands[1]//4)
+                _mems_written[operands[1]//4] = True
 
         if history:
             # iterate over the history
             for action in history:
                 update_history(*action)
+        # convert the sets to tensors
+        mem_reads = tf.constant(_mems_read, dtype=tf.bool)
+        mem_writes = tf.constant(_mems_written, dtype=tf.bool)
+        # get the maximum register and memory indices
+        reg_access = state['active_registers']
+        reg_access = tf.reduce_any(reg_access, axis=0)  # N_inputs x N_regs -> N_regs
+        mem_access = state['active_memory']
+        mem_access = tf.reduce_any(mem_access, axis=0)  # N_inputs x N_mem -> N_mem
+        reg_max_idx = tf.reduce_sum(tf.cast(reg_access, tf.int32))
+        mem_max_idx = tf.reduce_sum(tf.cast(mem_access, tf.int32)) + self.max_reg # offset
+        # create a mask over the action space
+        # action is valid if it is
+        # within the register window
+        reg_ok = self.reg_access <= reg_max_idx
+        # within the memory window
+        mem_ok = self.mem_access <= mem_max_idx
+        # either is isn't a memory read or the memory at this location was not read before
+        mem_r_ok = tf.reduce_any(
+            [
+            ~self.is_mem_read, 
+            ~tf.reduce_any(tf.boolean_mask(self.mem_access_1hot, mem_reads, axis=1),axis=1)
+            ],
+            axis=0
+        )
+        # either is isn't a memory write or the memory at this location was not written before
+        mem_w_ok = tf.reduce_any(
+            [
+            ~self.is_mem_write,
+            ~tf.reduce_any(tf.boolean_mask(self.mem_access_1hot, mem_writes, axis=1),axis=1)
+            ],
+            axis=0
+        )
+        # assert not tf.reduce_any(mem_reads) or tf.reduce_any(~mem_r_ok), \
+        #     "There are memory reads but no actions are filtered"
+        # assert not tf.reduce_any(mem_writes) or tf.reduce_any(~mem_w_ok), \
+        #     "There are memory writes but no actions are filtered"
+        return tf.reduce_all([reg_ok, mem_ok, mem_r_ok, mem_w_ok], axis=0)
 
-        act_loc_table = self.act_loc_table
-        reg_locs = self.reg_locs
-        mem_locs = self.mem_locs
-        reg_only_actions = self.reg_only_actions
-        mem_read_actions = self.mem_read_actions
-        mem_write_actions = self.mem_write_actions
-
-        # get the active registers and memory locations from the CPU state
-        # note they are matrices of shape E x R and E x M
-        # (E: number of examples, R: number of registers, M: number of memory locations)
-        # we consider the largest window of active registers and memory locations
-        # so we take their union
-        active_registers = state['active_registers']  # shape E x R+(unused) # TODO: we might want to let the emulator know
-        active_registers = tf.reduce_any(active_registers, axis=0)  # shape R
-        active_memory = state['active_memory']  # shape E x M
-        active_memory = tf.reduce_any(active_memory, axis=0)  # shape M
-
-        reg_hash = tf.reduce_sum(tf.cast(active_registers, tf.int32))
-        mem_hash = tf.reduce_sum(tf.cast(active_memory, tf.int32))
-        
-        _zero_mask = tf.zeros((self.max_reg + self.max_mem,), dtype=active_registers.dtype)
-
-        assert active_registers.shape[0] == self.max_reg, \
-            "active registers and max_reg do not match."
-        assert active_memory.shape[0] == self.max_mem, \
-            "active memory and max_mem do not match."
-
-        # find windows of locations that are valid
-        last_reg = reg_hash
-        if last_reg != 0: # 0 means window is full
-            last_reg = self.max_reg - last_reg
-            active_registers = tf.tensor_scatter_nd_update(active_registers, [[last_reg]], [True])
-        reg_window = tf.concat([active_registers, _zero_mask[:self.max_mem]], axis=-1)
-
-        # same for the memory locations
-        last_mem = mem_hash
-        if last_mem != 0: # 0 means window is full
-            last_mem = self.max_mem - last_mem
-            active_memory = tf.tensor_scatter_nd_update(active_memory, [[last_mem]], [True])
-        mem_window = tf.concat([_zero_mask[:self.max_reg], active_memory], axis=-1)
-
-        # Identify register-only actions that access *any* location *outside* the active register window.
-        # 1. Get access pattern for locations outside the window:
-        inactive_loc_access = act_loc_table[~reg_window]  # Shape (N_inactive_locs, N_actions)
-        # 2. Check for each action if it accesses *any* inactive location:
-        accesses_inactive_loc = tf.reduce_any(inactive_loc_access, axis=0)  # Shape (N_actions,)
-        # A register-only action is valid if it is a register-only action
-        # AND it does NOT access any inactive location.
-        reg_only_mask = tf.logical_and(reg_only_actions, ~accesses_inactive_loc)  # Shape (N_actions,)
-
-        # to enforce that only one read and one write is allowed at each memory location,
-        # we also need to look at the history of the program
-        # and mask out any actions that are illegal
-        read_locs = tf.constant(list(_mems_read), dtype=tf.int32) + self.max_reg
-        # create a mask of memory locations that are read
-        mem_read_locs = tf.tensor_scatter_nd_update(
-            tf.zeros_like(mem_locs, dtype=tf.bool), tf.expand_dims(read_locs, axis=1),
-            tf.ones(tf.shape(read_locs), dtype=tf.bool))
-        # subtract the read locations mask from the memory window
-        mem_read_window = tf.logical_and(mem_window, ~mem_read_locs)
-        # select all memory read actions, which operate within the memory window
-        invalid_mem_read_loc = tf.boolean_mask(act_loc_table, ~(mem_read_window | reg_locs))
-        accesses_invalid_mem = tf.reduce_any(invalid_mem_read_loc, axis=0)
-        mem_read_mask = tf.logical_and(mem_read_actions, ~accesses_invalid_mem)
-
-        # do the same for write actions
-        write_locs = tf.constant(list(_mems_written), dtype=tf.int32) + self.max_reg
-        mem_write_locs = tf.tensor_scatter_nd_update(
-            tf.zeros_like(mem_locs, dtype=tf.bool), tf.expand_dims(write_locs, axis=1), tf.ones(tf.shape(write_locs), dtype=tf.bool))
-        mem_write_window = tf.logical_and(mem_window, ~mem_write_locs)
-        invalid_mem_write_loc = tf.boolean_mask(act_loc_table, ~(mem_write_window | reg_locs))
-        accesses_invalid_mem = tf.reduce_any(invalid_mem_write_loc, axis=0)
-        mem_write_mask = tf.logical_and(mem_write_actions, ~accesses_invalid_mem)
-
-        assert reg_only_mask.shape[0] == len(self.actions), \
-            "mask and action space size do not match."
-        # assert not tf.reduce_any(tf.logical_and(tf.logical_and(reg_only_mask, mem_read_mask), mem_write_mask)), \
-        #     "masks do not partition the action space."
-        # assert tf.reduce_any(tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask)), \
-        #     "no actions left in the action space."
-
-        # combine the masks by taking their union
-        return tf.logical_or(tf.logical_or(reg_only_mask, mem_read_mask), mem_write_mask)
 
     def get_space(self) -> ActionSpace:
         return self.action_space_cls(self.actions, self.asm_actions, self.np_actions)
@@ -499,8 +429,8 @@ class AssemblyGame(Environment):
     
     def legal_actions(self) -> np.ndarray:
         tf_mask = self._action_space_storage.get_mask(self._last_ts.observation, self._program.asm_program)
-        # convert the mask to a numpy array of legal actions
-        legal_actions = np.asarray(tf_mask, dtype=np.bool_)
+        # convert the mask to a numpy array
+        legal_actions = tf_mask.numpy().astype(np.bool_)
         return legal_actions
     
     def reward_spec(self):
