@@ -1,4 +1,4 @@
-from typing import Any, Callable, List, NamedTuple, Tuple, Dict, Generator
+from typing import Any, Callable, List, NamedTuple, Tuple, Dict, Generator, Literal
 import itertools
 import numpy as np
 import tensorflow as tf
@@ -27,6 +27,7 @@ class TaskSpec(NamedTuple):
     num_latency_simulations: int # number of latency simulations to run
     inputs: IOExample # input examples for the task
     observe_reward_components: bool # whether to return the reward components for the value function (for categorical value loss)
+    emulator_mode: Literal['u8', 'i16', 'i32'] = 'u8' # emulator mode for the task, one of ['u8', 'i16', 'i32']
 
 class CPUState(NamedTuple):
     registers: tf.Tensor # num_inputs x num_regs array of register values
@@ -140,9 +141,9 @@ def generate_sort_inputs(
         i_list[i], o_list[i] = remap_input(i_list[i], o_list[i])
     
     return IOExample(
-        inputs=i_list,
-        outputs=o_list,
-        output_mask=o_mask,
+        inputs=i_list.astype(np.int32), # num_inputs x items_to_sort
+        outputs=o_list.astype(np.int32), # num_inputs x max_len
+        output_mask=o_mask.astype(np.bool_) # num_inputs x max_len boolean array masking irrelevant parts of the output,
     )
 
 # #################
@@ -155,18 +156,19 @@ REG_T = 10
 MEM_T = 11
 IMM_T = 12
 
-def x86_to_riscv(opcode: str, operands: Tuple[int, int], mem_offset) -> Tuple[str, Callable[[int], Tuple[int, int]]]:
+def x86_to_riscv(opcode: str, operands: Tuple[int, int], mem_offset, mode:Literal['u8', 'i16', 'i32']) -> Tuple[str, Callable[[int], Tuple[int, int]]]:
     """
     Convert an x86 (pseudo-) instruction to a RISC-V (pseudo-) instruction.
     """
+    blen = 4 if mode == 'u8' else 2 if mode == 'i16' else 1
     
     if opcode == "mv": # move between registers
         return [("ADD", (operands[1], X0, operands[0]))]
     elif opcode == "lw": # load word from memory to register
-        return [("LW", (operands[1], (operands[0]-mem_offset)*4, X0))]
+        return [("LW", (operands[1], (operands[0]-mem_offset)*blen, X0))]
     # rd,imm,rs -- rd, rs(imm)
     elif opcode == "sw": # store word from register to memory
-        return [("SW", (operands[0], (operands[1]-mem_offset)*4, X0))] 
+        return [("SW", (operands[0], (operands[1]-mem_offset)*blen, X0))] 
     # rs1,imm,rs2 -- rs1, rs2(imm)
     elif opcode == "cmp": # compare two registers
         return [("SUB", (X1, operands[0], operands[1]))]

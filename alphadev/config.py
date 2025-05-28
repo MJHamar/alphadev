@@ -31,6 +31,7 @@ class AlphaDevConfig(object):
     latency_reward_weight: float = 0.5
     latency_quantile: float = 0.05
     num_latency_simulations: int = 1
+    emulator_mode: Literal['u8', 'i16', 'i32'] = 'i32'
     ### Self-Play
     num_actors: int = 1 
     max_moves: int = 100
@@ -162,6 +163,7 @@ class AlphaDevConfig(object):
             num_latency_simulations=self.num_latency_simulations,
             inputs=self.input_examples,
             observe_reward_components=self.hparams.categorical_value_loss,
+            emulator_mode=self.emulator_mode,
         )
         
         self.logger_factory = logger_factory(self)

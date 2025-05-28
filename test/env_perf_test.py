@@ -37,7 +37,8 @@ def make_ts(num_inputs):
         # we care about these three.
         num_inputs=num_inputs,
         num_actions=200,
-        inputs=generate_sort_inputs(3,5,num_inputs)
+        inputs=generate_sort_inputs(3,5,num_inputs),
+        emulator_mode='i32'
     )
     
 task_a10_i10 = make_ts(10)
@@ -89,8 +90,8 @@ def profile_select_n_actions(env, actor, num_actions):
     return stats
 
 def main(id_):
-    num_steps = 100
-    num_episodes = 1 # x100
+    num_steps = 1000
+    num_episodes = 10 # x100
     
     print("Profiling select_action...")
     select_action_stats = profile_select_n_actions(env_10, actor_10, num_steps)

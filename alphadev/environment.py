@@ -1,4 +1,4 @@
-from typing import Dict, Any, Tuple, List, Callable, Union, Optional
+from typing import Dict, Any, Tuple, List, Callable, Union, Optional, Literal
 import functools
 import numpy as np
 import tensorflow as tf
@@ -79,15 +79,16 @@ class ActionSpaceStorage:
         raise NotImplementedError()
 
 class x86ActionSpaceStorage(ActionSpaceStorage):
-    def __init__(self, max_reg: int, max_mem: int):
+    def __init__(self, max_reg: int, max_mem: int, mode: Literal['u8', 'i32'] = 'i32'):
         self.max_reg = max_reg
         self.max_mem = max_mem
+        self.mode = mode
         self.actions: Dict[int, Dict[int, Tuple[str, Tuple[int,int]]]] =\
             x86_enumerate_actions(max_reg, max_mem)
         self.all_actions = tf.constant(tf.range(len(self.actions), dtype=tf.int32))
         # pre-compute the assembly representation of the actions
         self.asm_actions = {
-            i: x86_to_riscv(action[0], action[1], self.max_reg) for i, action in self.actions.items()
+            i: x86_to_riscv(action[0], action[1], self.max_reg, mode=mode) for i, action in self.actions.items()
         }
         self.np_actions = {
             i: np.array([x86_opcode2int[action[0]], action[1][0], action[1][1]])
@@ -147,6 +148,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         """
         _mems_read = [False] * (self.max_mem) # add an extra entry so reg-only actions can index it.
         _mems_written = [False] * (self.max_mem) # add an extra entry so reg-only actions can index it.
+        blen = 4 if self.mode == 'u8' else 2 if self.mode == 'i16' else 1
 
         def update_history(opcode, operands):
             # update the history with the action.
@@ -155,9 +157,9 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # rd/rs1 imm rs1/2. It is also in bytes so we divide by 4
             # NOTE: memory locations are not offset by max_reg here
             if opcode.startswith("LW"):  # (MEM_T, _)
-                _mems_read[operands[1]//4] = True
+                _mems_read[operands[1]//blen] = True
             elif opcode.startswith("SW"):  # (_, MEM_T)
-                _mems_written[operands[1]//4] = True
+                _mems_written[operands[1]//blen] = True
 
         if history:
             # iterate over the history
@@ -250,15 +252,18 @@ class AssemblyGame(Environment):
         self._observe_reward_components = task_spec.observe_reward_components
         
         self._emulator = multi_machine(
-            mem_size=task_spec.num_mem*4, # 4 bytes per memory location
+            mem_size=task_spec.num_mem,
             num_machines=task_spec.num_inputs,
             initial_state=self._inputs,
-            special_x_regs=np.array([1], dtype=np.int32), # TODO: this is the hard-coded X1 register for now.
+            # TODO: this is the hard-coded X1 register for now.
+            special_x_regs=np.array([1], dtype=np.int32),
+            mode=task_spec.emulator_mode, # use 32-bit mode
         )
         # TODO: make this distributed
         self._action_space_storage = x86ActionSpaceStorage(
             max_reg=task_spec.num_regs,
-            max_mem=task_spec.num_mem
+            max_mem=task_spec.num_mem,
+            mode=task_spec.emulator_mode, # use 32-bit mode
         )
         self.reset()
 
