@@ -80,7 +80,18 @@ class ActionSpaceStorage:
         raise NotImplementedError()
 
 class x86ActionSpaceStorage(ActionSpaceStorage):
-    def __init__(self, max_reg: int, max_mem: int, mode: Literal['u8', 'i32'] = 'i32'):
+    def __init__(self, max_reg: int, max_mem: int, mode: Literal['u8', 'i32'] = 'i32',
+                 init_active_registers: Optional[tf.Tensor] = None,
+                 init_active_memory: Optional[tf.Tensor] = None):
+        """
+        Create an action space storage for x86 instructions.
+        Args:
+            max_reg: Maximum number of registers.
+            max_mem: Maximum number of memory locations.
+            mode: The mode to use for the instructions, either 'u8' or 'i32'.
+            init_active_registers: Initial active registers mask, if available.
+            init_active_memory: Initial active memory mask, if available.
+        """
         self.max_reg = max_reg
         self.max_mem = max_mem
         self.mode = mode
@@ -102,12 +113,15 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # there is a single action space for the given task
         self.action_space_cls = ActionSpace # these are still x86 instructions
         # build mask lookup tables
-        self._build_masks()
+        self._build_masks(init_active_registers=init_active_registers,
+                          init_active_memory=init_active_memory)
         # create cache for the masks
         self._hash_base = tf.zeros(len(self.actions), dtype=tf.bool)
         self._mask_cache = {}
+        self._stats = {}
     
     def _hash_program(self, program: List[int]) -> str:
+        self._stats['hashes'] = self._stats.get('hashes', 0) + 1
         bagged_program = tf.tensor_scatter_nd_update(
             self._hash_base,
             indices=tf.expand_dims(tf.constant(program, dtype=tf.int32), axis=1),
@@ -283,6 +297,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         Returns a boolean tensor over the action space, with True values indicating
         valid actions.
         """
+        self._stats['mask_calls'] = self._stats.get('mask_calls', 0) + 1
         history = history.copy()  # don't modify the original history
         steps_to_eval = []
         prog_hash = self._hash_program(history)
@@ -295,8 +310,10 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
                 steps_to_eval.append(last_step)
             prog_hash = new_hash
         if prog_hash not in self._mask_cache:
+            self._stats['mask_history_hitmiss'] = self._stats.get('mask_history_hitmiss', []).append({'hit': 0, 'miss': len(steps_to_eval)})
             mask, (last_reg, last_mem) = self._base_mask
         else:
+            self._stats['mask_history_hitmiss'] = self._stats.get('mask_history_hitmiss', []).append({'hit': len(history), 'miss': len(steps_to_eval)} )
             mask, (last_reg, last_mem) = self._mask_cache[prog_hash]
         # now  that we have the mask, we need to update it
         # being overly optimistic about the register and memory accesses is still a problem.
@@ -320,9 +337,13 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # if step is an lw of sw, get the list of disallowed actions
             disallows = self._disallows_map.get(step, set())
         # update the mask with the allows and disallows
-        update = tf.constant(list(allows - disallows), dtype=tf.int32)
+        update = allows - disallows
+        self._stats['mask_updates'] = self._stats.get('mask_updates', []).append(len(update))
+        update = tf.constant(list(update), dtype=tf.int32)
         if len(update) == 0:
+            self._stats['mask_empty'] = self._stats.get('mask_empty', 0) + 1
             return mask
+        self._stats['mask_nonempty'] = self._stats.get('mask_nonempty', 0) + 1
         # update the mask with the new allows
         mask = tf.tensor_scatter_nd_update(
             mask, updates=tf.expand_dims(update, axis=1),
@@ -357,6 +378,15 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             asm_program.extend(asm_insn)
         return asm_program
 
+    @property
+    def stats(self) -> Dict[str, Any]:
+        """
+        Returns the statistics of the action space storage.
+        """
+        if hasattr(self, '_stats'):
+            # if stats are not initialized, return an empty dict
+            self._stats = self._stats or {}
+        return {}
 
 # #################
 # Environment definition
@@ -386,12 +416,17 @@ class AssemblyGame(Environment):
             # TODO: this is the hard-coded X1 register for now.
             special_x_regs=np.array([1], dtype=np.int32),
             mode=task_spec.emulator_mode, # use 32-bit mode
+            track_usage=False,
         )
         # TODO: make this distributed
         self._action_space_storage = x86ActionSpaceStorage(
             max_reg=task_spec.num_regs,
             max_mem=task_spec.num_mem,
             mode=task_spec.emulator_mode, # use 32-bit mode
+            init_active_registers=[
+                i for i, b in enumerate(self._emulator.register_mask[:, :task_spec.num_regs]) if b != 0],
+            init_active_memory=[
+                i for i, b in enumerate(self._emulator.memory_mask) if b != 0]
         )
         self.reset()
 
@@ -443,6 +478,7 @@ class AssemblyGame(Environment):
         # get the current state of the CPU
         return CPUState(
             registers=tf.constant(self._emulator.registers[:, :self._task_spec.num_regs], dtype=tf.int32),
+            # TODO: active registers and memory are no longer used.
             active_registers=tf.constant(self._emulator.register_mask[:, :self._task_spec.num_regs], dtype=tf.bool),
             memory=tf.constant(self._emulator.memory, dtype=tf.int32),
             active_memory=tf.constant(self._emulator.memory_mask, dtype=tf.bool),
@@ -567,7 +603,7 @@ class AssemblyGame(Environment):
         return self._update_state()
     
     def legal_actions(self) -> np.ndarray:
-        tf_mask = self._action_space_storage.get_mask(self._last_ts.observation, self._program.int_program)
+        tf_mask = self._action_space_storage.get_mask(self._program.int_program)
         # convert the mask to a numpy array
         legal_actions = tf_mask.numpy().astype(np.bool_)
         return legal_actions
@@ -579,6 +615,7 @@ class AssemblyGame(Environment):
     def observation_spec(self):
         return CPUState(
             registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.int32),
+            # TODO: active registers and memory are no longer used.
             active_registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.bool_),
             memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.int32),
             active_memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.bool_),
