@@ -57,7 +57,7 @@ actor_10 = MCTSActor(
 
 
 def print_mask_stats(action_space_storage):
-    mask_stats = action_space_storage.stats
+    mask_stats = action_space_storage._stats
     if not mask_stats:
         print("No mask stats available.")
         return
@@ -74,8 +74,8 @@ def print_mask_stats(action_space_storage):
     print(f"    hashes: {mask_stats['hashes']}")
     print(f"    mask empty: {mask_stats['mask_empty']}")
     print(f"    mask nonempty: {mask_stats['mask_nonempty']}")
-    hits = np.array(hit['hit'] for hit in mask_stats['mask_history_hitmiss'])
-    misses = np.array(hit['miss'] for hit in mask_stats['mask_history_hitmiss'])
+    hits = np.array([hit['hit'] for hit in mask_stats['mask_history_hitmiss']])
+    misses = np.array([hit['miss'] for hit in mask_stats['mask_history_hitmiss']])
     hits_sum = np.sum(hits)
     misses_sum = np.sum(misses)
     hits_ratio = hits_sum / (hits_sum + misses_sum) if (hits_sum + misses_sum) > 0 else 0
@@ -99,7 +99,7 @@ def select_n_actions(env:AssemblyGame, actor:MCTSActor, n):
     ts = env.reset()
     for _ in tqdm(range(n)):
         action = actor.select_action(ts.observation)
-        env.step(action)
+        ts = env.step(action)
         if env._is_invalid:
             ts = env.reset()
 
@@ -108,7 +108,6 @@ def run_env_loop(env, actor, num_steps):
     loop.run(num_episodes=num_steps)
 
 def profile_env_loop(env, actor, num_steps):
-    env._action_space_storage.stats.clear()
     profiler = cProfile.Profile()
     profiler.enable()
     
@@ -117,11 +116,10 @@ def profile_env_loop(env, actor, num_steps):
     profiler.disable()
     stats = pstats.Stats(profiler)
     stats.sort_stats('cumulative')
-    print_mask_stats(env._action_space_storage)
+    print_mask_stats(actor._model._environment._action_space_storage)
     return stats
 
 def profile_select_n_actions(env, actor, num_actions):
-    env._action_space_storage.stats.clear()
     profiler = cProfile.Profile()
     profiler.enable()
     
@@ -134,7 +132,7 @@ def profile_select_n_actions(env, actor, num_actions):
     return stats
 
 def main(id_):
-    num_steps = 1000
+    num_steps = 100
     num_episodes = 10 # x100
     
     print("Profiling select_action...")
@@ -151,4 +149,6 @@ def main(id_):
     
 if __name__ == '__main__':
     import sys
+    if len(sys.argv) != 2:
+        sys.argv.append('debug')
     main(id_=sys.argv[1])

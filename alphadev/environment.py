@@ -113,22 +113,29 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # there is a single action space for the given task
         self.action_space_cls = ActionSpace # these are still x86 instructions
         # build mask lookup tables
+        self.init_stats()
         self._build_masks(init_active_registers=init_active_registers,
                           init_active_memory=init_active_memory)
         # create cache for the masks
         self._hash_base = tf.zeros(len(self.actions), dtype=tf.bool)
         self._mask_cache = {}
-        self._stats = {}
+    
+    def init_stats(self):
+        self._stats = {
+            'hashes': 0,
+            'mask_calls': 0,
+            'mask_history_hitmiss': [],
+            'mask_updates': [],
+            'mask_empty': 0,
+            'mask_nonempty': 0,
+        }
     
     def _hash_program(self, program: List[int]) -> str:
-        self._stats['hashes'] = self._stats.get('hashes', 0) + 1
-        bagged_program = tf.tensor_scatter_nd_update(
-            self._hash_base,
-            indices=tf.expand_dims(tf.constant(program, dtype=tf.int32), axis=1),
-            updates=tf.ones_like(program, dtype=tf.bool)
-        )
+        self._stats['hashes'] = self._stats['hashes'] + 1
+        bagged_program = np.zeros(len(self.actions), dtype=np.bool_)
+        bagged_program[program] = True
         # convert to a bytearray
-        return hash(bagged_program.numpy().tobytes())
+        return hash(bagged_program.tobytes())
     
     def _build_masks(self, init_active_registers, init_active_memory):
         """
@@ -149,31 +156,31 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         #   - or write to a memory location that this action writes to.
         reg_read_by_action = {i: set() for i in range(self.max_reg)}
         reg_written_by_action = {i: set() for i in range(self.max_reg)}
-        lw_by_reg = {i: set() for i in range(self.max_reg())}
+        lw_by_reg = {i: set() for i in range(self.max_reg)}
         lw_by_mem = {i: set() for i in range(self.max_mem)}
-        sw_by_reg = {i: set() for i in range(self.max_reg())}
+        sw_by_reg = {i: set() for i in range(self.max_reg)}
         sw_by_mem = {i: set() for i in range(self.max_mem)}
-        action_ops = {}
+        action_ops = {} # destination register + memory location or -1 if either is not applicable
         for i, action in self.actions.items():
             opcode, operands = action
             if opcode == 'lw':
-                mem, rd = operands
+                mem, rd = operands[0]-self.max_reg, operands[1]
                 action_ops[i] = (rd, mem) # store the action index and memory location
                 lw_by_reg[rd].add((i, mem)) # store the action index and memory location
                 lw_by_mem[mem].add((i, rd)) # store the action index and register
             elif opcode == 'sw':
-                rs, mem = operands
-                action_ops[i] = (rs, mem) # store the action index and memory location
+                rs, mem = operands[0], operands[1]-self.max_reg
+                action_ops[i] = (-1, mem) # store the action index and memory location
                 sw_by_reg[rs].add((i, mem)) # store the action index and register
                 sw_by_mem[mem].add((i, rs)) # store the action index and memory location
             elif opcode in x86_source_source:
                 rs1, rs2 = operands
                 maxreg = max(rs1, rs2)
-                action_ops[i] = (maxreg, -1) # no memory location for source-source ops
+                action_ops[i] = (-1, -1) # no memory location for source-source ops
                 reg_read_by_action[maxreg].add(i)
             elif opcode in x86_source_dest:
                 rs, rd = operands
-                action_ops[i] = (max(rs, rd), -1)
+                action_ops[i] = (rd, -1)
                 if rd > rs:
                     reg_written_by_action[rd].add(i)
                 elif rd <= rs: # equality only makes sense here, because writing is less restrictive
@@ -187,10 +194,10 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
                     reg_read_by_action[rs].add(i)
         
         allows_map = {i: set() for i in range(len(self.actions))}
-        allows_lw = {i: set() for i in range(len(self.actions))}
-        allows_lw_mem = {i: set() for i in range(len(self.actions))}
-        allows_sw = {i: set() for i in range(len(self.actions))}
-        allows_sw_mem = {i: set() for i in range(len(self.actions))}
+        allows_lw = {}
+        allows_lw_mem = {}
+        allows_sw = {}
+        allows_sw_mem = {}
         disallows_map = {i: set() for i in range(len(self.actions))}
         for i, action in self.actions.items():
             # a register only action allows all actions that read 
@@ -198,26 +205,26 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             # all actions that write to the next register
             opcode, operands = action
             if opcode == 'lw':
-                mem, rd = operands
+                mem, rd = operands[0]-self.max_reg, operands[1]
                 # lw allows actions that read from rd or write to rd+1
-                allows_map[i] = reg_read_by_action.get(rd, set()).union(
-                    reg_written_by_action.get(rd + 1, set())
+                allows_map[i] = reg_read_by_action[rd].union(
+                    reg_written_by_action.get(rd + 1, set()) # avoid overflow
                 )
                 # it also allows sw ops for the current register
                 # and lw ops for the next register
                 # both of these need to be ordered by memory location
-                allows_lw[i] = set([act for act, _ in sorted(lw_by_reg.get(rd+1, []), key=lambda x: x[1])])
-                allows_sw[i] = set([act for act, _ in sorted(sw_by_reg.get(rd  , []), key=lambda x: x[1])])
+                allows_lw[i] = [act for act, _ in sorted(lw_by_reg.get(rd+1, []), key=lambda x: x[1])]
+                allows_sw[i] = [act for act, _ in sorted(sw_by_reg[rd]          , key=lambda x: x[1])]
                 # further, lw ops disallow all lw ops that read from the current memory
-                disallows_map[i] = lw_by_mem.get(mem, set())
+                disallows_map[i] = set([act for act, _ in lw_by_mem[mem]])
             elif opcode == 'sw':
-                rs, mem = operands
+                rs, mem = operands = operands[0], operands[1]-self.max_reg
                 allows_map[i] = set() # sw does not allow any register reads
                 # it does allow lw ops from mem and sw ops to mem+1
-                allows_lw_mem[i] = [act for act, _ in sorted(lw_by_mem.get(mem  , []), key=lambda x: x[1])]
+                allows_lw_mem[i] = [act for act, _ in sorted(lw_by_mem[mem]          , key=lambda x: x[1])]
                 allows_sw_mem[i] = [act for act, _ in sorted(sw_by_mem.get(mem+1, []), key=lambda x: x[1])]
                 # it also disallows all sw ops that write to the current memory
-                disallows_map[i] = sw_by_mem.get(mem, set())
+                disallows_map[i] = set([act for act, _ in sw_by_mem[mem]])
             elif opcode in x86_source_source:
                 continue # no register or memory writes, so no allows or disallows either
             else:
@@ -225,15 +232,15 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
                     rs, rd = operands
                 else:
                     rd, rs = operands
-                allows_map[i] = reg_read_by_action.get(rd, set()).union(
+                allows_map[i] = reg_read_by_action[rd].union(
                     reg_written_by_action.get(rd + 1, set())
                 )
                 # it also allows lw ops for the next register
                 # and sw ops for the current register
                 # both of these need to be ordered by memory location 
                 # so we can slice them later
-                allows_lw[i] =[act for act, _ in sorted(lw_by_reg.get(rd+1, []), key=lambda x: x[1])]
-                allows_sw[i] =[act for act, _ in sorted(lw_by_reg.get(rd  , []), key=lambda x: x[1])]
+                allows_lw[i] = [act for act, _ in sorted(lw_by_reg.get(rd+1, []), key=lambda x: x[1])]
+                allows_sw[i] = [act for act, _ in sorted(lw_by_reg[rd]          , key=lambda x: x[1])]
                 # reg-only actions do not disallow anything
         
         self._action_ops = action_ops
@@ -243,6 +250,26 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self._allows_sw = allows_sw
         self._allows_sw_mem = allows_sw_mem
         self._disallows_map = disallows_map
+
+        # all elements allows_lw and allows_sw should be either num_regs or 0. if 0,we remove it
+        for i in self.actions: 
+            if i in allows_lw and len(allows_lw[i]) == 0: allows_lw.pop(i)
+        assert all(len(v) == self.max_reg for v in allows_lw.values()), \
+            "Not all lw actions have the same number of allowed actions."
+        for i in self.actions: 
+            if i in allows_sw and len(allows_sw[i]) == 0: allows_sw.pop(i)
+        assert all(len(v) == self.max_reg for v in allows_sw.values()), \
+            "Not all sw actions have the same number of allowed actions."
+        
+        # also, all elements in allows_lw_mem and allows_sw_mem should be either num_mem or 0
+        for i in self.actions: 
+            if i in allows_lw_mem and len(allows_lw_mem[i]) == 0: allows_lw_mem.pop(i)
+        assert all(len(v) == self.max_mem for v in allows_lw_mem.values()), \
+            "Not all lw_mem actions have the same number of allowed actions."
+        for i in self.actions: 
+            if i in allows_sw_mem and len(allows_sw_mem[i]) == 0: allows_sw_mem.pop(i)
+        assert all(len(v) == self.max_mem for v in allows_sw_mem.values()), \
+            "Not all sw_mem actions have the same number of allowed actions."
 
         # finally, compute initial masks
         # there are no actions so nothing is disallowed.
@@ -258,7 +285,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # reg-only actions
         for reg in init_active_registers:
             # reg reads
-            allowed_actions.update(reg_read_by_action.get(reg, set()))
+            allowed_actions.update(reg_read_by_action[reg])
             # reg writes
             allowed_actions.update(reg_written_by_action.get(reg + 1, set()))
             # lw ops that write to next register
@@ -266,13 +293,13 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             lw_candidates = [act for act, mem in lw_candidates if mem <= last_mem]
             allowed_actions.update(lw_candidates)
             # sw ops that read from current register and write to <= next memory
-            sw_candidates = sw_by_reg.get(reg, set())
+            sw_candidates = sw_by_reg[reg]
             sw_candidates = [act for act, mem in sw_candidates if mem <= last_mem+1]
             allowed_actions.update(sw_candidates)
             # sw|lw_by_mem contain the same actions as sw|lw_by_reg
         for mem in init_active_memory:
             # lw ops that read from current memory and write to next register
-            lw_candidates = lw_by_mem.get(mem, set())
+            lw_candidates = lw_by_mem[mem]
             lw_candidates = [act for act, reg in lw_candidates if reg <= last_reg+1]
             allowed_actions.update(lw_candidates)
             # sw ops that write to current memory and read from <= next register
@@ -289,7 +316,30 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         )
         self._base_mask = (mask, (last_reg, last_mem))
         # done.
-
+        # summary
+        # print("Done building initial mask.")
+        # print(f"  allowed actions: {allowed_actions.shape}")
+        # print(f"  active registers: {init_active_registers}")
+        # print(f"  active memory: {init_active_memory}")
+        # print(f"  register mask: >= {last_reg}, memory mask: <= {last_mem}")
+        # print(f"allowed actions:")
+        # for i, act in self.actions.items():
+        #     isok = False
+        #     if act[0] == 'lw':
+        #         mem, rd = act[1][0]-self.max_reg, act[1][1]
+        #         isok = mem <= last_mem and rd <= last_reg+1
+        #     elif act[0] == 'sw':
+        #         rs, mem = act[1][0], act[1][1]-self.max_reg
+        #         isok = rs <= last_reg and mem <= last_mem+1
+        #     elif act[0] in x86_source_source:
+        #         rs, rs1 = act[1]
+        #         isok = rs <= last_reg and rs1 <= last_reg
+        #     else:
+        #         rs, rd = act[1] if act[0] in x86_source_dest else (act[1][1], act[1][0])
+        #         isok = rs <= last_reg and rd <= last_reg+1
+        #     if mask[i]:
+        #         print(f"{'OK ' if isok else 'NOK'}  {i}: {act} -> {self.asm_actions[i]} (np: {self.np_actions[i]})")
+    
     def get_mask(self, history: List[int]) -> tf.Tensor:
         """
         Get the mask over the action space for the given state and history.
@@ -297,24 +347,23 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         Returns a boolean tensor over the action space, with True values indicating
         valid actions.
         """
-        self._stats['mask_calls'] = self._stats.get('mask_calls', 0) + 1
+        self._stats['mask_calls'] = self._stats['mask_calls'] + 1
         history = history.copy()  # don't modify the original history
         steps_to_eval = []
         prog_hash = self._hash_program(history)
-        while prog_hash not in self._mask_cache:
-            last_step = history.pop() if len(history) > 0 else None
-            if last_step is None:
-                break # need to redo the whole program
+        crnt_hash = prog_hash
+        while len(history) > 0 and crnt_hash not in self._mask_cache:
+            last_step = history.pop()
             new_hash = self._hash_program(history)
-            if new_hash != prog_hash:
+            if new_hash != crnt_hash:
                 steps_to_eval.append(last_step)
-            prog_hash = new_hash
-        if prog_hash not in self._mask_cache:
-            self._stats['mask_history_hitmiss'] = self._stats.get('mask_history_hitmiss', []).append({'hit': 0, 'miss': len(steps_to_eval)})
+            crnt_hash = new_hash
+        if crnt_hash not in self._mask_cache:
+            self._stats['mask_history_hitmiss'].append({'hit': 0, 'miss': len(steps_to_eval)})
             mask, (last_reg, last_mem) = self._base_mask
         else:
-            self._stats['mask_history_hitmiss'] = self._stats.get('mask_history_hitmiss', []).append({'hit': len(history), 'miss': len(steps_to_eval)} )
-            mask, (last_reg, last_mem) = self._mask_cache[prog_hash]
+            self._stats['mask_history_hitmiss'].append({'hit': len(history), 'miss': len(steps_to_eval)} )
+            mask, (last_reg, last_mem) = self._mask_cache[crnt_hash]
         # now  that we have the mask, we need to update it
         # being overly optimistic about the register and memory accesses is still a problem.
         # we need to compute register and memory masks separately and take their union
@@ -323,31 +372,34 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         for step in steps_to_eval:
             step_reg, step_mem = self._action_ops[step] # mem=-1 if step is not a lw or sw
             # gather the allows and disallows for the step
-            allows.update(self._allows_map.get(step, set()))
             if step_mem > last_mem:
                 # get LW acts that this step allows, filtered by the current memory
-                allows.update(self._allows_lw.get(step, [])[step_mem] if step_mem < self.max_mem else [])
-                allows.update(self._allows_sw.get(step, [])[step_mem+1] if step_mem+1 < self.max_mem else [])
-                step_mem = last_mem
+                allows.update([self._allows_lw[step][step_mem  ]] if step in self._allows_lw and step_mem < self.max_mem else [])
+                allows.update([self._allows_sw[step][step_mem+1]] if step in self._allows_sw and step_mem+1 < self.max_mem else [])
+                last_mem = step_mem
             if step_reg > last_reg:
+                assert step not in x86_source_source,\
+                    f"Source-to-source step _reads_ from register>last_reg, this should not happen"
+                allows.update(self._allows_map[step])
                 # get SW acts that this step allows, filtered by the current register
-                allows.update(self._allows_lw_mem.get(step, [])[step_reg] if step_reg < self.max_reg else [])
-                allows.update(self._allows_sw_mem.get(step, [])[step_reg+1] if step_reg+1 < self.max_reg else [])
-                step_reg = last_reg
+                allows.update([self._allows_lw_mem[step][step_reg  ]] if step in self._allows_lw_mem and step_reg < self.max_reg else [])
+                allows.update([self._allows_sw_mem[step][step_reg+1]] if step in self._allows_sw_mem and step_reg+1 < self.max_reg else [])
+                last_reg = step_reg
             # if step is an lw of sw, get the list of disallowed actions
             disallows = self._disallows_map.get(step, set())
         # update the mask with the allows and disallows
         update = allows - disallows
-        self._stats['mask_updates'] = self._stats.get('mask_updates', []).append(len(update))
+        self._stats['mask_updates'].append(len(update))
         update = tf.constant(list(update), dtype=tf.int32)
         if len(update) == 0:
-            self._stats['mask_empty'] = self._stats.get('mask_empty', 0) + 1
+            self._stats['mask_empty'] = self._stats['mask_empty'] + 1
             return mask
-        self._stats['mask_nonempty'] = self._stats.get('mask_nonempty', 0) + 1
+        self._stats['mask_nonempty'] = self._stats['mask_nonempty'] + 1
         # update the mask with the new allows
         mask = tf.tensor_scatter_nd_update(
-            mask, updates=tf.expand_dims(update, axis=1),
-            indices=tf.ones_like(update, dtype=tf.bool)
+            mask,
+            indices=tf.expand_dims(update, axis=1),
+            updates=tf.ones_like(update, dtype=tf.bool)
         )
         # cache the mask
         self._mask_cache[prog_hash] = (mask, (last_reg, last_mem))
@@ -356,37 +408,23 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
     def get_space(self) -> ActionSpace:
         return self.action_space_cls(self.actions, self.asm_actions, self.np_actions)
 
-    def npy_to_asm(self, npy_program):
-        """
-        Convert a numpy program to a list of assembly instructions.
-        
-        Args:
-            npy_program: numpy array of shape (max_program_size, 3) containing
-            the program instructions.
-        
-        Returns:
-            A list of assembly instructions.
-        """
+    def npy_to_asm_int(self, npy_program):
         # convert the numpy program to a list of assembly instructions
         asm_program = []
+        int_program = []
         for insn in npy_program:
-            if tf.reduce_all(insn == 0):
+            if (insn == 0).all():
                 # reached the end of the program
                 break
             insn_idx = self._npy_reversed.get(tuple(insn))
             asm_insn = self.asm_actions.get(insn_idx)
             asm_program.extend(asm_insn)
-        return asm_program
+            int_program.append(insn_idx)
+        return asm_program, int_program
 
     @property
     def stats(self) -> Dict[str, Any]:
-        """
-        Returns the statistics of the action space storage.
-        """
-        if hasattr(self, '_stats'):
-            # if stats are not initialized, return an empty dict
-            self._stats = self._stats or {}
-        return {}
+        return self._stats
 
 # #################
 # Environment definition
@@ -424,9 +462,9 @@ class AssemblyGame(Environment):
             max_mem=task_spec.num_mem,
             mode=task_spec.emulator_mode, # use 32-bit mode
             init_active_registers=[
-                i for i, b in enumerate(self._emulator.register_mask[:, :task_spec.num_regs]) if b != 0],
+                i for i, b in enumerate(self._emulator.register_mask[:, :task_spec.num_regs].any(axis=0)) if b != 0],
             init_active_memory=[
-                i for i, b in enumerate(self._emulator.memory_mask) if b != 0]
+                i for i, b in enumerate(self._emulator.memory_mask.any(axis=0)) if b != 0]
         )
         self.reset()
 
@@ -483,7 +521,6 @@ class AssemblyGame(Environment):
             memory=tf.constant(self._emulator.memory, dtype=tf.int32),
             active_memory=tf.constant(self._emulator.memory_mask, dtype=tf.bool),
             program=tf.constant(self._program.npy_program, dtype=tf.int32),
-            int_program=tf.constant(self._program.int_program, dtype=tf.int32),
             program_length=tf.constant(len(self._program), dtype=tf.int32),
             program_counter=tf.constant(self._emulator.program_counter, dtype=tf.int32)
         )._asdict()
@@ -541,10 +578,8 @@ class AssemblyGame(Environment):
             # and program numpy -> asm is unavoidable anyway
             if isinstance(state, TimeStep):
                 ts_program = state.observation['program']
-                int_program = state.observation['int_program']
             else: # then it is a CPUState._asdict()
                 ts_program = state['program']
-                int_program = state['int_program']
             # logger.debug("AssemblyGame.reset: ts_program shape %s", ts_program.shape)
             # either B x num_inputs x 3 or no batch dimension
             if len(ts_program.shape) > 2:
@@ -553,9 +588,10 @@ class AssemblyGame(Environment):
                 ts_program = tf.squeeze(ts_program, axis=0)
 
             # convert the numpy program to a list of assembly instructions
-            asm_program = self._action_space_storage.npy_to_asm(ts_program.numpy())
+            np_program = ts_program.numpy()
+            asm_program, int_program = self._action_space_storage.npy_to_asm_int(np_program)
             self._program = Program(
-                npy_program=ts_program.numpy(),
+                npy_program=np_program,
                 asm_program=asm_program,
                 int_program=int_program
             )
@@ -621,7 +657,7 @@ class AssemblyGame(Environment):
             active_memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.bool_),
             program=Array(shape=(self._task_spec.max_program_size, 3), dtype=np.int32),
             program_length=Array(shape=(), dtype=np.int32),
-            program_counter=Array(shape=(self._task_spec.num_inputs,), dtype=np.int32)
+            program_counter=Array(shape=(self._task_spec.num_inputs,), dtype=np.int32),
         )._asdict()
     def action_spec(self):
         # TODO: this won't work for dynamic action spaces
