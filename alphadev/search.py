@@ -1,7 +1,7 @@
 """
 Extension of `acme.agents.tf.mcts.search`
 """
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Generator
 
 from acme.agents.tf.mcts.search import SearchPolicy
 from acme.agents.tf.mcts import types
@@ -25,14 +25,17 @@ class Node:
     children: Dict[types.Action, 'Node'] = dataclasses.field(default_factory=dict)
     _children_priors: List[float] = None
     action_mask: Optional[np.ndarray] = None
-
+    container_cls: Optional[type] = None
+    
     def expand(self, prior: np.ndarray, action_mask: Optional[np.ndarray] = None):
         """Expands this node, adding child nodes."""
         assert prior.ndim == 1  # Prior should be a flat vector.
         self.action_mask = action_mask if action_mask is not None else np.ones_like(prior, dtype=bool)
         self._children_priors = prior
-        for a, p in enumerate(prior):
-            self.children[a] = self.__class__(prior=p)
+        self.children = self._make_children(prior.shape[0])
+    
+    def _make_children(self, num_kids:int) -> Dict[types.Action, 'Node']:
+        return NodeContainer(num_kids)
 
     @property
     def children_visits(self) -> np.ndarray:
@@ -71,15 +74,41 @@ class Node:
     def reward(self, value: float):
         self._reward = value
 
+class NodeContainer():
+    default_node = Node()
+
+    def __init__(self, num_nodes: int):
+        self.num_nodes = num_nodes
+        self.nodes = {a: self.__class__.default_node for a in range(num_nodes)}
+    
+    def __getitem__(self, key: int) -> Node:
+        if id(self.nodes[key]) == id(self.__class__.default_node):
+            # If the node is the default node, create a new one.
+            self.nodes[key] = Node()
+        return self.nodes[key]
+    
+    def values(self) -> Generator[Node, None, None]:
+        return self.nodes.values()
+
+
 class DvNode(Node):
     """Just like a Node, but rewards are 3D vectors."""
+    def _make_children(self, num_kids):
+        return DvNodeContainer(num_kids)
+    
     @property
     def reward(self) -> np.ndarray:
         """Return the reward of this node."""
         return self._reward[0]
+    
     @reward.setter
     def reward(self, value) -> np.ndarray:
         self._reward = value
+
+# NOTE: unfortunately, python doesn't support generics in any meaningful way.
+class DvNodeContainer(NodeContainer):
+    default_node = DvNode()
+
 
 def mcts(
     observation: types.Observation,
