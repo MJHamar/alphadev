@@ -12,120 +12,74 @@ import numpy as np
 
 from tqdm import tqdm
 
+@dataclasses.dataclass
 class Node:
-    def __init__(self, parent: Optional['Node'] = None, index: Optional[int] = None):
-        """A MCTS node.
-        
-        Args:
-            parent: The parent node of this node.
-        Fields:
-            reward
-            visit_count
-            terminal
-            prior
-            total_value
-            children
-        """
-        self.parent = parent
-        self.index = index
-        self.action_mask = None
-        
-        self._reward = None if parent is not None else 0.
-        self._visit_count = None if parent is not None else 0
-        self._terminal = None if parent is not None else False
-        self._prior = None if parent is not None else 1.
-        self._value = None if parent is not None else 0.
-        self.children = None
-        self.children_priors = None
-        self.children_rewards = None
-        self.children_visits = None
-        self.children_values = None
-        self.children_terminal = None
+    """A MCTS node."""
+
+    prior: float = 1.
+    terminal: bool = False
+    _reward: float = 0.
+    _visit_count: int = 0
+    _total_value: float = 0.
+    _value: types.Value = 0.  # Q(s, a)
+    children: Dict[types.Action, 'Node'] = dataclasses.field(default_factory=dict)
+    _children_priors: List[float] = None
+    action_mask: Optional[np.ndarray] = None
 
     def expand(self, prior: np.ndarray, action_mask: Optional[np.ndarray] = None):
         """Expands this node, adding child nodes."""
         assert prior.ndim == 1  # Prior should be a flat vector.
-        assert self.children is None, "Node already expanded."
-        self.children_priors = prior
-        self.action_mask = action_mask
-        self.children_rewards = np.zeros_like(prior)
-        self.children_visits = np.zeros_like(prior)
-        self.children_values = np.zeros_like(prior)
-        self.children_terminal = np.zeros_like(prior, dtype=bool)
-        self.children = []
-        for a, _ in enumerate(prior):
-            self.children.append(self.__class__(parent=self, index=a))
+        self.action_mask = action_mask if action_mask is not None else np.ones_like(prior, dtype=bool)
+        self._children_priors = prior
+        for a, p in enumerate(prior):
+            self.children[a] = self.__class__(prior=p)
+
+    @property
+    def children_visits(self) -> np.ndarray:
+        """Return array of visit counts of visited children."""
+        return np.array([c.visit_count for c in self.children.values()])
+
+    @property
+    def children_values(self) -> np.ndarray:
+        """Return array of values of visited children."""
+        return np.array([c.value for c in self.children.values()])
+    
+    @property
+    def children_priors(self) -> np.ndarray:
+        return self._children_priors
 
     def visit(self, value: float):
         """Visit this node andd update its value by computing the new average
         based on the previous value and the new value. also increment the visit count."""
-        if self.parent is not None:
-            #avg_i+1 = avg_i * n_i + value / (n_i + 1)
-            self.parent.children_values[self.index] = \
-                (self.parent.children_values[self.index] * self.parent.children_visits[self.index] + value) \
-                    / (self.parent.children_visits[self.index] + 1)
-            self.parent.children_visits[self.index] += 1
-        elif self._value is not None:
-            self._value = (self._value * self._visit_count + value) / (self._visit_count + 1)
-            self._visit_count += 1
-        else:
-            raise ValueError("Node has no parent. and no value.")
-
-    @property
-    def reward(self) -> float:
-        """Return the reward of this node."""
-        return self.parent.children_rewards[self.index] if self.parent is not None else self._reward
-
-    @reward.setter
-    def reward(self, value: float):
-        """Set the reward of this node."""
-        if self.parent is not None:
-            self.parent.children_rewards[self.index] = value
-        else:
-            self._reward = value
+        self._visit_count += 1
+        self._total_value += value
+        self._value = self._total_value / self._visit_count
 
     @property
     def visit_count(self) -> int:
         """Return the visit count of this node."""
-        return self.parent.children_visits[self.index] if self.parent is not None else self._visit_count
+        return self._visit_count
 
     @property
     def value(self) -> types.Value:  # Q(s, a)
-        """Returns the value from this node."""
-        if self.parent is not None:
-            return self.parent.children_values[self.index]
-        if self._value:
-            return self.value
-        raise ValueError("Node has no value.")
-
+        return self._value
+    
     @property
-    def terminal(self) -> bool:
-        """Return whether this node is terminal."""
-        return self.parent.children_terminal[self.index] if self.parent is not None else self._terminal
-    @terminal.setter
-    def terminal(self, value: bool):
-        """Set the terminal flag of this node."""
-        if self.parent is not None:
-            self.parent.children_terminal[self.index] = value
-        else:
-            self._terminal = value
-    @property
-    def prior(self) -> float:
-        """Return the prior of this node."""
-        return self.parent.children_priors[self.index] if self.parent is not None else self._prior
+    def reward(self) -> float:
+        return self._reward
+    @reward.setter
+    def reward(self, value: float):
+        self._reward = value
 
 class DvNode(Node):
     """Just like a Node, but rewards are 3D vectors."""
     @property
     def reward(self) -> np.ndarray:
         """Return the reward of this node."""
-        return self.parent.children_rewards[self.index] if self.parent is not None else self._reward
+        return self._reward[0]
     @reward.setter
     def reward(self, value) -> np.ndarray:
-        if self.parent is not None:
-            self.parent.children_rewards[self.index] = value[0]
-        else:
-            self._reward = value[0]
+        self._reward = value
 
 def mcts(
     observation: types.Observation,
