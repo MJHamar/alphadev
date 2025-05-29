@@ -31,12 +31,9 @@ class TaskSpec(NamedTuple):
 
 class CPUState(NamedTuple):
     registers: tf.Tensor # num_inputs x num_regs array of register values
-    active_registers: tf.Tensor # num_inputs x num_regs boolean array of active registers
     memory: tf.Tensor # num_inputs x num_mem array of memory locations
-    active_memory: tf.Tensor # num_inputs x num_mem boolean array of active memory locations
     program: tf.Tensor # max_program_size x 1 array of progrram instructions.
     program_length: tf.Tensor  # scalar length of the program 
-    program_counter: tf.Tensor # num_inputs x 1 array of program counters (in int32)
 
 class Program(NamedTuple):
     npy_program: np.ndarray # <max_program_size> x 3 (opcode, op1, op2)

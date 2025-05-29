@@ -419,16 +419,15 @@ class AssemblyGame(Environment):
             special_x_regs=np.array([1], dtype=np.int32),
             mode=task_spec.emulator_mode, # use 32-bit mode
             track_usage=False,
+            use_fp=False
         )
         # TODO: make this distributed
         self._action_space_storage = x86ActionSpaceStorage(
             max_reg=task_spec.num_regs,
             max_mem=task_spec.num_mem,
             mode=task_spec.emulator_mode, # use 32-bit mode
-            init_active_registers=[
-                i for i, b in enumerate(self._emulator.register_mask[:, :task_spec.num_regs].any(axis=0)) if b != 0],
-            init_active_memory=[
-                i for i, b in enumerate(self._emulator.memory_mask.any(axis=0)) if b != 0]
+            init_active_registers=[0,1],
+            init_active_memory=list(range(task_spec.inputs.inputs.shape[1]))
         )
         self.reset()
 
@@ -483,12 +482,9 @@ class AssemblyGame(Environment):
         return CPUState(
             registers= self._emulator.registers[:, :self._task_spec.num_regs],
             # TODO: active registers and memory are no longer used.
-            active_registers= self._emulator.register_mask[:, :self._task_spec.num_regs],
             memory= self._emulator.memory,
-            active_memory= self._emulator.memory_mask,
             program= self._program.npy_program,
             program_length= len(self._program),
-            program_counter= self._emulator.program_counter,
         )._asdict()
     
     def _check_invalid(self) -> bool:
@@ -614,12 +610,9 @@ class AssemblyGame(Environment):
         return CPUState(
             registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.int32),
             # TODO: active registers and memory are no longer used.
-            active_registers=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_regs), dtype=np.bool_),
             memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.int32),
-            active_memory=Array(shape=(self._task_spec.num_inputs, self._task_spec.num_mem), dtype=np.bool_),
             program=Array(shape=(self._task_spec.max_program_size, 3), dtype=np.int32),
             program_length=Array(shape=(), dtype=np.int32),
-            program_counter=Array(shape=(self._task_spec.num_inputs,), dtype=np.int32),
         )._asdict()
     def action_spec(self):
         # TODO: this won't work for dynamic action spaces
