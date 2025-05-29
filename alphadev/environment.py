@@ -1,8 +1,6 @@
 from typing import Dict, Any, Tuple, List, Callable, Union, Optional, Literal
 import functools
 import numpy as np
-import tensorflow as tf
-import tree
 from dm_env import Environment, TimeStep, StepType
 from acme.specs import EnvironmentSpec, make_environment_spec as acme_make_environment_spec, Array, BoundedArray, DiscreteArray
 from acme.agents.tf.mcts import models
@@ -67,7 +65,7 @@ class ActionSpaceStorage:
     def get_space(self, state) -> ActionSpace:
         raise NotImplementedError()
 
-    def get_mask(self, state, history:list=None) -> tf.Tensor:
+    def get_mask(self, state, history:list=None) -> np.ndarray:
         """
         Get the mask over the action space for the given state and history.
         
@@ -76,13 +74,13 @@ class ActionSpaceStorage:
         """
         raise NotImplementedError()
 
-    def npy_to_asm(self, npy_program: tf.Tensor) -> List[Callable[[int], Any]]:
+    def npy_to_asm(self, npy_program: np.ndarray) -> List[Callable[[int], Any]]:
         raise NotImplementedError()
 
 class x86ActionSpaceStorage(ActionSpaceStorage):
     def __init__(self, max_reg: int, max_mem: int, mode: Literal['u8', 'i32'] = 'i32',
-                 init_active_registers: Optional[tf.Tensor] = None,
-                 init_active_memory: Optional[tf.Tensor] = None):
+                 init_active_registers: List[int] = None,
+                 init_active_memory: List[int] = None):
         """
         Create an action space storage for x86 instructions.
         Args:
@@ -97,7 +95,6 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         self.mode = mode
         self.actions: Dict[int, Dict[int, Tuple[str, Tuple[int,int]]]] =\
             x86_enumerate_actions(max_reg, max_mem)
-        self.all_actions = tf.constant(tf.range(len(self.actions), dtype=tf.int32))
         # pre-compute the assembly representation of the actions
         self.asm_actions = {
             i: x86_to_riscv(action[0], action[1], self.max_reg, mode=mode) for i, action in self.actions.items()
@@ -113,12 +110,11 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # there is a single action space for the given task
         self.action_space_cls = ActionSpace # these are still x86 instructions
         # build mask lookup tables
-        self.init_stats()
         self._build_masks(init_active_registers=init_active_registers,
                           init_active_memory=init_active_memory)
         # create cache for the masks
-        self._hash_base = tf.zeros(len(self.actions), dtype=tf.bool)
         self._mask_cache = {}
+        self.init_stats()
     
     def init_stats(self):
         self._stats = {
@@ -279,7 +275,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # or next memory location.
         last_reg = max(init_active_registers)
         last_mem = max(init_active_memory)
-        mask = tf.zeros(len(self.actions), dtype=tf.bool)
+        mask = np.zeros(len(self.actions), dtype=np.bool_)
         # take the union of the different lookup tables
         allowed_actions = set()
         # reg-only actions
@@ -308,39 +304,11 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             allowed_actions.update(sw_candidates)
         
         # update the mask
-        allowed_actions = tf.constant(list(allowed_actions), dtype=tf.int32)
-        mask = tf.tensor_scatter_nd_update(
-            mask,
-            indices=tf.expand_dims(allowed_actions, axis=1),
-            updates=tf.ones_like(allowed_actions, dtype=tf.bool)
-        )
+        allowed_actions = list(allowed_actions)
+        mask[allowed_actions] = True
         self._base_mask = (mask, (last_reg, last_mem))
-        # done.
-        # summary
-        # print("Done building initial mask.")
-        # print(f"  allowed actions: {allowed_actions.shape}")
-        # print(f"  active registers: {init_active_registers}")
-        # print(f"  active memory: {init_active_memory}")
-        # print(f"  register mask: >= {last_reg}, memory mask: <= {last_mem}")
-        # print(f"allowed actions:")
-        # for i, act in self.actions.items():
-        #     isok = False
-        #     if act[0] == 'lw':
-        #         mem, rd = act[1][0]-self.max_reg, act[1][1]
-        #         isok = mem <= last_mem and rd <= last_reg+1
-        #     elif act[0] == 'sw':
-        #         rs, mem = act[1][0], act[1][1]-self.max_reg
-        #         isok = rs <= last_reg and mem <= last_mem+1
-        #     elif act[0] in x86_source_source:
-        #         rs, rs1 = act[1]
-        #         isok = rs <= last_reg and rs1 <= last_reg
-        #     else:
-        #         rs, rd = act[1] if act[0] in x86_source_dest else (act[1][1], act[1][0])
-        #         isok = rs <= last_reg and rd <= last_reg+1
-        #     if mask[i]:
-        #         print(f"{'OK ' if isok else 'NOK'}  {i}: {act} -> {self.asm_actions[i]} (np: {self.np_actions[i]})")
-    
-    def get_mask(self, history: List[int]) -> tf.Tensor:
+        
+    def get_mask(self, history: List[int]) -> np.ndarray:
         """
         Get the mask over the action space for the given state and history.
 
@@ -360,10 +328,10 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             crnt_hash = new_hash
         if crnt_hash not in self._mask_cache:
             self._stats['mask_history_hitmiss'].append({'hit': 0, 'miss': len(steps_to_eval)})
-            mask, (last_reg, last_mem) = self._base_mask
+            mask, (last_reg, last_mem) = self._base_mask[0].copy(), self._base_mask[1]
         else:
             self._stats['mask_history_hitmiss'].append({'hit': len(history), 'miss': len(steps_to_eval)} )
-            mask, (last_reg, last_mem) = self._mask_cache[crnt_hash]
+            mask, (last_reg, last_mem) = self._mask_cache[crnt_hash][0].copy(), self._mask_cache[crnt_hash][1]
         # now  that we have the mask, we need to update it
         # being overly optimistic about the register and memory accesses is still a problem.
         # we need to compute register and memory masks separately and take their union
@@ -389,18 +357,14 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
             disallows = self._disallows_map.get(step, set())
         # update the mask with the allows and disallows
         update = allows - disallows
+        update = list(update)
         self._stats['mask_updates'].append(len(update))
-        update = tf.constant(list(update), dtype=tf.int32)
         if len(update) == 0:
             self._stats['mask_empty'] = self._stats['mask_empty'] + 1
             return mask
         self._stats['mask_nonempty'] = self._stats['mask_nonempty'] + 1
         # update the mask with the new allows
-        mask = tf.tensor_scatter_nd_update(
-            mask,
-            indices=tf.expand_dims(update, axis=1),
-            updates=tf.ones_like(update, dtype=tf.bool)
-        )
+        mask[update] = True
         # cache the mask
         self._mask_cache[prog_hash] = (mask, (last_reg, last_mem))
         return mask
@@ -442,7 +406,7 @@ class AssemblyGame(Environment):
         self._inputs = task_spec.inputs.inputs
         self._output_mask = task_spec.inputs.output_mask
         self._outputs = task_spec.inputs.outputs
-        self._max_num_hits = tf.math.count_nonzero(self._output_mask)
+        self._max_num_hits = np.sum(self._output_mask.astype(np.int32))
         # whether to return the correctness and latency components of the reward
         # in the TimeSteps
         self._observe_reward_components = task_spec.observe_reward_components
@@ -475,20 +439,22 @@ class AssemblyGame(Environment):
             int_program=[]
         )
     
-    def _eval_output(self, output: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        masked_output = tf.multiply(output, self._output_mask)
-        hits = tf.equal(masked_output, self._outputs)
-        num_hits = tf.math.count_nonzero(hits)
-        all_hits = tf.equal(num_hits, self._max_num_hits)
-        return tf.cast(all_hits, dtype=tf.float32), tf.cast(num_hits, dtype=tf.float32)
+    def _eval_output(self, output: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        masked_output = np.multiply(output, self._output_mask)
+        hits = masked_output == self._outputs
+        num_hits = hits.sum()
+        all_hits = num_hits == self._max_num_hits
+        return all_hits, num_hits
     
-    def _eval_latency(self) -> tf.Tensor:
+    def _eval_latency(self) -> np.ndarray:
         """Returns a scalar latency for the program."""
-        latencies = tf.constant([
-            self._emulator.measure_latency(self._program.asm_program)
-            for _ in range(self._task_spec.num_latency_simulations)], dtype=tf.float32
+        latencies = np.asarray([
+                self._emulator.measure_latency(self._program.asm_program)
+                for _ in range(self._task_spec.num_latency_simulations)
+            ],
+            dtype=np.float32
         )
-        return tf.cast(latencies, dtype=tf.float32)
+        return latencies
     
     def _compute_reward(self, include_latency: float) -> float:
         # compute the reward based on the latency and correctness
@@ -512,17 +478,17 @@ class AssemblyGame(Environment):
         self._prev_num_hits = self._num_hits
         return reward, latency_reward, correctness_reward
     
-    def _make_observation(self) -> Dict[str, tf.Tensor]:
+    def _make_observation(self) -> Dict[str, np.ndarray]:
         # get the current state of the CPU
         return CPUState(
-            registers=tf.constant(self._emulator.registers[:, :self._task_spec.num_regs], dtype=tf.int32),
+            registers= self._emulator.registers[:, :self._task_spec.num_regs],
             # TODO: active registers and memory are no longer used.
-            active_registers=tf.constant(self._emulator.register_mask[:, :self._task_spec.num_regs], dtype=tf.bool),
-            memory=tf.constant(self._emulator.memory, dtype=tf.int32),
-            active_memory=tf.constant(self._emulator.memory_mask, dtype=tf.bool),
-            program=tf.constant(self._program.npy_program, dtype=tf.int32),
-            program_length=tf.constant(len(self._program), dtype=tf.int32),
-            program_counter=tf.constant(self._emulator.program_counter, dtype=tf.int32)
+            active_registers= self._emulator.register_mask[:, :self._task_spec.num_regs],
+            memory= self._emulator.memory,
+            active_memory= self._emulator.memory_mask,
+            program= self._program.npy_program,
+            program_length= len(self._program),
+            program_counter= self._emulator.program_counter,
         )._asdict()
     
     def _check_invalid(self) -> bool:
@@ -554,10 +520,9 @@ class AssemblyGame(Environment):
             # too many components in acme hard-code the structure of TimeStep, and not
             # everything supports reward to be a dictionary, so we concatenate
             # the reward components into a single tensor
-            reward=(tf.constant(reward, dtype=tf.float32) 
-                        if not self._observe_reward_components else 
-                            tf.constant(np.asarray([reward, correctness, latency]), dtype=tf.float32)),
-            discount=tf.constant(1.0, dtype=tf.float32), # NOTE: not sure what discount here means.
+            reward=reward if not self._observe_reward_components else 
+                np.asarray([reward, correctness, latency], dtype=np.float32),
+            discount=np.asarray([1.0], dtype=np.float32), # NOTE: not sure what discount here means.
             observation=observation,
             # skip latency and correctness
         )
@@ -577,21 +542,20 @@ class AssemblyGame(Environment):
             # but copying is also not fully possible
             # and program numpy -> asm is unavoidable anyway
             if isinstance(state, TimeStep):
-                ts_program = state.observation['program']
+                npy_program = state.observation['program']
             else: # then it is a CPUState._asdict()
-                ts_program = state['program']
-            # logger.debug("AssemblyGame.reset: ts_program shape %s", ts_program.shape)
+                npy_program = state['program']
+            # logger.debug("AssemblyGame.reset: npy_program shape %s", npy_program.shape)
             # either B x num_inputs x 3 or no batch dimension
-            if len(ts_program.shape) > 2:
+            if len(npy_program.shape) > 2:
                 # we need to remove the batch dimension
-                assert ts_program.shape[0] == 1, "Batch dimension is not 1, resetting is ambigouous."
-                ts_program = tf.squeeze(ts_program, axis=0)
+                assert npy_program.shape[0] == 1, "Batch dimension is not 1, resetting is ambigouous."
+                npy_program = np.squeeze(npy_program, axis=0)
 
             # convert the numpy program to a list of assembly instructions
-            np_program = ts_program.numpy()
-            asm_program, int_program = self._action_space_storage.npy_to_asm_int(np_program)
+            asm_program, int_program = self._action_space_storage.npy_to_asm_int(npy_program)
             self._program = Program(
-                npy_program=np_program,
+                npy_program=npy_program,
                 asm_program=asm_program,
                 int_program=int_program
             )
@@ -639,9 +603,7 @@ class AssemblyGame(Environment):
         return self._update_state()
     
     def legal_actions(self) -> np.ndarray:
-        tf_mask = self._action_space_storage.get_mask(self._program.int_program)
-        # convert the mask to a numpy array
-        legal_actions = tf_mask.numpy().astype(np.bool_)
+        legal_actions = self._action_space_storage.get_mask(self._program.int_program)
         return legal_actions
     
     def reward_spec(self):
@@ -722,7 +684,8 @@ class AssemblyGameModel(models.Model):
     def update(
         self,
         timestep: TimeStep, # prior to executing the action
-        action: tf.Tensor, # opcode, operands
+        # FIXME: this might be very incorrect.
+        action: np.ndarray, # opcode, operands
         next_timestep: TimeStep, # after executing the action
     ) -> TimeStep:
         """
@@ -747,19 +710,9 @@ class AssemblyGameModel(models.Model):
         def assert_timestep():
             # to save time, we only compare the program.
             # it deterministically defines the rest.
-            try:
-                tf.assert_equal(
-                    timestep.observation['program'],
-                    self._environment._last_ts.observation['program'],
-                    message=(
-                        f"timestep {timestep.observation['program']} does not match "
-                        f"environment {self._environment._last_ts.observation['program']}"
-                    ),
-                )
-                return True
-            except tf.errors.InvalidArgumentError as e:
-                # logger.error("AssemblyGameModel: timestep assertion error %s", e)
-                return False
+            return (
+                timestep.observation['program'] == self._environment._last_ts.observation['program']
+            ).all()
         if assert_timestep():
             return self._environment.step(action)
         else:

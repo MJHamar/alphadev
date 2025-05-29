@@ -22,7 +22,8 @@ class DummyNetwork(snn.Module):
         self.num_actions = num_actions
         self.last_action = 0 # cycle through all actions one by one to make this deterministic
         self.value = tf.constant([0.0], dtype=tf.float32)  # dummy value
-        
+    
+    @tf.function
     def __call__(self, observation):
         pi = tf.one_hot([self.last_action], self.num_actions) #add batch dim
         self.last_action = (self.last_action + 1) % self.num_actions
@@ -133,7 +134,7 @@ def profile_select_n_actions(env, actor, num_actions):
 
 def main(id_):
     num_steps = 100
-    num_episodes = 10 # x100
+    num_episodes = 1 # x100
     
     print("Profiling select_action...")
     select_action_stats = profile_select_n_actions(env_10, actor_10, num_steps)
