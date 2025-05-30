@@ -9,10 +9,13 @@ import tensorflow as tf
 import sonnet as snn
 import numpy as np
 
-from alphadev.environment import AssemblyGame, EnvironmentFactory, AssemblyGameModel
+from alphadev.environment import AssemblyGame, EnvironmentFactory, AssemblyGameModel, ModelFactory
 from alphadev.acting import MCTSActor
 from alphadev.search import PUCTSearchPolicy
 from alphadev.utils import TaskSpec, generate_sort_inputs
+from alphadev.config import AlphaDevConfig
+from alphadev.network import AlphaDevNetwork, NetworkFactory
+from alphadev.alphadev_acme import make_agent
 from acme.specs import make_environment_spec
 from acme.environment_loop import EnvironmentLoop
 
@@ -56,6 +59,23 @@ actor_10 = MCTSActor(
     discount=1.0,
 )
 
+# realistic scenario
+def actor_env_from_config(path) -> EnvironmentLoop:
+    """Load the configuration from a file."""
+    config = AlphaDevConfig.from_yaml(path)
+    assert not config.distributed, "This test is not for distributed agents."
+    agent = make_agent(config)
+    environment = EnvironmentFactory(config)()
+    env_executor = EnvironmentLoop(
+        environment=environment,
+        actor=agent,
+        counter=agent.counter,
+        should_update=False,
+        logger=agent.logger,
+        observers=[]
+    )
+    return agent._actor, env_executor
+
 
 def print_mask_stats(action_space_storage):
     mask_stats = action_space_storage._stats
@@ -97,6 +117,7 @@ def print_mask_stats(action_space_storage):
 
 
 def select_n_actions(env:AssemblyGame, actor:MCTSActor, n):
+    print(f"Selecting {n} actions in the environment {env} using actor {actor} and network {actor._network}.")
     ts = env.reset()
     for _ in tqdm(range(n)):
         action = actor.select_action(ts.observation)
@@ -104,11 +125,13 @@ def select_n_actions(env:AssemblyGame, actor:MCTSActor, n):
         if env._is_invalid:
             ts = env.reset()
 
-def run_env_loop(env, actor, num_steps):
-    loop = EnvironmentLoop(env, actor)
+def run_env_loop(env, actor, num_steps, loop=None):
+    if loop is None:
+        loop = EnvironmentLoop(env, actor)
     loop.run(num_episodes=num_steps)
 
 def profile_env_loop(env, actor, num_steps):
+    print("Profiling environment loop...")
     profiler = cProfile.Profile()
     profiler.enable()
     
@@ -120,6 +143,19 @@ def profile_env_loop(env, actor, num_steps):
     print_mask_stats(actor._model._environment._action_space_storage)
     return stats
 
+def profile_prepared_env_loop(loop: EnvironmentLoop, num_steps):
+    print("Profiling prepared environment loop...")
+    profiler = cProfile.Profile()
+    profiler.enable()
+    
+    loop.run(num_episodes=num_steps)
+    
+    profiler.disable()
+    stats = pstats.Stats(profiler)
+    stats.sort_stats('cumulative')
+    # print_mask_stats(actor._model._environment._action_space_storage)
+    return stats
+
 def profile_select_n_actions(env, actor, num_actions):
     profiler = cProfile.Profile()
     profiler.enable()
@@ -129,19 +165,29 @@ def profile_select_n_actions(env, actor, num_actions):
     profiler.disable()
     stats = pstats.Stats(profiler)
     stats.sort_stats('cumulative')
-    print_mask_stats(env._action_space_storage)
+    print_mask_stats(actor._model._environment._action_space_storage)
     return stats
 
-def main(id_):
+def main(id_, actor=None, env_loop=None):
+    if actor is None:
+        actor = actor_10
+    if env_loop is None:
+        env = env_10
+    else:
+        env = env_loop._environment
+    
     num_steps = 100
     num_episodes = 1 # x100
     
     print("Profiling select_action...")
-    select_action_stats = profile_select_n_actions(env_10, actor_10, num_steps)
+    select_action_stats = profile_select_n_actions(env, actor, num_steps)
     select_action_stats.dump_stats(f'profile/select_action_profile_{id_}.prof')
     subprocess.run(['flameprof', '-i', f'profile/select_action_profile_{id_}.prof', '-o', f'profile/select_action_flamegraph_{id_}.svg'])
     print("Profiling Environment Loop...")
-    env_loop_stats = profile_env_loop(env_10, actor_10, num_episodes)
+    if env_loop is not None:
+        env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
+    else:
+        env_loop_stats = profile_env_loop(env_10, actor_10, num_episodes)
     env_loop_stats.dump_stats(f'profile/env_loop_profile_{id_}.prof')
     subprocess.run(['flameprof', '-i', f'profile/env_loop_profile_{id_}.prof', '-o', f'profile/env_loop_flamegraph_{id_}.svg'])
     print("Profiling complete.")
@@ -150,6 +196,13 @@ def main(id_):
     
 if __name__ == '__main__':
     import sys
-    if len(sys.argv) != 2:
+    if len(sys.argv) < 2:
         sys.argv.append('debug')
-    main(id_=sys.argv[1])
+    print("Arguments:", sys.argv)
+    if len(sys.argv) == 3:
+        actor, env_loop = actor_env_from_config(sys.argv[2])
+        print(f"Using actor {actor} and environment loop {env_loop}.")
+        main(id_=sys.argv[1], actor=actor, env_loop=env_loop)
+    else:
+        print("No environment loop provided, using default actor and environment.")
+        main(id_=sys.argv[1])

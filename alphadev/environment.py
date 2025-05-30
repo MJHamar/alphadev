@@ -131,7 +131,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         bagged_program = np.zeros(len(self.actions), dtype=np.bool_)
         bagged_program[program] = True
         # convert to a bytearray
-        return hash(bagged_program.tobytes())
+        return bagged_program.tobytes()
     
     def _build_masks(self, init_active_registers, init_active_memory):
         """
@@ -481,11 +481,11 @@ class AssemblyGame(Environment):
     def _make_observation(self) -> Dict[str, np.ndarray]:
         # get the current state of the CPU
         return CPUState(
-            registers= self._emulator.registers[:, :self._task_spec.num_regs],
+            registers= self._emulator.registers[:, :self._task_spec.num_regs].astype(np.int32),
             # TODO: active registers and memory are no longer used.
-            memory= self._emulator.memory,
-            program= self._program.npy_program,
-            program_length= len(self._program),
+            memory= self._emulator.memory.astype(np.int32),
+            program= self._program.npy_program.astype(np.int32),
+            program_length= np.asarray(len(self._program), dtype=np.int32),
         )._asdict()
     
     def _check_invalid(self) -> bool:
@@ -519,7 +519,7 @@ class AssemblyGame(Environment):
             # the reward components into a single tensor
             reward=reward if not self._observe_reward_components else 
                 np.asarray([reward, correctness, latency], dtype=np.float32),
-            discount=np.asarray([1.0], dtype=np.float32), # NOTE: not sure what discount here means.
+            discount=np.asarray(1.0, dtype=np.float32), # NOTE: not sure what discount here means.
             observation=observation,
             # skip latency and correctness
         )

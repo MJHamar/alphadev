@@ -46,7 +46,6 @@ class Node:
     def children_values(self) -> np.ndarray:
         """Return array of values of visited children."""
         vals = [c.value for c in self.children.values()]
-        print(vals)
         return np.array(vals)
     
     @property
@@ -86,7 +85,7 @@ class NodeContainer():
     def __getitem__(self, key: int) -> Node:
         if id(self.nodes[key]) == id(self.__class__.default_node):
             # If the node is the default node, create a new one.
-            self.nodes[key] = Node()
+            self.nodes[key] = self.__class__.default_node.__class__()
         return self.nodes[key]
     
     def values(self) -> Generator[Node, None, None]:
@@ -102,12 +101,9 @@ class DvNode(Node):
     @property
     def reward(self) -> np.ndarray:
         """Return the reward of this node."""
-        print('getting reward [0]', self._reward, 'shape', self._reward.shape)
         return self._reward[0]
-    
     @reward.setter
-    def reward(self, value) -> np.ndarray:
-        print('setting reward', value, 'shape', value.shape)
+    def reward(self, value: float):
         self._reward = value
 
 # NOTE: unfortunately, python doesn't support generics in any meaningful way.
@@ -132,11 +128,11 @@ def mcts(
     # Evaluate the prior policy for this state.
     prior, value = evaluation(observation)
     assert prior.shape == (num_actions,), f"Expected prior shape {(num_actions,)}, got {prior.shape}."
+    assert isinstance(value, float), f"Expected value to be a float, got {type(value)}."
 
     # Add exploration noise to the prior.
     noise = np.random.dirichlet(alpha=[dirichlet_alpha] * num_actions)
     prior = prior * (1 - exploration_fraction) + noise * exploration_fraction
-
     # Create a fresh tree search.
     root = node_class()
     legal_actions = model.legal_actions()
@@ -163,7 +159,6 @@ def mcts(
 
         # Replay the simulator until the current node and expand it.
         timestep = model.step(actions)
-        print('timestep reward:', timestep.reward)
         node.reward = timestep.reward if timestep.reward is not None else 0.
         node.terminal = timestep.last()
 
@@ -187,11 +182,9 @@ def mcts(
         while trajectory:
             # Pop off the latest node in the trajectory.
             node = trajectory.pop()
-
             # Accumulate the discounted return
             ret *= discount
             ret += node.reward
-            print('ret', ret, 'reward', node.reward)
 
             # Update the node.
             node.visit(ret)

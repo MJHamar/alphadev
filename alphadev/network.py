@@ -17,6 +17,7 @@ from .distribution import DistributionSupport
 
 import logging
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 class MultiQueryAttentionBlock(snn.Module):
     """Attention with multiple query heads and a single shared key and value head.
@@ -687,7 +688,7 @@ class AlphaDevNetwork(snn.Module):
     
     def __call__(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
         """Computes and returns the policy and value logits for the AZLearner."""
-        # logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
+        logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
         # inputs is the observation dict
         embedding: tf.Tensor = self._representation_net(inputs)
         # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
