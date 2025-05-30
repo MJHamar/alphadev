@@ -40,13 +40,12 @@ class Node:
     @property
     def children_visits(self) -> np.ndarray:
         """Return array of visit counts of visited children."""
-        return np.array([c.visit_count for c in self.children.values()])
+        return self.children.visits()
 
     @property
     def children_values(self) -> np.ndarray:
         """Return array of values of visited children."""
-        vals = [c.value for c in self.children.values()]
-        return np.array(vals)
+        return self.children.values()
     
     @property
     def children_priors(self) -> np.ndarray:
@@ -55,6 +54,9 @@ class Node:
     def visit(self, value: float):
         """Visit this node andd update its value by computing the new average
         based on the previous value and the new value. also increment the visit count."""
+        # update the node container with the latest values and visit counts of its children
+        self.children.update()
+        # Update the visit count and value.
         self._visit_count += 1
         self._total_value += value
         self._value = self._total_value / self._visit_count
@@ -76,20 +78,67 @@ class Node:
         self._reward = value
 
 class NodeContainer():
+    """
+    Node container that caches node values and visit counts, so that we don't have to keep re-initializing ndarrays.
+    An important assumption is that this class is only used during MCTS, where
+    update() is called during the backup phase and __getitem__() is called exactly once per node, per rollout.
+    """
     default_node = Node()
 
     def __init__(self, num_nodes: int):
         self.num_nodes = num_nodes
         self.nodes = {a: self.__class__.default_node for a in range(num_nodes)}
+        self._node_values = None
+        self._node_visits = None
+        self._needs_update = None
     
     def __getitem__(self, key: int) -> Node:
+        assert self._needs_update is None,\
+            "Cannot call __getitem__ while _needs_update is not None."\
+            "This means two subsequent calls to __getitem__ without an update (via values() or visits())."
         if id(self.nodes[key]) == id(self.__class__.default_node):
             # If the node is the default node, create a new one.
             self.nodes[key] = self.__class__.default_node.__class__()
+        self._needs_update = key
         return self.nodes[key]
     
-    def values(self) -> Generator[Node, None, None]:
+    def update(self):
+        if self._needs_update is not None:
+            key = self._needs_update; self._needs_update = None
+            if self._node_values is not None:
+                self._node_values[key] = self.nodes[key].value
+            if self._node_visits is not None:
+                self._node_visits[key] = self.nodes[key].visit_count
+    
+    def values(self) -> np.ndarray:
+        if self._node_values is not None:
+            return self._node_values
+        self._node_values = np.asarray(
+            [node.value for node in self.nodes.values()],
+            dtype=np.float32
+        )
+        return self._node_values
+    
+    def visits(self) -> np.ndarray:
+        if self._node_visits is not None:
+            return self._node_visits
+        self._node_visits = np.asarray(
+            [node.visit_count for node in self.nodes.values()],
+            dtype=np.int32
+        )
+        return self._node_visits
+    
+    def elements(self) -> Generator[Node, None, None]:
         return self.nodes.values()
+    
+    def __len__(self) -> int:
+        """Return the number of nodes in this container."""
+        return self.num_nodes
+    
+    def __iter__(self) -> Generator[Node, None, None]:
+        """Iterate over the nodes in this container."""
+        raise NotImplementedError(
+            "NodeContainer is not iterable. Use `nodes()` to be explicit about iterating over the nodes.")
 
 @dataclasses.dataclass
 class DvNode(Node):
