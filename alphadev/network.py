@@ -6,7 +6,6 @@ from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import sonnet as snn
 import tensorflow as tf
-import numpy as np
 import ml_collections
 import functools
 from acme.specs import DiscreteArray
@@ -106,13 +105,20 @@ class MultiQueryAttentionBlock(snn.Module):
         """Compute sinusoid absolute position encodings, 
         given a sequence size and feature dimensionality"""
         # SOURCE: https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/JAX/tutorial6/Transformers_and_MHAttention.html
-        pe = np.zeros((seq_size, feat_size))
-        position = np.arange(0, seq_size, dtype=np.float32)[:,None]
-        div_term = np.exp(np.arange(0, feat_size, 2) * (-np.log(10000.0) / feat_size))
-        pe[:, 0::2] = np.sin(position * div_term)
-        pe[:, 1::2] = np.cos(position * div_term)
-        pe = pe[None]
-        return tf.constant(pe, dtype=tf.float32) # [1, seq_size, feat_size]
+        pe = tf.zeros((seq_size, feat_size), dtype=tf.float32)
+        position = tf.range(0, seq_size, dtype=tf.float32)[:, None]
+        div_term = tf.exp(tf.range(0, feat_size, 2, dtype=tf.float32) * (-tf.math.log(10000.0) / feat_size))
+        tf.tensor_scatter_nd_update(
+            pe, 
+            indices=tf.range(0, feat_size, 2)[:, None],
+            updates=tf.sin(position * div_term)
+        )
+        tf.tensor_scatter_nd_update(
+            pe,
+            indices=tf.range(1, feat_size, 2)[:, None],
+            updates=tf.cos(position * div_term)
+        )
+        return tf.expand_dims(pe, axis=0) # [1, seq_size, feat_size]
 
 class ResBlockV2(snn.Module):
     """Layer-normed variant of the block from https://arxiv.org/abs/1603.05027.
