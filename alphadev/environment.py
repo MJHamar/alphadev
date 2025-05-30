@@ -448,6 +448,7 @@ class AssemblyGame(Environment):
     
     def _eval_latency(self) -> np.ndarray:
         """Returns a scalar latency for the program."""
+        # NOTE: not used.
         latencies = np.asarray([
                 self._emulator.measure_latency(self._program.asm_program)
                 for _ in range(self._task_spec.num_latency_simulations)
@@ -470,10 +471,11 @@ class AssemblyGame(Environment):
         # update the previous correct items
         latency_reward = 0.0
         if include_latency: # cannot be <0 btw
-            latencies = self._eval_latency()
-            latency_reward = np.quantile(
-                latencies, self._task_spec.latency_quantile
-            ) * self._task_spec.latency_reward_weight
+            latency_reward = len(self._program) * self._task_spec.latency_reward_weight
+            # latencies = self._eval_latency()
+            # latency_reward = np.quantile(
+            #     latencies, self._task_spec.latency_quantile
+            # ) * self._task_spec.latency_reward_weight
         reward = max(correctness_reward - latency_reward, 0.0)
         self._prev_num_hits = self._num_hits
         return reward, latency_reward, correctness_reward
