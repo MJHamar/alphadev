@@ -250,21 +250,22 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # all elements allows_lw and allows_sw should be either num_regs or 0. if 0,we remove it
         for i in self.actions: 
             if i in allows_lw and len(allows_lw[i]) == 0: allows_lw.pop(i)
-        assert all(len(v) == self.max_reg for v in allows_lw.values()), \
-            "Not all lw actions have the same number of allowed actions."
+        print('max_reg', self.max_reg, "max_mem", self.max_mem)
+        assert all(len(v) == self.max_mem for v in allows_lw.values()), \
+            f"Not all lw actions have the same number of allowed actions. {[len(v) for v in allows_lw.values()]}"
         for i in self.actions: 
             if i in allows_sw and len(allows_sw[i]) == 0: allows_sw.pop(i)
-        assert all(len(v) == self.max_reg for v in allows_sw.values()), \
-            "Not all sw actions have the same number of allowed actions."
+        assert all(len(v) == self.max_mem for v in allows_sw.values()), \
+            f"Not all sw actions have the same number of allowed actions. {[len(v) for v in allows_sw.values()]}"
         
         # also, all elements in allows_lw_mem and allows_sw_mem should be either num_mem or 0
         for i in self.actions: 
             if i in allows_lw_mem and len(allows_lw_mem[i]) == 0: allows_lw_mem.pop(i)
-        assert all(len(v) == self.max_mem for v in allows_lw_mem.values()), \
+        assert all(len(v) == self.max_reg for v in allows_lw_mem.values()), \
             "Not all lw_mem actions have the same number of allowed actions."
         for i in self.actions: 
             if i in allows_sw_mem and len(allows_sw_mem[i]) == 0: allows_sw_mem.pop(i)
-        assert all(len(v) == self.max_mem for v in allows_sw_mem.values()), \
+        assert all(len(v) == self.max_reg for v in allows_sw_mem.values()), \
             "Not all sw_mem actions have the same number of allowed actions."
 
         # finally, compute initial masks

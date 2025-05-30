@@ -45,7 +45,9 @@ class Node:
     @property
     def children_values(self) -> np.ndarray:
         """Return array of values of visited children."""
-        return np.array([c.value for c in self.children.values()])
+        vals = [c.value for c in self.children.values()]
+        print(vals)
+        return np.array(vals)
     
     @property
     def children_priors(self) -> np.ndarray:
@@ -90,8 +92,9 @@ class NodeContainer():
     def values(self) -> Generator[Node, None, None]:
         return self.nodes.values()
 
-
+@dataclasses.dataclass
 class DvNode(Node):
+    _reward: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(3, dtype=np.float32))
     """Just like a Node, but rewards are 3D vectors."""
     def _make_children(self, num_kids):
         return DvNodeContainer(num_kids)
@@ -99,10 +102,12 @@ class DvNode(Node):
     @property
     def reward(self) -> np.ndarray:
         """Return the reward of this node."""
+        print('getting reward [0]', self._reward, 'shape', self._reward.shape)
         return self._reward[0]
     
     @reward.setter
     def reward(self, value) -> np.ndarray:
+        print('setting reward', value, 'shape', value.shape)
         self._reward = value
 
 # NOTE: unfortunately, python doesn't support generics in any meaningful way.
@@ -158,6 +163,7 @@ def mcts(
 
         # Replay the simulator until the current node and expand it.
         timestep = model.step(actions)
+        print('timestep reward:', timestep.reward)
         node.reward = timestep.reward if timestep.reward is not None else 0.
         node.terminal = timestep.last()
 
@@ -185,6 +191,7 @@ def mcts(
             # Accumulate the discounted return
             ret *= discount
             ret += node.reward
+            print('ret', ret, 'reward', node.reward)
 
             # Update the node.
             node.visit(ret)
