@@ -22,8 +22,10 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
 import numpy as np
+
 def positional_encoding(length, depth):
     """Adapted from https://www.tensorflow.org/text/tutorials/transformer"""
+    logger.debug("[re]computing positional encoding for length %d and depth %d", length, depth)
     depth = depth/2
 
     positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
