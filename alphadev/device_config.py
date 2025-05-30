@@ -41,7 +41,7 @@ class DeviceAllocationConfig:
     
     def _compute_network_size(self, batch_size: int = 1) -> int:
         """Compute the size of the network in bytes."""
-        from .network import NetworkFactory
+        from .network import NetworkFactory, make_input_spec
         from .environment import EnvironmentFactory
         print("Computing network size...")
         # create a new tf session temporarily to containerize this computation
@@ -49,9 +49,9 @@ class DeviceAllocationConfig:
         if gpus:
             print("Using GPU for network size computation.")
             tf.config.experimental.set_memory_growth(gpus[0], True)
-            network = NetworkFactory(self.config)(None)
             env = EnvironmentFactory(self.config)()
             env_spec = make_environment_spec(env)
+            network = NetworkFactory(self.config)(make_input_spec(env_spec.observations))
             tf2_utils.create_variables(
                 network, [env_spec.observations],
                 batch_size=batch_size,

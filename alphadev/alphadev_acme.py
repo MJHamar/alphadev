@@ -17,7 +17,7 @@ from .agents import MCTS, DistributedMCTS # copied from github (not in the dm-ac
 
 from .config import AlphaDevConfig
 from .search import PUCTSearchPolicy
-from .network import AlphaDevNetwork, NetworkFactory
+from .network import AlphaDevNetwork, NetworkFactory, make_input_spec
 from .environment import AssemblyGame, AssemblyGameModel, EnvironmentFactory, ModelFactory
 from .service.variable_service import VariableService
 
@@ -75,7 +75,7 @@ def make_agent(config: AlphaDevConfig):
     else:
         cfg_logger = config.logger_factory()
         return MCTS(
-            network=net_factory(None),
+            network=net_factory(make_input_spec(env_spec.observations)),
             model=mod_factory(None),
             optimizer=opt_factory(),
             n_step=config.n_step,

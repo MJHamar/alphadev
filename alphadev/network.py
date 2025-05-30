@@ -8,7 +8,10 @@ import sonnet as snn
 import tensorflow as tf
 import ml_collections
 import functools
-from acme.specs import DiscreteArray
+from acme.specs import Array, DiscreteArray
+from dm_env import Environment
+import tree
+
 
 from .config import AlphaDevConfig
 from .utils import TaskSpec, CPUState
@@ -16,7 +19,7 @@ from .distribution import DistributionSupport
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 import numpy as np
 def positional_encoding(length, depth):
@@ -43,7 +46,7 @@ class PositionalEmbedding(snn.Module):
         self.length = seq_size
         self.pos_encoding = positional_encoding(length=seq_size, depth=feat_size)
 
-    def call(self, x):
+    def __call__(self, x):
         length = tf.shape(x)[1]
         # This factor sets the relative scale of the embedding and positonal_encoding.
         x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
@@ -679,7 +682,7 @@ class AlphaDevNetwork(snn.Module):
             prediction.value,
         )
     
-    def __init__(self, hparams, task_spec,
+    def __init__(self, hparams, task_spec, input_signature,
                  name: str = 'AlphaDevNetwork'):
         super().__init__(name=name)
         self._hparams = hparams
@@ -702,17 +705,35 @@ class AlphaDevNetwork(snn.Module):
             if hparams.categorical_value_loss else
             self._return_without_reward_logits
         )
+        self.forward = tf.function(
+            self.inference, input_signature=[input_signature], jit_compile=True
+        )
     
-    def __call__(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
+    def inference(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
         """Computes and returns the policy and value logits for the AZLearner."""
-        logger.debug("AlphaDevNetwork: inputs %s", str({k:v.shape for k,v in inputs.items()}))
+        logger.debug("AlphaDevNetwork [retracing]: inputs %s", str({k:v.shape for k,v in inputs.items()}))
         # inputs is the observation dict
         embedding: tf.Tensor = self._representation_net(inputs)
         # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
         prediction: NetworkOutput = self._prediction_net(embedding)
         # logger.debug("AlphaDevNetwork: prediction obtained")
         return self._return_fn(prediction)
+    
+    def __call__(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
+        """Alias for inference."""
+        return self.inference(inputs)
+
+def make_input_spec(observation_spec) -> DiscreteArray:
+    # observation_spac is possibly a nested dict of dm_env.specs.Array type.
+    # we want to convert them to TensorSpec
+    def process_leaf(leaf: Array) -> tf.TensorSpec:
+        return tf.TensorSpec(
+            shape=leaf.shape, dtype=leaf.dtype, name=leaf.name
+        )
+    return tree.map_structure(
+        process_leaf, observation_spec
+    )
 
 class NetworkFactory:
     def __init__(self, config: AlphaDevConfig): self._hparams = config.hparams; self._task_spec = config.task_spec
-    def __call__(self, _: DiscreteArray): return AlphaDevNetwork(hparams=self._hparams, task_spec=self._task_spec)
+    def __call__(self, spec: DiscreteArray, name:str='AlphaDevNetwork'): return AlphaDevNetwork(hparams=self._hparams, task_spec=self._task_spec, input_signature=spec, name=name)

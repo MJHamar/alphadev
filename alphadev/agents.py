@@ -45,6 +45,7 @@ from uuid import uuid4 as uuid
 
 import numpy as np
 from .dual_value_az import DualValueAZLearner, DualValueMCTSActor
+from .network import NetworkFactory, make_input_spec
 from .acting import MCTSActor
 from .search import PUCTSearchPolicy
 from .observers import MCTSObserver
@@ -289,7 +290,7 @@ class DistributedMCTS:
                 logger: loggers.Logger):
         """The learning part of the agent."""
         # Create the networks.
-        network = self._network_factory(self._env_spec.actions)
+        network = self._network_factory(make_input_spec(self._env_spec.observations))
         print('learner network created')
         tf2_utils.create_variables(network, [self._env_spec.observations])
         print('learner make dataset server_address:', replay.server_address)
@@ -345,7 +346,7 @@ class DistributedMCTS:
         network = inference
         variable_client = None
         if inference is None:
-            network = self._network_factory(self._env_spec.actions)
+            network = self._network_factory(self._env_spec.observations)
             # If no inference client is provided, we create a new network.
             tf2_utils.create_variables(network, [self._env_spec.observations])
             # also create the variable service
