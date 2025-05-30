@@ -18,6 +18,38 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+import numpy as np
+def positional_encoding(length, depth):
+    """Adapted from https://www.tensorflow.org/text/tutorials/transformer"""
+    depth = depth/2
+
+    positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
+    depths = np.arange(depth)[np.newaxis, :]/depth   # (1, depth)
+
+    angle_rates = 1 / (10000**depths)         # (1, depth)
+    angle_rads = positions * angle_rates      # (pos, depth)
+
+    pos_encoding = np.concatenate(
+        [np.sin(angle_rads), np.cos(angle_rads)],
+        axis=-1) 
+
+    return tf.cast(pos_encoding, dtype=tf.float32)
+
+class PositionalEmbedding(snn.Module):
+    """Adapted from https://www.tensorflow.org/text/tutorials/transformer"""
+    def __init__(self, seq_size, feat_size):
+        super().__init__()
+        self.d_model = feat_size
+        self.length = seq_size
+        self.pos_encoding = positional_encoding(length=seq_size, depth=feat_size)
+
+    def call(self, x):
+        length = tf.shape(x)[1]
+        # This factor sets the relative scale of the embedding and positonal_encoding.
+        x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
+        x = x + self.pos_encoding[tf.newaxis, :length, :]
+        return x
+
 class MultiQueryAttentionBlock(snn.Module):
     """Attention with multiple query heads and a single shared key and value head.
 
@@ -42,7 +74,6 @@ class MultiQueryAttentionBlock(snn.Module):
             self.attention_dropout = snn.Dropout(self.attention_dropout, name='attn_dropout')
         else:
             self.attention_dropout = None
-        
     
     def __call__(self, inputs, encoded_state=None):
         """
@@ -100,25 +131,10 @@ class MultiQueryAttentionBlock(snn.Module):
         
         return Y # B x N x D
     
-    @staticmethod
-    def sinusoid_position_encoding(seq_size, feat_size):
+    def sinusoid_position_encoding(self, seq_size, feat_size):
         """Compute sinusoid absolute position encodings, 
         given a sequence size and feature dimensionality"""
-        # SOURCE: https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/JAX/tutorial6/Transformers_and_MHAttention.html
-        pe = tf.zeros((seq_size, feat_size), dtype=tf.float32)
-        position = tf.range(0, seq_size, dtype=tf.float32)[:, None]
-        div_term = tf.exp(tf.range(0, feat_size, 2, dtype=tf.float32) * (-tf.math.log(10000.0) / feat_size))
-        tf.tensor_scatter_nd_update(
-            pe, 
-            indices=tf.range(0, feat_size, 2)[:, None],
-            updates=tf.sin(position * div_term)
-        )
-        tf.tensor_scatter_nd_update(
-            pe,
-            indices=tf.range(1, feat_size, 2)[:, None],
-            updates=tf.cos(position * div_term)
-        )
-        return tf.expand_dims(pe, axis=0) # [1, seq_size, feat_size]
+        return self.encoder(seq_size, feat_size)
 
 class ResBlockV2(snn.Module):
     """Layer-normed variant of the block from https://arxiv.org/abs/1603.05027.
@@ -252,6 +268,9 @@ class RepresentationNet(snn.Module):
         self._hparams = hparams
         self._task_spec = task_spec
         self._embedding_dim = embedding_dim
+        
+        seq_size, feat_size = task_spec.max_program_size, embedding_dim
+        self.positional_embedding = PositionalEmbedding(seq_size, feat_size)
         
         self.program_mlp_embedder = snn.Sequential(
             [
@@ -470,15 +489,7 @@ class RepresentationNet(snn.Module):
             f"program encoding dim {d} does not match embedding dim {self._embedding_dim}"
         ) 
 
-        *_, seq_size, feat_size = program_encoding.shape
-
-        position_encodings = tf.broadcast_to(
-            MultiQueryAttentionBlock.sinusoid_position_encoding(
-                seq_size, feat_size
-            ),
-            program_encoding.shape,
-        )
-        program_encoding = tf.add(program_encoding, position_encodings)
+        program_encoding = self.positional_embedding(program_encoding)
 
         program_encoding = self.attention_encoders(program_encoding)
 
