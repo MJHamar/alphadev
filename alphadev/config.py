@@ -258,3 +258,10 @@ class search_observer_factory:
     
 def make_observer_factories(config: AlphaDevConfig):
     return env_observer_factory(config), search_observer_factory(config)
+
+import sys
+if len(sys.argv) > 1:
+    ADConfig = AlphaDevConfig.from_yaml(sys.argv[1])
+else:
+    ADConfig = AlphaDevConfig()
+print(f"Loaded AlphaDevConfig: {ADConfig.experiment_name}")
