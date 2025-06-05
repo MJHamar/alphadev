@@ -12,6 +12,8 @@ import contextlib
 import tree
 
 from .environment import AssemblyGame, AssemblyGameModel
+from .inference_service import InferenceTask, InferenceResult, AlphaDevInferenceService
+from .shared_memory import *
 from .config import ADConfig
 
 
@@ -19,86 +21,6 @@ from .config import ADConfig
 # but we do need to re-initialize it.
 # so that it is with 100% certainty that addresses we didn't touch are zeroed out.
 # hence no need to worry about whether a node is being created or is already there.
-
-class ArrayElement(NamedTuple):
-    dtype: np.dtype
-    shape: tuple
-    def size(self, *args, **kwargs):
-        return np.dtype(self.dtype).itemsize * np.prod(self.shape)
-    def create(self, shm, offset, *args, **kwargs):
-        return np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf, offset=offset)
-
-class VarLenArrayElement(ArrayElement):
-    def size(self, length, *args, **kwargs):
-        return np.dtype(self.dtype).itemsize * np.prod((length, *self.shape))
-    def create(self, shm, offset, length, *args, **kwargs):
-        return np.ndarray((length, *self.shape), dtype=self.dtype, buffer=shm.buf, offset=offset)
-
-class NestedArrayElement(ArrayElement):
-    model: Union[Dict, NamedTuple]
-    def size(self, *args, **kwargs):
-        return sum(element.nbytes for element in self.model.values())
-    def create(self, shm, offset, *args, **kwargs):
-        elements = {}
-        crnt_offset = offset
-        for name, element in self.model.items():
-            elements[name] = np.ndarray(element.shape, dtype=element.dtype, buffer=shm.buf, offset=crnt_offset)
-            crnt_offset += element.nbytes
-        if isinstance(self.model, dict):
-            return elements
-        elif isinstance(self.model, NamedTuple):
-            return self.model._make(**elements)
-
-class BlockLayout:
-    _elements: Dict[ArrayElement] = {}
-    
-    def __init__(self, shm, offset, *args, **kwargs):
-        self.shm = shm
-        self.offset = offset
-        self._create_elements(*args, **kwargs)
-    
-    def _create_elements(self, *args, **kwargs):
-        crnt_offset = self.offset
-        for name, element_spec in self.__class__._elements.items():
-            setattr(self, name, element_spec.create(self.shm, crnt_offset, *args, **kwargs))
-            crnt_offset += element_spec.size()
-    
-    def write(self, **kwargs):
-        """
-        Write the given values to the block.
-        The values should be provided as keyword arguments, where the keys are the names of the elements.
-        """
-        for name, value in kwargs.items():
-            if hasattr(self, name):
-                element = getattr(self, name)
-                if isinstance(element, np.ndarray):
-                    element[:] = value
-                else:
-                    raise ValueError(f"Element {name} is not a numpy array.")
-            else:
-                raise ValueError(f"Element {name} does not exist in the block.")
-    
-    def read(self):
-        """Create a localized namedtuple with the conteents of the block."""
-        return namedtuple(self.__class__.__name__, self.__class__._elements.keys())(
-            **{name: getattr(self, name).copy() for name in self.__class__._elements.keys()}
-        )
-    
-    @classmethod
-    def clear_block(cls, shm, offset, *args, **kwargs):
-        """
-        Initialize a block of shared memory at the given offset.
-        """
-        for element_spec in cls._elements.values():
-            element = element_spec.create(shm, offset, *args, **kwargs)
-            tree.map_structure(lambda x: x.fill(0), element)
-
-    @classmethod
-    def get_block_size(cls, *args, **kwargs):
-        """
-        Get the size of the block in bytes.
-        """
-        return sum(element.size(*args, **kwargs) for element in cls._elements.values())
 
 class Node(BlockLayout):
     """
@@ -206,155 +128,6 @@ class Node(BlockLayout):
     
     def set_reward(self, reward):
         self.parent.R[self.action_id] = reward
-
-class InferenceTask(BlockLayout):
-    _elements = {
-        'node_offset': ArrayElement(np.int32, ()),  # offset of the node in the shared memory, needed for expansion/backpropagation
-        'observation': NestedArrayElement(model=AssemblyGame(ADConfig.task_spec).observation_spec()),
-    }
-
-class InferenceResult(BlockLayout):
-    _elements = {
-        'node_offset': ArrayElement(np.int32, ()),  # offset of the node in the shared memory, needed for expansion/backpropagation
-        'prior': ArrayElement(np.float32, (ADConfig.task_spec.num_actions,)),  # prior probabilities of actions
-        'value': ArrayElement(np.float32, ()),  # **SCALAR** value estimate of the node
-    }
-
-class BufferHeader(BlockLayout):
-    _elements = {
-        'in_index': ArrayElement(np.int32, ()),  # index of the next block to be used
-        'out_index': ArrayElement(np.int32, ()),  # index of the next block to be used
-        'submitted': VarLenArrayElement(np.bool_, ()), # boolean mask of submitted blocks
-        'ready': VarLenArrayElement(np.bool_, ()),  # boolean mask of ready blocks
-    }
-
-class IOBuffer:
-    """The IOBuffer handles asynchronous communication between processes.
-    It creates two blocks of shared memory one  for input and one for output.
-    The input block is used to enqueue tasks and the output block is where the results are written.
-    The buffer is lock-free and uses a circular buffer approach.
-    
-    1. A process can request a new block for input by calling `next()`.
-        the process will receive a BlockLayout object to write its task data into.
-    2. The process writes its task data into the input block and calls `submit()`.
-    3. Consumer process reads the input block and processes the task. it also clears the submitted flag for that block.
-    4. Once the task is processed, the consumer writes the result into the output block and calls the ready() function.
-    5. Other processes can then poll() the ready output blocks and read the results.
-    """
-    def __init__(self, num_blocks, input_element: BlockLayout, output_element: BlockLayout, name: str = 'IOBuffer'):
-        self._header_size = BufferHeader.get_block_size(length=num_blocks)
-        self._header_name = f'{name}_header'
-
-        self._input_size = num_blocks * input_element.get_block_size()
-        self._input_name = f'{name}_input'
-        
-        self._output_size = num_blocks * output_element.get_block_size()
-        self._output_name = f'{name}_output'
-        
-        self._input_element_cls = input_element
-        self._output_element_cls = output_element
-        self._num_blocks = num_blocks
-        self._lock = mp.Lock()  # to ensure atomicity of index updates
-        self._header.in_index = 1
-        self._header.out_index = 1
-        self._is_main = False
-    
-    def configure(self):
-        """To be called by the parent process to allocate shared memory blocks."""
-        self._is_main = True
-        self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=True, size=self._header_size)
-        self._header = BufferHeader(self._header_shm, 0, length=self.num_blocks)
-        self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=True, size=self._input_size)
-        self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=True, size=self._output_size)
-        
-        self.reset()  # clear the header and input/output blocks
-    
-    def reset(self):
-        assert self._is_main, "reset() should only be called in the main process."
-        # clear the header and input/output blocks
-        BufferHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
-        for i in range(self.num_blocks):
-            self.input_element.clear_block(self._input_shm, self._header_size + i * self._input_size)
-            self.output_element.clear_block(self._output_shm, self._header_size + i * self._output_size)
-    
-    def attach(self):
-        self._is_main = False
-        self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
-        self._header = BufferHeader(self._header_shm, 0, length=self.num_blocks)
-        self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=False, size=self._input_size)
-        self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=False, size=self._output_size)
-
-    def __del__(self):
-        """Clean up shared memory blocks in the main process."""
-        if not self._is_main:
-            return
-        if hasattr(self, '_header_shm'):
-            self._header_shm.close()
-            self._header_shm.unlink()
-        if hasattr(self, '_input_shm'):
-            self._input_shm.close()
-            self._input_shm.unlink()
-        if hasattr(self, '_output_shm'):
-            self._output_shm.close()
-            self._output_shm.unlink()
-    
-    def _next_in(self):
-        with self._lock:
-            self._header.in_index = (self._header.in_index + 1) % self._num_blocks
-            index = self._header.in_index
-            assert not self._header.submitted[index], "Circular input buffer full."
-        return index
-    def _next_out(self):
-        with self._lock:
-            self._header.out_index = (self._header.out_index + 1) % self._num_blocks
-            index = self._header.out_index
-            assert not self._header.ready[index], "Circular output buffer full."
-        return index
-    
-    def submit(self, **payload):
-        index = self._next_in()
-        iblock = self._input_element_cls(self._input_shm, index * self._input_size)
-        iblock.write(**payload)
-        self._header.submitted[index] = True
-    
-    def ready(self, payload_list: List[Dict[str, np.ndarray]]):
-        for payload in payload_list:
-            index = self._next_out()
-            oblock = self._output_element_cls(self._output_shm, index * self._output_size)
-            oblock.write(**payload)
-            self._header.ready[index] = True
-    
-    def poll_submitted(self, max_samples:int):
-        """
-        Linear search once through the submitted blocks.
-        Appends the first `max_samples` blocks that are ready to be processed.
-        """
-        idx = 0
-        inp = []
-        while idx < self._num_blocks and len(inp) < max_samples:
-            if self._header.submitted[idx]:
-                # read the output block and localize its contents. 
-                iblock = self._input_element_cls(self._input_shm, idx * self._input_size)
-                inp.append(iblock.read())
-                self._header.submitted[idx] = False  # clear the ready flag
-            # increment the index
-            idx += 1
-        return inp
-
-    def poll_ready(self, timeout=None):
-        start = time()
-        idx = 0
-        while timeout is None or time() - start > timeout:
-            if self._header.ready[idx]:
-                break
-            idx = (idx + 1) % self._num_blocks
-        else:
-            return None # timeout reached.
-        # read the output block and localize its contents. 
-        oblock = self._output_element_cls(self._output_shm, idx * self._output_size)
-        output = oblock.read()
-        self._header.ready[idx] = False  # clear the ready flag
-        return output
 
 class SharedTreeHeader(BlockLayout):
     _elements = {
@@ -505,7 +278,7 @@ class APV_MCTS(object):
     def __init__(self,
             model,
             search_policy,
-            evaluation,
+            network_factory,
             num_simulations,
             num_actions,
             discount,
@@ -514,11 +287,12 @@ class APV_MCTS(object):
             node_class: Node = Node,
             batch_size: int = 1,
             inference_buffer_size: int = None,
+            network_factory_args=(),
+            network_factory_kwargs={},
+            name:str='apv-mcts' # needs to be specified is multiple instances are used.
         ):
         self.model = model # a (learned) model of the environment.
         self.search_policy = search_policy # a function that takes a node and returns an action to take.
-        self.evaluation_fn = evaluation # a function that takes an observation and returns a prior and value estimate.
-        self.batch_size = batch_size  # number of samples to process in a single inference call
         self.num_simulations = num_simulations  # number of simulations to run per search
         self.num_actions = num_actions  # number of actions in the environment [a noop, we know this from ADConfig already]
         self.discount = discount  # discount factor for the value estimate
@@ -528,14 +302,16 @@ class APV_MCTS(object):
         self.dirichlet_alpha = dirichlet_alpha  # alpha parameter for the Dirichlet noise
         self.exploration_fraction = exploration_fraction  # fraction of the prior to add Dirichlet noise to
         
-        # declare shared memory
+        # declare shared memory ( no init )
         self.tree = SharedTree(num_blocks=num_simulations, node_cls=node_class)
-        # TODO: this can be optional.
-        self.inference_buffer = IOBuffer(
+        # TODO: this could be optional; and each process can have its own network instance instead.
+        self.inference_buffer = AlphaDevInferenceService(
             num_blocks=self.inference_buffer_size,
-            input_element=InferenceTask,
-            output_element=InferenceResult,
-            name='APV_MCTS_IOBuffer'
+            network_factory=network_factory,
+            batch_size=batch_size,
+            factory_args=network_factory_args,
+            factory_kwargs=network_factory_kwargs,
+            name=f'{name}.inference'
         )
         
         self._init_root()
@@ -562,7 +338,7 @@ class APV_MCTS(object):
         prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
 
         self.root.expand(prior, value, legal_actions)
-    
+
 def _select_and_simulate(
     root: Node, search_policy, tree: SharedTree,
     inference_buffer: IOBuffer,
@@ -593,33 +369,9 @@ def _select_and_simulate(
         node_offset=new_node.offset,
         observation=observation
     )
-    
-def _evaluate(
-    inference_buffer: IOBuffer, network: AssemblyGameModel,
-    batch_size: int, timeout: float = None
-):
-    """Wait for the inference result and update the node with the value estimate."""
-    # TODO: batch inference
-    task: InferenceTask = inference_buffer.poll_submitted(
-        max_samples=batch_size ,timeout=timeout)
-    if not task:
-        return
-    node_offset = task.node_offset # list of node offsets to update
-    observation = task.observation # list of observations to evaluate
-    def stack_requests(*requests):
-        return tf.stack(requests, axis=0)
-    observation = tree.map_structure(stack_requests, *observation)
-    prior, value = network(observation)
-    inference_buffer.ready(
-        [InferenceResult(
-            node_offset=off,
-            prior=p,
-            value=v
-        ) for off, p, v in zip(node_offset, prior, value)]
-    )
 
 def _backpropagate(
-    inference_buffer: IOBuffer, 
+    inference_buffer: IOBuffer,
     tree: SharedTree,
     discount: float = 1.0,
     timeout: float = None
