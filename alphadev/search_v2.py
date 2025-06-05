@@ -94,6 +94,7 @@ class Node(BlockLayout):
     
     @property
     def parent(self) -> 'Node':
+        assert not self.is_root, "Trying to access the parent of the Root!"
         return self.__class__(self.shm, self.parent_offset)
     @property
     def value(self):
@@ -117,7 +118,10 @@ class Node(BlockLayout):
     def set_terminal(self, terminal): self.header[self.__class__.hdr_terminal] = terminal
     @property
     def is_root(self):       return self.header[self.__class__.hdr_action] == -1
-    def set_root(self):      self.header[self.__class__.hdr_action] = -1
+    def set_root(self):
+        self.header[self.__class__.hdr_parent] = -1
+        self.header[self.__class__.hdr_action] = -1
+        self.header[self.__class__.hdr_terminal] = False
     
     def set_parent(self, parent_offset, action):
         self.header[self.__class__.hdr_parent] = parent_offset
@@ -132,14 +136,6 @@ class Node(BlockLayout):
 class SharedTreeHeader(BlockLayout):
     _elements = {
         'index': ArrayElement(np.int32, ()),  # index of the next block to be used
-        'index_pid': ArrayElement(np.int32, (ADConfig.num_actors)),  # buffer of failed attempts to write to the tree
-        'active_indices': VarLenArrayElement(np.bool_, ()),  # indices of active processes
-    }
-
-class SharedTreePathsNode(BlockLayout):
-    _elements = {
-        'pid': ArrayElement(np.int32, ()),  # process id of the process that owns this node
-        'children_offsets': ArrayElement(np.int32, (ADConfig.task_spec.num_actions,)),  # offsets of the children nodes in the shared memory
     }
 
 class SharedTree:
@@ -163,27 +159,25 @@ class SharedTree:
     """
     def __init__(self, num_blocks, node_cls: Node, name: str = 'SharedTree'):
         self.num_blocks = num_blocks
+        self._node_cls = node_cls
+        # declare shared memory regions
         self._header_size = SharedTreeHeader.get_block_size(length=num_blocks)
         self._header_name = f'{name}_header'
         
-        self._paths_size = num_blocks * SharedTreePathsNode.get_block_size()
-        self._paths_name = f'{name}_paths'
-        
         self._data_size = num_blocks * node_cls.get_block_size()
         self._data_name = f'{name}_data'
-        self._header = SharedTreeHeader(self._header_shm, 0, length=num_blocks)
-        self._paths_root = SharedTreePathsNode(self._paths_shm, 0)
-        self._data_root = node_cls(self._data_shm, 0)
-        self._node_cls = node_cls
-        self._is_main = False
         
+        # shared between processes
         self._lock = mp.Lock()  # to ensure atomicity of index updates
+        # process-local
+        self._is_main = False
+        self._local_write_head = None
     
     def configure(self):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
         self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=True, size=self._header_size)
-        self._paths_shm = mp.shared_memory.SharedMemory(name=self._paths_name, create=True, size=self._paths_size)
+        self._header = SharedTreeHeader(self._header_shm, 0)
         self._data_shm = mp.shared_memory.SharedMemory(name=self._data_name, create=True, size=self._data_size)
         
         self.reset()  # clear the header and input/output blocks
@@ -192,55 +186,61 @@ class SharedTree:
         assert self._is_main, "reset() should only be called in the main process."
         SharedTreeHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
         for i in range(self.num_blocks):
-            SharedTreePathsNode.clear_block(self._paths_shm, self._header_size + i * SharedTreePathsNode.get_block_size())
             self._node_cls.clear_block(self._data_shm, self._header_size + i * self._node_cls.get_block_size())
     
     def attach(self):
         self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
-        self._paths_shm = mp.shared_memory.SharedMemory(name=self._paths_name, create=False, size=self._paths_size)
         self._data_shm = mp.shared_memory.SharedMemory(name=self._data_name, create=False, size=self._data_size)
     
     def _update_index(self):
-        pid = mp.current_process().pid
-        if self.header.active_indices[pid]:
-            return self.header.active_indices[pid]
-        # if index is no longer active (it was used to write a node)
-        # find the next available index
         with self._lock:
-            index = self._header.index
+            index = self._header.index[0]
             if index >= self.num_blocks:
-                return -1  # no more blocks available
-            self._header.index += 1
-        self._header.index_pid[pid] = index
-        return index
+                self._local_write_head = None # we are done
+            else:
+                self._local_write_head = index
+                self._header.index[0] += 1
+        return self._local_write_head
     
-    def get_next_block(self, path:List[int]):
-        index = self._update_index()
-        crnt_node = self._paths_root
-        for action in path[:-1]:
-            crnt_node = SharedTreePathsNode(self._paths_shm, crnt_node.children_offsets[action])
-        # now we are at the parent node, try to write the new node
-        # first check if it exists
-        if crnt_node.children_offsets[path[-1]] != 0:
-            # node already exists, this attempt failed.
+    def fail(self):
+        """We didn't manage to write, try again next time to the same block."""
+        pass
+
+    def succeed(self):
+        """We successfully wrote to the block, we can find the next block."""
+        self._local_write_head = self._update_index()
+    
+    def append_child(self, parent_offset: int, action: int) -> Union[Node, None]:
+        """
+        Attempt to append a child node to the parent node by
+        first writing the offset corresponding to the 
+            current write head to the parent node's children array
+        then writing the parent's offset and action id to the child node's header
+        finally checking if the write to the parent was successful.
+        if yes, succeed() else fail().
+        
+        Multiple processes may attempt to write to the same parent node at 
+        the same time and we do not lock the tree for this operation.
+        This way, we be almost certain that the tree will stay consistent.
+        Losing one or two children due to race conditions is acceptable.
+        """
+        child_offset = self._header_size + self._local_write_head * self._data_size
+        parent = self._node_cls(self._data_shm, parent_offset)
+        parent.children[action] = child_offset
+        # now write the parent offset and action id to the child node's header
+        child: Node = self._node_cls(self._data_shm, child_offset)
+        child.set_parent(parent_offset, action)
+        # now check if the write was successful
+        if parent.children[action] == child_offset:
+            self.succeed()
+            return child
+        else:
+            self.fail()
             return None
-        # otherwise, reserve a new block for this node
-        new_node_offset = self._header_size + index * SharedTreePathsNode.get_block_size()
-        crnt_node.children_offsets[path[-1]] = new_node_offset
-        # now write the process id to the new node
-        new_node = SharedTreePathsNode(self._paths_shm, new_node_offset)
-        pid = current_process().pid
-        if crnt_node.children_offsets[path[-1]] != index:
-            # this atttempt failed and we need to restart
-            return None # TODO: distinguish
-        new_node.pid = pid
-        # check parent-node alignment
-        if new_node_offset != crnt_node.children_offsets[path[-1]] or new_node.pid != pid:
-            # this atttempt failed and we need to restart
-            return None
-        # otherwise, we successfully reserved a new block for this node
-        # now we can return the new node offset
-        return index
+        
+    def get_root(self) -> Node:
+        """Return the root node, at offset 0."""
+        return self._node_cls(self._data_shm, 0)
 
 class APV_MCTS(object):
     """
@@ -303,7 +303,7 @@ class APV_MCTS(object):
         self.exploration_fraction = exploration_fraction  # fraction of the prior to add Dirichlet noise to
         
         # declare shared memory ( no init )
-        self.tree = SharedTree(num_blocks=num_simulations, node_cls=node_class)
+        self.tree = SharedTree(num_blocks=num_simulations, node_cls=node_class, name=f'{name}.tree')
         # TODO: this could be optional; and each process can have its own network instance instead.
         self.inference_buffer = AlphaDevInferenceService(
             num_blocks=self.inference_buffer_size,
@@ -314,104 +314,134 @@ class APV_MCTS(object):
             name=f'{name}.inference'
         )
         
-        self._init_root()
-        self.pool = mp.Pool(processes=ADConfig.num_actors)
+        # TODO: make optional
+        self.actor_pool = mp.Pool(processes=ADConfig.num_actors, initializer=self._init_actor)
+        self.inference_process = mp.Process(target=self._init_inference, name=f'{name}.inf_proc')
+        self.inference_process.run()
+        self._init_main()
     
     def __call__(observation):
         with contextlib.ExitStack() as stack:
             pass
     
-    def _init_root(self):
+    def _init_main(self):
         """
         Initialize the root node of the search tree.
         The root node is a special node that is not expanded and has no parent.
         It is created in the shared memory and its attributes are set to zero.
         """
-        prior, value = self.evaluation_fn(self.observation)
-        legal_actions = self.model.legal_actions()
+        # we can also test the inference service here 
+        # TODO: handle case where inference is not a process
+        self.inference_buffer.configure()
+        self.tree.configure()
+        self.inference_process.run() # start the inference process here.
+    
+    def _search(self, observation):
+        # TODO: support only partially resetting the tree.
+        self.tree.reset()
         
-        self.root = self.node_cls(self.shm, 0, self.num_actions)
-        self.root.set_root()
+        self.inference_buffer.submit(observation)
+        
+        with self.inference_buffer.poll_ready() as inference_result:
+            prior, value = inference_result
         
         # Add exploration noise to the prior.
         noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
         prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
+        
+        legal_actions = self.model.legal_actions()
+        
+        self.root: Node = self.tree.get_root()
+        self.root.set_root()
+        self.root.set_legal_actions(legal_actions)
 
-        self.root.expand(prior, value, legal_actions)
+        self.root.expand(prior, value)
+        
+        # all that is left is to start the pool.
+        self.actor_pool.map(self._rollout, range(self.num_simulations))
 
-def _select_and_simulate(
-    root: Node, search_policy, tree: SharedTree,
-    inference_buffer: IOBuffer,
-    model: AssemblyGameModel
-    ):
-    node = root; parent_node = None
-    actions = []
-    while node.expanded:
-        action = search_policy(node)
-        actions.append(action)
-        parent_node = node
-        node = node.select(action) # increment virtual loss
-    # before simulating, reserve a new block for this node.
-    new_node: Node = tree.get_next_block(actions) # pass the path to make sure only one block is reserved for this node.
-    if not new_node:
-        return # nothing to do.
-    # otherwise, run the simulation and schedule an evaluation
-    # first set parent
-    new_node.set_parent(parent_node.offset, actions[-1])
-    # then run the simulation update the node with the results
-    timestep = model.step(actions, update=False)
-    new_node.set_legal_actions(model.legal_actions())
-    new_node.set_reward(timestep.reward)
-    new_node.set_terminal(timestep.final())
+    def _init_actor(self):
+        """To be called from a subprocess"""
+        self.tree.attach()
+        self.inference_buffer.attach()
     
-    observation = timestep.observation
-    inference_buffer.submit(
-        node_offset=new_node.offset,
-        observation=observation
-    )
+    def _init_inference(self):
+        """To be called from a subprocess"""
+        self.inference_buffer.attach()
+        # run indefinitely
+        self.inference_buffer.run()
 
-def _backpropagate(
-    inference_buffer: IOBuffer,
-    tree: SharedTree,
-    discount: float = 1.0,
-    timeout: float = None
-    ):
-    result: InferenceResult = inference_buffer.poll_ready(timeout=timeout)
-    if not result:
-        return
-    node_offset = result.node_offset
-    prior = result.prior
-    value = result.value
-    
-    node = tree.get_node(node_offset)
-    node.expand(prior, value) # reward, legal_actions and terminal are already set
+    def _select_and_simulate(self):
+        node = self.root; parent_node = None
+        actions = []
+        while node.expanded:
+            action = self.search_policy(node)
+            actions.append(action)
+            parent_node = node
+            node = node.select(action) # increment virtual loss
+        # before simulating, initialize the new node.
+        new_node: Node = tree.append_child(parent_node.offset, actions[-1]) # pass the path to make sure only one block is reserved for this node.
+        if new_node is None:
+            return False # Try again.
+        # otherwise, run the simulation and schedule an evaluation
+        # first set parent
+        new_node.set_parent(parent_node.offset, actions[-1])
+        # then run the simulation update the node with the results
+        timestep = self.model.step(actions, update=False)
+        new_node.set_legal_actions(self.model.legal_actions())
+        new_node.set_reward(timestep.reward)
+        new_node.set_terminal(timestep.final())
+        
+        observation = timestep.observation
+        self.inference_buffer.submit(
+            node_offset=new_node.offset,
+            observation=observation
+        )
+        return True  # we successfully submitted the task for evaluation
 
-    ret = value
-    while not node.is_root:
-        node = node.parent
-        ret *= discount
-        ret += node.reward
+    def _backpropagate(
+        inference_buffer: IOBuffer,
+        tree: SharedTree,
+        discount: float = 1.0,
+        timeout: float = None
+        ):
+        result: InferenceResult = inference_buffer.poll_ready(timeout=timeout)
+        if not result:
+            return False # timeout happenned, we need to try again.
+        node_offset = result.node_offset
+        prior = result.prior
+        value = result.value
+        
+        node = tree.get_node(node_offset)
+        node.expand(prior, value) # reward, legal_actions and terminal are already set
 
-        node.visit(ret)
-    return True
+        ret = value
+        while not node.is_root:
+            node = node.parent
+            ret *= discount
+            ret += node.reward
 
-def _rollout(
-    root: Node, search_policy, tree: SharedTree,
-    inference_buffer: IOBuffer, model: AssemblyGameModel,
-):
-    """Run a single rollout from the root node.
-    with evaluation phase done in a separate process.
-    Return search statistics.
-    """
-    selection_tries = 0
-    while not _select_and_simulate(
-        root, search_policy, tree, inference_buffer, model):
-        selection_tries += 1
-    while not _backpropagate(
-        inference_buffer, tree, discount=model.discount, timeout=0.1):
-        backprop_tries += 1
-    return {
-        'selection_tries': selection_tries,
-        'backprop_tries': backprop_tries,
-    }
+            node.visit(ret)
+        return True
+
+    def _rollout(self, rollout_nr: int):
+        """
+        Run a single rollout from the root node.
+        with evaluation phase done in a separate process.
+        Return search statistics.
+        """
+        if self.local_write_head is None:
+            return { # tree buffer is full.
+                'rollout': rollout_nr,
+                'selection_tries':0, 'backprop_tries': 0} 
+        selection_tries = 0
+        while not self._select_and_simulate():
+            selection_tries += 1
+        while not self._backpropagate():
+            backprop_tries += 1
+        return {
+            'rollout': rollout_nr,
+            'selection_tries': selection_tries,
+            'backprop_tries': backprop_tries,
+        }
 
