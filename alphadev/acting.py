@@ -36,7 +36,7 @@ import tree
 
 from .observers import MCTSObserver
 from .search import visit_count_policy, mcts
-from .service.inference_service import InferenceClient
+from .inference_service import InferenceClient
 
 import logging
 logger = logging.getLogger(__name__)

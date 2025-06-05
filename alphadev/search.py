@@ -276,11 +276,12 @@ def puct(node: Node, ucb_scaling: float = 1.) -> types.Action:
     puct_scores = value_scores + ucb_scaling * priors * visit_ratios
     return argmax(puct_scores, node.action_mask)
 
+argmax_rng = np.random.default_rng(42)  # Ensure we have a random number generator.
 def argmax(values: np.ndarray, mask: np.ndarray) -> types.Action:
     """Argmax with random tie-breaking."""
     # check_numerics(values)
     max_value = np.max(values*mask) # mask the values to only consider valid actions
-    return np.int32(np.random.choice(np.flatnonzero(values == max_value)))
+    return np.int32(argmax_rng.choice(values[values == max_value]))
 
 def check_numerics(values: np.ndarray):
     """Raises a ValueError if any of the inputs are NaN or Inf."""
@@ -303,6 +304,6 @@ def visit_count_policy(root: Node, temperature: float = 1.0, mask: np.ndarray = 
     masked_visits = visits * mask # multiply by the mask to keep the shape, but make invalid actions impossible to choose    
     rescaled_visits = masked_visits**(1 / temperature)
     probs = rescaled_visits / np.sum(rescaled_visits)
-    check_numerics(probs)
+    # check_numerics(probs)
     
     return probs

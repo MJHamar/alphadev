@@ -52,7 +52,7 @@ from .observers import MCTSObserver
 from .service.service import Program, ReverbService, RPCService, RPCClient, SubprocessService
 from .config import AlphaDevConfig
 from .device_config import DeviceAllocationConfig
-from .service.inference_service import InferenceClient
+from .inference_service import InferenceClient
 from .service.variable_service import VariableService
 
 
