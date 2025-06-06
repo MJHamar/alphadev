@@ -1,0 +1,78 @@
+experiment_name: AlphaDev-sort3
+
+# Environment
+num_inputs: 17
+num_mem: 3
+num_regs: 6
+items_to_sort: 3
+correct_reward: 1.0
+correctness_reward_weight: 2.0
+latency_reward_weight: 0.5
+latency_quantile: 0.05
+num_latency_simulations: 1
+emulator_mode: 'i32'
+
+# Self-Play
+num_actors: 2
+num_simulations: 100
+
+# UCB formula
+pb_c_base: 19652
+pb_c_init: 1.25
+temperature_fn: visit_softmax_temperature_fn
+
+# Network architecture
+embedding_dim: 512
+representation_use_program: True
+representation_use_locations: True
+representation_use_locations_binary: False
+representation_use_permutation_embedding: False
+representation_repr_net_res_blocks: 8
+representation_attention_head_depth: 128
+representation_attention_num_heads: 4
+representation_attention_attention_dropout: False
+representation_attention_position_encoding: absolute
+representation_attention_num_layers: 6
+value_max: 30.0
+value_num_bins: 301
+categorical_value_loss: True
+
+# Training
+training_steps: 1000
+batch_size: 1024
+n_step: 5
+lr_init: 0.0002
+momentum: 0.9
+
+# single threaded training
+episode_accumulation_period: 2
+
+# Distributed training
+distributed: False
+prefetch_size: 4
+variable_update_period: 50
+target_update_period: 10
+samples_per_insert: 2
+min_replay_size: 100
+max_replay_size: 1000000
+importance_sampling_exponent: 0.2
+priority_exponent: 0.6
+redis_host: 'localhost'
+redis_port: 6379
+redis_db: 0
+inference_service_name: 'inference'
+variable_service_name: 'variable'
+inference_accumulation_period: 0.001
+device_config_path: './device_config.yaml'
+# Logging
+use_wandb: False
+wandb_project: alphadev
+wandb_entity: hamar_m
+wandb_tags: [sort3, alphadev, verification]
+wandb_notes: null
+wandb_mode: online
+wanbd_run_id: null
+
+# Observers
+observe_mcts_policy: True
+mcts_observer_ratio: 0.001

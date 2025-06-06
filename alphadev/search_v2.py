@@ -7,6 +7,8 @@ from time import time
 import tensorflow as tf
 import numpy as np
 import multiprocessing as mp
+from multiprocessing import shared_memory as mp_shm
+mp.set_start_method('spawn', force=True)  # use spawn method for multiprocessing
 from collections import namedtuple
 import contextlib
 import tree
@@ -16,6 +18,8 @@ from .inference_service import InferenceTask, InferenceResult, AlphaDevInference
 from .shared_memory import *
 from .config import ADConfig
 
+import logging
+logger = logging.getLogger(__name__)
 
 # Shared memory has a fixed size. for each MCTS, we do not need to re-allocate it
 # but we do need to re-initialize it.
@@ -171,7 +175,7 @@ class SharedTreeHeader(BlockLayout):
 
 class TreeFull(Exception): pass
 
-class SharedTree:
+class SharedTree(BaseMemoryManager):
     """
     Shared Memory which stores a tree structure.
     
@@ -202,9 +206,9 @@ class SharedTree:
     def configure(self):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
-        self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=True, size=self._header_size)
+        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
         self._header = SharedTreeHeader(self._header_shm, 0)
-        self._data_shm = mp.shared_memory.SharedMemory(name=self._data_name, create=True, size=self._data_size)
+        self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
         
         self.reset()  # clear the header and input/output blocks
     
@@ -216,8 +220,17 @@ class SharedTree:
             self._node_cls.clear_block(self._data_shm, self.i2off(i))
     
     def attach(self):
-        self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
-        self._data_shm = mp.shared_memory.SharedMemory(name=self._data_name, create=False, size=self._data_size)
+        self._is_main = False
+        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
+        self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)
+    
+    def __del__(self):
+        if self._is_main:
+            # only the main process should delete the shared memory
+            self._header_shm.close()
+            self._header_shm.unlink()
+            self._data_shm.close()
+            self._data_shm.unlink()
     
     def _update_index(self):
         with self._lock:
@@ -275,13 +288,16 @@ class SharedTree:
     def i2off(self, index: int) -> int:
         if index == 0:
             return 0
-        return self._root_size + (index - 1) * self._node_size()
+        return self._root_size + (index - 1) * self._node_size
     
     def get_node(self, index) -> Node:
         """Return the root node, at offset 0."""
         if index == 0:
             return self.root
         return self._node_cls(self._data_shm, self.i2off(index))
+    
+    def get_root(self) -> RootNode:
+        return self.root
     
     def get_by_offset(self, offset: int) -> Node:
         return self._node_cls(self._data_shm, offset)
@@ -297,7 +313,7 @@ class TaskAllocatorHeader(BlockLayout):
     _elements = {
         'process_task': ArrayElement(np.int32, (ADConfig.num_actors,)),  # list of tasks assigned to each process
     }
-class SharedTaskAllocator:
+class SharedTaskAllocator(BaseMemoryManager):
     def __init__(self):
         self._header_size = TaskAllocatorHeader.get_block_size()
         self._header_name = 'task_allocator_header'
@@ -308,7 +324,7 @@ class SharedTaskAllocator:
     def configure(self):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
-        self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=True, size=self._header_size)
+        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
         self._header = TaskAllocatorHeader(self._header_shm, 0)
         self.reset()
     
@@ -318,8 +334,14 @@ class SharedTaskAllocator:
 
     def attach(self):
         self._is_main = False
-        self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
+        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
         self._header = TaskAllocatorHeader(self._header_shm, 0)
+    
+    def __del__(self):
+        if self._is_main:
+            # only the main process should delete the shared memory
+            self._header_shm.close()
+            self._header_shm.unlink()
     
     def allocate(self, task_ids: Sequence[int]) -> Dict[int, int]:
         """
@@ -417,13 +439,16 @@ class APV_MCTS(object):
         )
         self.task_allocator = SharedTaskAllocator()
         self._init_task_allocation = \
-            [APV_MCTS.SEARCH_SIM_TASK] * ADConfig.num_actors - 1 + [APV_MCTS.BACKUP_TASK] # last actor is the one listening to the evaluator
+            [APV_MCTS.SEARCH_SIM_TASK] * (ADConfig.num_actors - 1) + [APV_MCTS.BACKUP_TASK] # last actor is the one listening to the evaluator
         
         # TODO: make optional
-        self.actor_pool = mp.Pool(processes=ADConfig.num_actors, initializer=self._init_actor)
-        self._init_main()
+        self.initialized = False
         self.inference_process = mp.Process(target=self._init_inference, args=(inference_device_config,), name=f'{name}.inf_proc')
-        self.inference_process.run()
+        self._init_main()
+        self.inference_process.start()
+        self.actor_pool = mp.Pool(processes=ADConfig.num_actors)
+        print(f"APV_MCTS: Inference process started with PID {self.inference_process.pid}.")
+        print("Finished initialization.")
     
     def search(self, observation):
         """
@@ -435,25 +460,26 @@ class APV_MCTS(object):
         # TODO: support only partially resetting the tree.
         self.tree.reset()
         
-        self.inference_buffer.submit(observation)
+        self.inference_buffer.submit(node_offset=0, observation=observation)
         
         with self.inference_buffer.poll_ready() as inference_result:
-            prior, value = inference_result
+            _, prior, value = inference_result
         
         # Add exploration noise to the prior.
         noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
         prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
+
         
         legal_actions = self.model.legal_actions()
         
         self.root: Node = self.tree.get_root()
         self.root.set_root()
         self.root.set_legal_actions(legal_actions)
-
+        
         self.root.expand(prior, value)
         
         # all that is left is to start the pool.
-        statistics = self.actor_pool.map(self._rollout, range(ADConfig.num_actors))
+        statistics = self.actor_pool.map(self._run_task, range(ADConfig.num_actors))
         for o in self.observers:
             o.update(statistics, self.root, self.tree, self.inference_buffer)
         
@@ -465,23 +491,29 @@ class APV_MCTS(object):
         The root node is a special node that is not expanded and has no parent.
         It is created in the shared memory and its attributes are set to zero.
         """
+        logger.info("APV_MCTS[main process] Initializing the shared tree and inference service.")
         # we can also test the inference service here 
         # TODO: handle case where inference is not a process
         self.task_allocator.configure()
         self.task_allocator.allocate(self._init_task_allocation)
         self.inference_buffer.configure()
         self.tree.configure()
-        self.inference_process.run() # start the inference process here.
+        self.initialized = True
     
     def _init_actor(self):
         """To be called from a subprocess"""
+        logger.info("APV_MCTS[actor process] Initializing the actor process.")
         self.task_allocator.attach()
         self.tree.attach()
         self.inference_buffer.attach()
+        self.initialized = True
     
-    def _init_inference(self):
+    def _init_inference(self, device_config):
         """To be called from a subprocess"""
+        logger.info("APV_MCTS[inference process] Initializing the inference service.")
+        # TODO: setup tensorflow device config.
         self.inference_buffer.attach()
+        self.initialized = True
         # run indefinitely
         self.inference_buffer.run()
 
@@ -501,7 +533,7 @@ class APV_MCTS(object):
         Once the inference task is done, we will asynchronously make a second backward pass (and check tree consistency),
         see `_phase_2` method.
         """
-        
+        print('APV_MCTS[phase 1] Starting search simulation phase.')
         node = self.root; parent = None  # to keep track of the path taken
         actions = []
         while node.expanded:
@@ -532,7 +564,7 @@ class APV_MCTS(object):
             observation=observation
         )
         # perform a backward pass with the reward and legal actions
-        reward = timestep.reward
+        reward = timestep.reward[0] # there might be other outputs but they are irrelevant for mcts
         terminal = timestep.final()
         
         new_node.set_terminal(terminal)
@@ -549,6 +581,7 @@ class APV_MCTS(object):
         - Update the prior and value of the node with the result.
         - Backpropagate the value estimate to the root node.
         """
+        print('APV_MCTS[phase 2] Starting backup phase.')
         with self.inference_buffer.poll_ready(timeout=10) as result:
             if result is None: 
                 if self.tree.is_full():
@@ -570,7 +603,10 @@ class APV_MCTS(object):
         return True
 
     def _run_task(self, process_id: int):
+        if not self.initialized:
+            self._init_actor()
         my_task_id = self.task_allocator.get_task(process_id)
+        print(f'APV_MCTS[actor {process_id}] Starting task execution my_task_id({my_task_id})')
         my_task = self._phase_1 if my_task_id == APV_MCTS.SEARCH_SIM_TASK else self._phase_2
         
         try:

@@ -10,7 +10,7 @@ class ArrayElement(NamedTuple):
     dtype: np.dtype
     shape: tuple
     def size(self, *args, **kwargs):
-        return np.dtype(self.dtype).itemsize * np.prod(self.shape)
+        return np.int32(np.dtype(self.dtype).itemsize * np.prod(self.shape))
     def create(self, shm, offset, *args, **kwargs):
         return np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf, offset=offset)
 
@@ -20,23 +20,38 @@ class VarLenArrayElement(ArrayElement):
     def create(self, shm, offset, length, *args, **kwargs):
         return np.ndarray((length, *self.shape), dtype=self.dtype, buffer=shm.buf, offset=offset)
 
-class NestedArrayElement(ArrayElement):
-    model: Union[Dict, NamedTuple]
+class NestedArrayElement(NamedTuple):
+    dtype: np.dtype
+    shape: tuple
+    model: Union[Dict[str, np.ndarray], NamedTuple]
     def size(self, *args, **kwargs):
-        return sum(element.nbytes for element in self.model.values())
+        if isinstance(self.model, dict):
+            return sum(element.dtype.itemsize*np.prod(element.shape) for element in self.model.values())
+        elif isinstance(self.model, NamedTuple):
+            return sum(getattr(self.model, name).dtype.itemsize * np.prod(getattr(self.model, name).shape) for name in self.model._fields)
+        else:
+            raise ValueError("self.model must be a dict or a NamedTuple.")
     def create(self, shm, offset, *args, **kwargs):
         elements = {}
         crnt_offset = offset
-        for name, element in self.model.items():
-            elements[name] = np.ndarray(element.shape, dtype=element.dtype, buffer=shm.buf, offset=crnt_offset)
-            crnt_offset += element.nbytes
+        if isinstance(self.model, dict):
+            for name, element in self.model.items():
+                elements[name] = np.ndarray(element.shape, dtype=element.dtype, buffer=shm.buf, offset=crnt_offset)
+                crnt_offset += np.int32(element.dtype.itemsize * np.prod(element.shape))
+        elif isinstance(self.model, NamedTuple):
+            for name in self.model._fields:
+                element = getattr(self.model, name)
+                if not isinstance(element, np.ndarray):
+                    continue
+                elements[name] = np.ndarray(element.shape, dtype=element.dtype, buffer=shm.buf, offset=crnt_offset)
+                crnt_offset += np.int32(element.dtype.itemsize * np.prod(element.shape))
         if isinstance(self.model, dict):
             return elements
         elif isinstance(self.model, NamedTuple):
             return self.model._make(**elements)
 
 class BlockLayout:
-    _elements: Dict[ArrayElement] = {}
+    _elements: Dict[str, ArrayElement] = {}
     
     def __init__(self, shm, offset, *args, **kwargs):
         self.shm = shm
@@ -47,18 +62,22 @@ class BlockLayout:
         crnt_offset = self.offset
         for name, element_spec in self.__class__._elements.items():
             setattr(self, name, element_spec.create(self.shm, crnt_offset, *args, **kwargs))
-            crnt_offset += element_spec.size()
+            crnt_offset += element_spec.size(*args, **kwargs)
     
     def write(self, **kwargs):
         """
         Write the given values to the block.
         The values should be provided as keyword arguments, where the keys are the names of the elements.
         """
+        def write_element(element, value):
+            element[...] = value
         for name, value in kwargs.items():
             if hasattr(self, name):
                 element = getattr(self, name)
                 if isinstance(element, np.ndarray):
-                    element[:] = value
+                    element[...] = value
+                elif isinstance(element, (dict, NamedTuple)):
+                    tree.map_structure(write_element, element, value)
                 else:
                     raise ValueError(f"Element {name} is not a numpy array.")
             else:
@@ -84,7 +103,7 @@ class BlockLayout:
         """
         Get the size of the block in bytes.
         """
-        return sum(element.size(*args, **kwargs) for element in cls._elements.values())
+        return int(sum(element.size(*args, **kwargs) for element in cls._elements.values()))
 
 class BaseMemoryManager:
     def configure(self):
@@ -125,18 +144,17 @@ class IOBuffer(BaseMemoryManager):
         self._header_size = BufferHeader.get_block_size(length=num_blocks)
         self._header_name = f'{name}_header'
 
-        self._input_size = num_blocks * input_element.get_block_size()
+        self._input_size = input_element.get_block_size()
         self._input_name = f'{name}_input'
         
-        self._output_size = num_blocks * output_element.get_block_size()
+        self._output_size = output_element.get_block_size()
         self._output_name = f'{name}_output'
         
         self._input_element_cls = input_element
         self._output_element_cls = output_element
         self._num_blocks = num_blocks
         self._lock = mp.Lock()  # to ensure atomicity of index updates
-        self._header.in_index = 1
-        self._header.out_index = 1
+        
         self._is_main = False
         # maintain LOCAL read pointers for the two buffers.
         # ideally, only one process should read without localization, otherwise
@@ -147,30 +165,30 @@ class IOBuffer(BaseMemoryManager):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
         self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=True, size=self._header_size)
-        self._header = BufferHeader(self._header_shm, 0, length=self.num_blocks)
-        self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=True, size=self._input_size)
-        self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=True, size=self._output_size)
+        self._header = BufferHeader(self._header_shm, 0, length=self._num_blocks)
+        self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=True, size=self._input_size*self._num_blocks)
+        self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=True, size=self._output_size*self._num_blocks)
         
         self.reset()  # clear the header and input/output blocks
     
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
         # clear the header and input/output blocks
-        BufferHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
-        for i in range(self.num_blocks):
-            self.input_element.clear_block(self._input_shm, self._header_size + i * self._input_size)
-            self.output_element.clear_block(self._output_shm, self._header_size + i * self._output_size)
+        BufferHeader.clear_block(self._header_shm, 0, length=self._num_blocks)
+        for i in range(self._num_blocks):
+            self._input_element_cls.clear_block(self._input_shm, i * self._input_size)
+            self._output_element_cls.clear_block(self._output_shm, i * self._output_size)
     
     def attach(self):
         self._is_main = False
         self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
-        self._header = BufferHeader(self._header_shm, 0, length=self.num_blocks)
+        self._header = BufferHeader(self._header_shm, 0, length=self._num_blocks)
         self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=False, size=self._input_size)
         self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=False, size=self._output_size)
 
     def __del__(self):
         """Clean up shared memory blocks in the main process."""
-        if not self._is_main:
+        if hasattr(self, '_is_main') and not self._is_main:
             return
         if hasattr(self, '_header_shm'):
             self._header_shm.close()
@@ -215,8 +233,10 @@ class IOBuffer(BaseMemoryManager):
         Appends the first `max_samples` blocks that are ready to be processed.
         """
         inp = []; indices = []
-        start_mod = self.submitted_read_head % self._num_blocks - 1
-        while self.submitted_read_head % self._num_blocks != start_mod and len(inp) < max_samples:
+        
+        start_mod = (self.submitted_read_head % self._num_blocks)
+        start_mod = start_mod if start_mod != 0 else self._num_blocks-1  # avoid zero mod for circular buffer
+        while (self.submitted_read_head % self._num_blocks) != start_mod and len(inp) < max_samples:
             if self._header.submitted[self.submitted_read_head]:
                 # read the output block and localize its contents. 
                 iblock = self._input_element_cls(self._input_shm, self.submitted_read_head * self._input_size)
@@ -232,7 +252,7 @@ class IOBuffer(BaseMemoryManager):
         else:
             yield inp
             # clear the ready flag after the context is exited
-            for self.submitted_read_head in indices: self._header.submitted[self.submitted_read_head] = False
+            for idx in indices: self._header.submitted[idx] = False
 
     @contextlib.contextmanager
     def poll_ready(self, localize:bool=True, timeout=None):

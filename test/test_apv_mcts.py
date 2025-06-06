@@ -1,0 +1,96 @@
+# we need to set a path to a config file
+import os
+config_path = os.path.join(__file__, 'apv_mcts_config.py')
+import sys
+sys.path.append(config_path)
+
+from alphadev.search_v2 import APV_MCTS, Node as Node_V2
+
+from alphadev.environment import CPUState
+from alphadev.search import PUCTSearchPolicy, visit_count_policy
+from alphadev.config import ADConfig
+
+from dm_env import TimeStep, StepType
+import numpy as np
+
+import logging
+logging.basicConfig(level=logging.DEBUG)
+
+num_simulations = 1000
+
+dirichlet_alpha = 0.3
+exploration_fraction = 0.1
+
+def dummy_evaluation_fn(observation):
+    """Dummy evaluation function that returns a random prior and value."""
+    prior = np.random.rand(observation['program'].shape[0], ADConfig.task_spec.num_actions)
+    value = np.zeros_like(observation['program_length'], dtype=np.float32)
+    return prior, value
+
+def dummy_eval_factory():
+    """Factory function to create a dummy evaluation function."""
+    return dummy_evaluation_fn
+
+class DummyModel:
+    """Dummy model that does nothing."""
+    def save_checkpoint(self):
+        pass
+
+    def load_checkpoint(self):
+        pass
+    
+    def step(self, observation: np.ndarray):
+        """Dummy step function that returns a random prior and value."""
+        return TimeStep(
+            step_type=StepType.MID if observation < num_simulations else StepType.LAST,
+            observation=CPUState(
+                registers=observation.registers,
+                memory=observation.memory,
+                program=observation.program,
+                program_length=observation.program_length+1
+            )._asdict(),
+            reward=np.zeros((3,), dtype=np.float32),
+            discount=1.0
+        )
+    
+    def legal_actions(self):
+        """Returns a list of legal actions."""
+        return np.array([True]*ADConfig.task_spec.num_actions, dtype=np.bool_)
+
+
+def run_mcts():
+    """Run the MCTS algorithm with a dummy model and evaluation function."""
+    mcts = APV_MCTS(
+        model=DummyModel(),
+        search_policy=PUCTSearchPolicy(),
+        network_factory=dummy_eval_factory,
+        num_simulations=num_simulations,
+        num_actions=ADConfig.task_spec.num_actions,
+        dirichlet_alpha=dirichlet_alpha,
+        exploration_fraction=exploration_fraction,
+        discount=1.0,
+        node_class=Node_V2,
+        batch_size=16,
+    )
+    observation = CPUState(
+        registers=np.zeros((ADConfig.task_spec.num_inputs, ADConfig.task_spec.num_regs), dtype=np.int32),  # Dummy registers
+        memory=np.zeros((ADConfig.task_spec.num_inputs, ADConfig.task_spec.num_mem), dtype=np.int32),  # Dummy memory
+        program=np.zeros((ADConfig.task_spec.max_program_size,3), dtype=np.int32),  # Dummy program
+        program_length=np.zeros((1,), dtype=np.int32),  # Dummy program length
+    )._asdict() # Dummy observation
+    timestep = TimeStep(
+        step_type=StepType.FIRST,
+        observation=observation,
+        reward=np.zeros((3,), dtype=np.float32),
+        discount=1.0
+    )
+    outer_model = DummyModel()
+    while timestep.step_type != StepType.LAST:
+        root = mcts.search(observation)
+        action = visit_count_policy(root)
+        timestep = outer_model.step(action)
+
+
+if __name__ == "__main__":
+    run_mcts()
+    print("MCTS completed.")
