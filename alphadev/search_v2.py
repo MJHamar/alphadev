@@ -83,7 +83,7 @@ class Node(BlockLayout):
         parent.deselect(action_id)
     
     def select(self, action_id):
-        self.vl[action_id] += 1 if self.vl[action_id] > 0 else 0
+        self.vl[action_id] += 1 # if self.vl[action_id] > 0 else 1
     def deselect(self, action_id):
         self.vl[action_id] -= 1 if self.vl[action_id] > 0 else 0
     
@@ -91,8 +91,8 @@ class Node(BlockLayout):
         """To be called during search for selecting children. considers the virtual loss."""
         denominator = self.N + self.vl
         return np.where(
-            self.mask,
-            np.divide(self.W + self.const_vl * self.vl, denominator, where=(denominator != 0)),
+            self.mask & (denominator != 0),
+            np.divide(self.W + self.const_vl * self.vl, denominator),
             0.0
         )
     
