@@ -281,7 +281,7 @@ def argmax(values: np.ndarray, mask: np.ndarray) -> types.Action:
     """Argmax with random tie-breaking."""
     # check_numerics(values)
     max_value = np.max(values*mask) # mask the values to only consider valid actions
-    return np.int32(argmax_rng.choice(values[values == max_value]))
+    return np.int32(argmax_rng.choice(np.arange(values.shape[0])[values == max_value]))
 
 def check_numerics(values: np.ndarray):
     """Raises a ValueError if any of the inputs are NaN or Inf."""
