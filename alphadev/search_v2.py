@@ -1,7 +1,7 @@
 """
 Implementation of APV-MCTS
 """
-from typing import NamedTuple, Dict, Union, List
+from typing import NamedTuple, Dict, Union, Sequence
 from time import time
 
 import tensorflow as tf
@@ -78,15 +78,23 @@ class Node(BlockLayout):
     
     def visit(self, value):
         parent = self.parent; action_id = self.action_id
-        parent.vl[action_id] -= 1 if parent.vl[action_id] > 0 else 0
         parent.W[action_id] += value
         parent.N += 1
+        parent.deselect(action_id)
+    
+    def select(self, action_id):
+        self.vl[action_id] += 1 if self.vl[action_id] > 0 else 0
+    def deselect(self, action_id):
+        self.vl[action_id] -= 1 if self.vl[action_id] > 0 else 0
     
     def children_values(self):
         """To be called during search for selecting children. considers the virtual loss."""
-        virt_W = np.where(self.mask, self.W + self.const_vl * self.vl, 0.0)
-        virt_N = np.where(self.mask, self.N + self.vl, 1)  # avoid division by zero
-        return np.where(self.mask, virt_W / virt_N, 0.0)
+        denominator = self.N + self.vl
+        return np.where(
+            self.mask,
+            np.divide(self.W + self.const_vl * self.vl, denominator, where=(denominator != 0)),
+            0.0
+        )
     
     def children_visits(self):
         """To be called during search for selecting children. considers the virtual loss."""
@@ -289,14 +297,18 @@ class APV_MCTS(object):
             inference_buffer_size: int = None,
             network_factory_args=(),
             network_factory_kwargs={},
+            inference_device_config: Union[Dict, None] = None,
+            observers: Sequence = [],
             name:str='apv-mcts' # needs to be specified is multiple instances are used.
         ):
         self.model = model # a (learned) model of the environment.
         self.search_policy = search_policy # a function that takes a node and returns an action to take.
         self.num_simulations = num_simulations  # number of simulations to run per search
         self.num_actions = num_actions  # number of actions in the environment [a noop, we know this from ADConfig already]
+        assert num_actions == ADConfig.task_spec.num_actions, "num_actions doesn't match the task specification. You did somethin dumb miki"
         self.discount = discount  # discount factor for the value estimate
         self.inference_buffer_size = inference_buffer_size or num_simulations  # size of the inference buffer
+        self.observers = observers  # list of observers that evaluate search statistics.
 
         # applying Dirichlet noise to the prior probabilities at the root.
         self.dirichlet_alpha = dirichlet_alpha  # alpha parameter for the Dirichlet noise
@@ -316,13 +328,9 @@ class APV_MCTS(object):
         
         # TODO: make optional
         self.actor_pool = mp.Pool(processes=ADConfig.num_actors, initializer=self._init_actor)
-        self.inference_process = mp.Process(target=self._init_inference, name=f'{name}.inf_proc')
-        self.inference_process.run()
         self._init_main()
-    
-    def __call__(observation):
-        with contextlib.ExitStack() as stack:
-            pass
+        self.inference_process = mp.Process(target=self._init_inference, args=(inference_device_config,), name=f'{name}.inf_proc')
+        self.inference_process.run()
     
     def _init_main(self):
         """
@@ -336,7 +344,13 @@ class APV_MCTS(object):
         self.tree.configure()
         self.inference_process.run() # start the inference process here.
     
-    def _search(self, observation):
+    def search(self, observation):
+        """
+        Perform APV-MCTS search on the given observation.
+        This method initializes the search tree with root corresponding to the given observation,
+        and runs num_simulations rollouts from the root node using a pool of worker processes.
+        Finally, it returns a pointer to the root node, which can be used to perform post-mcts action selection.
+        """
         # TODO: support only partially resetting the tree.
         self.tree.reset()
         
@@ -358,7 +372,11 @@ class APV_MCTS(object):
         self.root.expand(prior, value)
         
         # all that is left is to start the pool.
-        self.actor_pool.map(self._rollout, range(self.num_simulations))
+        statistics = self.actor_pool.map(self._rollout, range(self.num_simulations))
+        for o in self.observers:
+            o.update(statistics, self.root, self.tree, self.inference_buffer)
+        
+        return self.root  # return the root node, which now contains the search results
 
     def _init_actor(self):
         """To be called from a subprocess"""
@@ -372,20 +390,23 @@ class APV_MCTS(object):
         self.inference_buffer.run()
 
     def _select_and_simulate(self):
-        node = self.root; parent_node = None
+        node = self.root; history = []  # to keep track of the path taken
         actions = []
         while node.expanded:
             action = self.search_policy(node)
             actions.append(action)
-            parent_node = node
+            history.append(node)
             node = node.select(action) # increment virtual loss
         # before simulating, initialize the new node.
-        new_node: Node = tree.append_child(parent_node.offset, actions[-1]) # pass the path to make sure only one block is reserved for this node.
+        new_node: Node = tree.append_child(history[-1].offset, actions[-1]) # pass the path to make sure only one block is reserved for this node.
         if new_node is None:
+            # decrement the virtual losses appended to the path
+            for node, action in zip(history, actions):
+                node.deselect(action)
             return False # Try again.
         # otherwise, run the simulation and schedule an evaluation
         # first set parent
-        new_node.set_parent(parent_node.offset, actions[-1])
+        new_node.set_parent(history[-1].offset, actions[-1])
         # then run the simulation update the node with the results
         timestep = self.model.step(actions, update=False)
         new_node.set_legal_actions(self.model.legal_actions())
@@ -434,7 +455,7 @@ class APV_MCTS(object):
             return { # tree buffer is full.
                 'rollout': rollout_nr,
                 'selection_tries':0, 'backprop_tries': 0} 
-        selection_tries = 0
+        selection_tries = backprop_tries = 1
         while not self._select_and_simulate():
             selection_tries += 1
         while not self._backpropagate():
@@ -444,4 +465,3 @@ class APV_MCTS(object):
             'selection_tries': selection_tries,
             'backprop_tries': backprop_tries,
         }
-
