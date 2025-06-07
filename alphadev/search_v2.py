@@ -66,7 +66,6 @@ class Node(BlockLayout):
         'R':      ArrayElement(np.float32, (_num_actions,)), # One-time reward observed at this node
         'W':      ArrayElement(np.float32, (_num_actions,)), # predicted value + empirical discounted return
         'N':      ArrayElement(np.int32,   (_num_actions,)), # number of visits to the node
-        'vl':     ArrayElement(np.int32,   (_num_actions,)), # virtual loss multiplier to discourage visiting this node
         'mask':   ArrayElement(np.bool_,   (_num_actions,)), # mask of valid actions leading to this node
     }
     # virtual loss constant
@@ -75,34 +74,41 @@ class Node(BlockLayout):
     def __init__(self, shm, offset):
         super().__init__(shm, offset)
     
-    def expand(self, prior, value):
-        self.parent.W[self.action_id] = value
+    def expand(self, prior):
         self.prior = prior
         self.header[self.__class__.hdr_expanded] = True
     
-    def visit(self, value):
-        parent = self.parent; action_id = self.action_id
-        parent.W[action_id] += value
-        parent.N += 1
-        parent.deselect(action_id)
-    
     def select(self, action_id):
-        self.vl[action_id] += 1 # if self.vl[action_id] > 0 else 1
-    def deselect(self, action_id):
-        self.vl[action_id] -= 1 if self.vl[action_id] > 0 else 0
+        """Increment W by const_vl and N by 1 for the given action_id."""
+        self.W[action_id] += self.const_vl
+        self.N[action_id] += 1
+    def deselect(self, action_id, reward=0.0):
+        """Inverse operation of select."""
+        self.W[action_id] += -self.const_vl + reward
+        self.N[action_id] -= 1
+    def visit_child(self, action_id, value):
+        """W = W - const_vl + value; N = N - 1 + 1 for the given action_id."""
+        self.W[action_id] += -self.const_vl + value
+        # N = N - 1 + 1 -> N = N, so this is a no-op
+    def update_child(self, action_id, value):
+        """Update the child without touching the virtual loss."""
+        self.W[action_id] += value
+        self.N[action_id] += 1
+    
+    def is_consistent(self):
+        return self.parent.children[self.action_id] == self.offset
     
     def children_values(self):
         """To be called during search for selecting children. considers the virtual loss."""
-        denominator = self.N + self.vl
         return np.where(
-            self.mask & (denominator != 0),
-            np.divide(self.W + self.const_vl * self.vl, denominator),
+            self.mask & (self.N != 0),
+            np.divide(self.W, self.N),
             0.0
         )
     
     def children_visits(self):
         """To be called during search for selecting children. considers the virtual loss."""
-        return np.where(self.mask, self.N + self.vl, 0)
+        return self.N
     
     @property
     def parent(self) -> 'Node':
@@ -130,6 +136,11 @@ class Node(BlockLayout):
     def set_terminal(self, terminal): self.header[self.__class__.hdr_terminal] = terminal
     @property
     def is_root(self):       return self.header[self.__class__.hdr_action] == -1
+    @property
+    def set_root(self):
+        """Set this node as the root node."""
+        self.header[self.__class__.hdr_parent] = -1
+        self.header[self.__class__.hdr_action] = -1
     
     def set_parent(self, parent_offset, action):
         self.header[self.__class__.hdr_parent] = parent_offset
@@ -141,47 +152,6 @@ class Node(BlockLayout):
     def set_reward(self, reward):
         self.parent.R[self.action_id] = reward
 
-class RootNode(Node):
-    _elements = Node._elements.copy()
-    _elements['root_attrs'] = ArrayElement(np.int32, (2,))  # root attributes: num_actions, value
-    _root_N_idx = 0; _root_W_idx = 1
-    def __init__(self, shm, offset):
-        super().__init__(shm, offset)
-        self.header[self.__class__.hdr_parent] = -1
-        self.header[self.__class__.hdr_action] = -1
-        self.header[self.__class__.hdr_terminal] = False
-
-    def visit(self, value):
-        """
-        Overriding the visit method to update the root attributes.
-        The root node has a special visit count and value estimate.
-        """
-        self.root_attrs[self.__class__._root_W_idx] += value
-        self.root_attrs[self.__class__._root_N_idx] += 1
-        self.deselect(self.action_id)
-
-    def expand(self, prior, value):
-        """
-        Overriding the expand method to set the root attributes.
-        The root node has a special visit count and value estimate.
-        """
-        self.prior = prior
-        self.root_attrs[self.__class__._root_W_idx] = value
-        self.header[self.__class__.hdr_expanded] = True
-    
-    def is_consistent(self):
-        return True
-    
-    def set_parent(self, parent_offset, action):
-        raise RuntimeError("Root node cannot have a parent. This is a bug in the code.")
-    
-    @property
-    def value(self):
-        return self.root_attrs[self.__class__._root_W_idx] / self.root_attrs[self.__class__._root_N_idx] \
-            if self.root_attrs[self.__class__._root_N_idx] > 0 else 0.0
-    @property
-    def visit_count(self):
-        return self.root_attrs[self.__class__._root_N_idx]
 
 class SharedTreeHeader(BlockLayout):
     _elements = {
@@ -199,17 +169,15 @@ class SharedTree(BaseMemoryManager):
     2. data block stores the nodes of the tree
     """
     def __init__(self, num_blocks, node_cls: Node, name: str = 'SharedTree'):
-        self.num_blocks = num_blocks
+        self.num_blocks = num_blocks + 1 # 1 for the root.
         self._node_cls = node_cls
-        self._root_cls = RootNode # TODO we should pass this as an argument too.
         # declare shared memory regions
         self._header_size = SharedTreeHeader.get_block_size(length=num_blocks)
         self._header_name = f'{name}_header'
         
-        self._root_size = self._root_cls.get_block_size()
         self._node_size = self._node_cls.get_block_size()
         
-        self._data_size = self._root_size + num_blocks * self._node_size
+        self._data_size = num_blocks * self._node_size
         self._data_name = f'{name}_data'
         
         # shared between processes
@@ -230,10 +198,12 @@ class SharedTree(BaseMemoryManager):
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
         SharedTreeHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
-        self._root_cls.clear_block(self._data_shm, 0)  # clear the root node
-        self.root = self._root_cls(self._data_shm, 0)  # instantiate the root node
-        for i in range(1,self.num_blocks+1): # block 0 is the root.
+        self._header.index[0] = 1 # do not write to the root.
+        for i in range(self.num_blocks):
             self._node_cls.clear_block(self._data_shm, self.i2off(i))
+        # initialize the root node
+        root: Node = self.get_root()
+        root.set_root()
     
     def attach(self):
         self._is_main = False
@@ -288,7 +258,7 @@ class SharedTree(BaseMemoryManager):
             self.fail()
             return None
         
-        child_offset = self._root_size + (self._local_write_head-1) * self._data_size
+        child_offset = self.i2off(self._local_write_head)
         parent.children[action] = child_offset
         # now write the parent offset and action id to the child node's header
         child: Node = self._node_cls(self._data_shm, child_offset)
@@ -302,9 +272,7 @@ class SharedTree(BaseMemoryManager):
             return None
     
     def i2off(self, index: int) -> int:
-        if index == 0:
-            return 0
-        return self._root_size + (index - 1) * self._node_size
+        return index * self._node_size
     
     def get_node(self, index) -> Node:
         """Return the root node, at offset 0."""
@@ -312,8 +280,8 @@ class SharedTree(BaseMemoryManager):
             return self.root
         return self._node_cls(self._data_shm, self.i2off(index))
     
-    def get_root(self) -> RootNode:
-        return self.root
+    def get_root(self):
+        return self._node_cls(self._data_shm, 0)
     
     def get_by_offset(self, offset: int) -> Node:
         return self._node_cls(self._data_shm, offset)
@@ -549,19 +517,20 @@ class APV_MCTS(object):
         see `_phase_2` method.
         """
         print('APV_MCTS[phase 1] Starting search simulation phase.')
-        node = self.root; parent = None  # to keep track of the path taken
-        actions = []
+        node = self.root
+        actions = []; trajectory = []
         while node.expanded:
             action = self.search_policy(node)
-            actions.append(action)
-            parent = node
             node = node.select(action) # increment virtual loss
+            actions.append(action)
+            trajectory.append(node)  # keep track of the trajectory for backpropagation
         
         # before simulating, initialize the new node.
-        new_node: Node = tree.append_child(parent, actions[-1]) # pass the path to make sure only one block is reserved for this node.
+        new_node: Node = tree.append_child(trajectory[-2], actions[-1]) # pass the path to make sure only one block is reserved for this node.
         if new_node is None:
             # this node is already being evaluated by some other process.
-            parent.deselect(actions[-1])  # this process lost, clear the virtual losses
+            for n, a in zip(trajectory[:-1], actions):
+                n.deselect(a)
             return False  # we need to try again, the node was overwritten by another process
         
         # then run the simulation update the node with the results. This delay also enables other processes to write stuff
@@ -569,7 +538,8 @@ class APV_MCTS(object):
         legal_actions = self.model.legal_actions()
         # now we can check for tree consistency (whether any other process has overwritten the node)
         if not new_node.is_consistent():
-            parent.deselect(actions[-1])  # this process lost, clear the virtual losses
+            for n, a in zip(trajectory[:-1], actions):
+                n.deselect(a)
             return False # we need to try again, the node was overwritten by another process
         
         # otherwise, submit a new inference task to the inference service.
@@ -585,7 +555,12 @@ class APV_MCTS(object):
         new_node.set_terminal(terminal)
         new_node.set_legal_actions(legal_actions)
         new_node.set_reward(reward)
-        new_node.backward(reward, discount=self.discount)
+
+        # backpropagate the reward for each t < L and remove the virtual loss.
+        reward = self.discount * reward  # discount the reward for the backpropagation
+        for n, a in zip(trajectory[:-1], actions):
+            n.visit_child(a, reward)
+            reward *= self.discount
         
         return True  # we successfully submitted the task for evaluation
 
@@ -607,14 +582,20 @@ class APV_MCTS(object):
             prior = result.prior
             value = result.value
         # obtain the node from the shared tree and check for consistency.
-        node = tree.get_by_offset(node_offset)
+        node = self.tree.get_by_offset(node_offset)
         if not node.is_consistent():
             # the node was overwritten by another process, nothing to do here.
             return False
         # expand the current node
-        node.expand(prior, value) # reward, legal_actions and terminal are already set
+        node.expand(prior) # reward, legal_actions and terminal are already set
         # backpropagate without touching the virtual loss.
-        node.parent.visit(value, self.discount)
+        while not node.is_root:
+            parent = node.parent
+            # update the parent with the value estimate and visit count
+            parent.update_child(node.action_id, value)
+            # then move to the parent node and discount the value
+            node = parent
+            value *= self.discount
         return True
 
     def _run_task(self, process_id: int):
