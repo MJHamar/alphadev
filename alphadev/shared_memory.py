@@ -4,7 +4,9 @@ from time import time
 import numpy as np
 import multiprocessing as mp
 import contextlib
+import functools
 import tree
+import atomics
 
 class ArrayElement(NamedTuple):
     dtype: np.dtype
@@ -13,6 +15,16 @@ class ArrayElement(NamedTuple):
         return np.int32(np.dtype(self.dtype).itemsize * np.prod(self.shape))
     def create(self, shm, offset, *args, **kwargs):
         return np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf, offset=offset)
+
+AtomicContext = functools.partial
+class AtomicCounterElement(NamedTuple):
+    def size(self, *args, **kwargs):
+        return np.dtype(np.int32).itemsize
+    def create(self, shm, offset, *args, **kwargs):
+        return functools.partial(
+            atomics.atomicview,
+            shm.buf[offset:offset + self.size(*args, **kwargs)], atype=atomics.INT
+            )
 
 class VarLenArrayElement(ArrayElement):
     def size(self, length, *args, **kwargs):
@@ -86,7 +98,9 @@ class BlockLayout:
     def read(self):
         """Create a localized namedtuple with the contents of the block."""
         return namedtuple(self.__class__.__name__, self.__class__._elements.keys())(
-            **{name: getattr(self, name).copy() for name in self.__class__._elements.keys()}
+            **{name: getattr(self, name).copy()
+               for name in self.__class__._elements.keys()
+               if type(getattr(self, name)) != AtomicContext}  # skip atomic counters for localization
         )
     
     @classmethod
@@ -94,9 +108,16 @@ class BlockLayout:
         """
         Initialize a block of shared memory at the given offset.
         """
+        off = offset
         for element_spec in cls._elements.values():
-            element = element_spec.create(shm, offset, *args, **kwargs)
-            tree.map_structure(lambda x: x.fill(0), element)
+            element = element_spec.create(shm, off, *args, **kwargs)
+            if type(element) == AtomicContext:
+                # handle atomic counters
+                with element() as atomic_counter:
+                    atomic_counter.store(0)
+            else:
+                tree.map_structure(lambda x: (x.fill(0) if hasattr(x,'fill') else x), element)
+            off += element_spec.size(*args, **kwargs)
 
     @classmethod
     def get_block_size(cls, *args, **kwargs):
@@ -121,8 +142,8 @@ class BaseMemoryManager:
 
 class BufferHeader(BlockLayout):
     _elements = {
-        'in_index': ArrayElement(np.int32, ()),  # index of the next block to be used
-        'out_index': ArrayElement(np.int32, ()),  # index of the next block to be used
+        'in_index': AtomicCounterElement(),  # index of the next block to be used
+        'out_index': AtomicCounterElement(),  # index of the next block to be used
         'submitted': VarLenArrayElement(np.bool_, ()), # boolean mask of submitted blocks
         'ready': VarLenArrayElement(np.bool_, ()),  # boolean mask of ready blocks
     }
@@ -140,7 +161,9 @@ class IOBuffer(BaseMemoryManager):
     4. Once the task is processed, the consumer writes the result into the output block and calls the ready() function.
     5. Other processes can then poll() the ready output blocks and read the results.
     """
-    def __init__(self, num_blocks, input_element: BlockLayout, output_element: BlockLayout, name: str = 'IOBuffer'):
+    def __init__(
+        self, num_blocks, input_element: BlockLayout,
+        output_element: BlockLayout, name: str = 'IOBuffer'):
         self._header_size = BufferHeader.get_block_size(length=num_blocks)
         self._header_name = f'{name}_header'
 
@@ -153,7 +176,6 @@ class IOBuffer(BaseMemoryManager):
         self._input_element_cls = input_element
         self._output_element_cls = output_element
         self._num_blocks = num_blocks
-        self._lock = mp.Lock()  # to ensure atomicity of index updates
         
         self._is_main = False
         # maintain LOCAL read pointers for the two buffers.
@@ -201,16 +223,16 @@ class IOBuffer(BaseMemoryManager):
             self._output_shm.unlink()
     
     def _next_in(self):
-        with self._lock:
-            self._header.in_index = (self._header.in_index + 1) % self._num_blocks
-            index = self._header.in_index
-            assert not self._header.submitted[index], "Circular input buffer full."
+        with self._header.in_index() as in_index:
+            index = in_index.fetch_inc()  # increment the in_index atomically
+        index = index % self._num_blocks  # wrap around the index
+        assert not self._header.submitted[index], "Circular input buffer full."
         return index
     def _next_out(self):
-        with self._lock:
-            self._header.out_index = (self._header.out_index + 1) % self._num_blocks
-            index = self._header.out_index
-            assert not self._header.ready[index], "Circular output buffer full."
+        with self._header.out_index() as out_index:
+            index = out_index.fetch_inc()  # increment the out_index atomically
+        index = index % self._num_blocks  # wrap around the index
+        assert not self._header.ready[index], "Circular output buffer full."
         return index
     
     def submit(self, **payload):

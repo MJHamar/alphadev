@@ -31,7 +31,11 @@ class AlphaDevInferenceService(IOBuffer):
             factory_kwargs:dict = {},
             name:str = 'AlphaDevInferenceService'
             ):
-        super().__init__(num_blocks, InferenceTask, InferenceResult, name=name)
+        super().__init__(
+            num_blocks=num_blocks,
+            input_element=InferenceTask,
+            output_element=InferenceResult,
+            name=name)
         self.batch_size = max(batch_size, 1)
         self._network_factory = network_factory # to be initialized in the 
         self._factory_args = factory_args or ()
@@ -79,5 +83,4 @@ class AlphaDevInferenceService(IOBuffer):
                 node_offset=off,
                 prior=p,
                 value=v
-            ) for off, p, v in zip(node_offset, prior, value)]
-            )
+            ) for off, p, v in zip(node_offset, prior, value)])

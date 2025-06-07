@@ -136,7 +136,7 @@ class Node(BlockLayout):
     def set_terminal(self, terminal): self.header[self.__class__.hdr_terminal] = terminal
     @property
     def is_root(self):       return self.header[self.__class__.hdr_action] == -1
-    @property
+
     def set_root(self):
         """Set this node as the root node."""
         self.header[self.__class__.hdr_parent] = -1
@@ -155,7 +155,7 @@ class Node(BlockLayout):
 
 class SharedTreeHeader(BlockLayout):
     _elements = {
-        'index': ArrayElement(np.int32, ()),  # index of the next block to be used
+        'index': AtomicCounterElement(),  # index of the next block to be used
     }
 
 class TreeFull(Exception): pass
@@ -177,11 +177,9 @@ class SharedTree(BaseMemoryManager):
         
         self._node_size = self._node_cls.get_block_size()
         
-        self._data_size = num_blocks * self._node_size
+        self._data_size = self.num_blocks * self._node_size
         self._data_name = f'{name}_data'
         
-        # shared between processes
-        self._lock = mp.Lock()  # to ensure atomicity of index updates
         # process-local
         self._is_main = False
         self._local_write_head = None
@@ -198,7 +196,8 @@ class SharedTree(BaseMemoryManager):
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
         SharedTreeHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
-        self._header.index[0] = 1 # do not write to the root.
+        with self._header.index() as idx:
+            idx.store(1) # do not write to the root.
         for i in range(self.num_blocks):
             self._node_cls.clear_block(self._data_shm, self.i2off(i))
         # initialize the root node
@@ -219,14 +218,13 @@ class SharedTree(BaseMemoryManager):
             self._data_shm.unlink()
     
     def _update_index(self):
-        with self._lock:
-            index = self._header.index[0]
-            if index >= self.num_blocks:
-                self._local_write_head = None # we are done
-            else:
-                self._local_write_head = index
-                self._header.index[0] += 1
-        return self._local_write_head
+        with self._header.index() as index_counter:
+            index = index_counter.fetch_inc()
+        if index >= self.num_blocks:
+            self._local_write_head = None # we are done
+        else:
+            self._local_write_head = index
+        return index
     
     def fail(self):
         """We didn't manage to write, try again next time to the same block."""
@@ -291,7 +289,8 @@ class SharedTree(BaseMemoryManager):
         Check if the tree is full.
         The tree is full if the index is equal to the number of blocks.
         """
-        return self._header.index[0] >= self.num_blocks
+        with self._header.index() as idx:
+            return idx.load() >= self.num_blocks
 
 class TaskAllocatorHeader(BlockLayout):
     _elements = {
@@ -442,25 +441,26 @@ class APV_MCTS(object):
         Finally, it returns a pointer to the root node, which can be used to perform post-mcts action selection.
         """
         # TODO: support only partially resetting the tree.
+        print('APV_MCTS[main process] Starting search simulation phase.')
         self.tree.reset()
         
         self.inference_buffer.submit(node_offset=0, observation=observation)
         
+        print('APV_MCTS[main process] Waiting for inference service to return prior and value estimate.')
         with self.inference_buffer.poll_ready() as inference_result:
-            _, prior, value = inference_result
-        
+            _, prior, _ = inference_result
+        print('APV_MCTS[main process] Received prior and value estimate from inference service.')
         # Add exploration noise to the prior.
         noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
         prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
-
         
         legal_actions = self.model.legal_actions()
         
         self.root: Node = self.tree.get_root()
         self.root.set_legal_actions(legal_actions)
         
-        self.root.expand(prior, value)
-        
+        self.root.expand(prior)
+        print('APV_MCTS[main process] Root node initialized with prior and legal actions. Starting pool')
         # all that is left is to start the pool.
         statistics = self.actor_pool.map(self._run_task, range(ADConfig.num_actors))
         for o in self.observers:
