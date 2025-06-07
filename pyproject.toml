@@ -46,6 +46,7 @@ dependencies = [
     "tqdm",
     "wandb",
     "redis",
+    "atomics",
 
     # tinyfive submodule (editable install from local path):
     "tinyfive @ {root:uri}/tinyfive" # Changed from file:./tinyfive

@@ -155,6 +155,25 @@ class DeviceAllocationConfig:
         print(f"Device allocations: {device_allocations}")
         return device_allocations
 
+def apply_device_config(device_allocation: dict):
+    """
+    Apply the device allocation configuration to the current TensorFlow session.
+    
+    Args:
+        device_allocation: A dictionary with keys 'gpu' and 'memory'
+        corresponding to the GPU device and memory allocation for the process.
+    """
+    tf.config.experimental.set_memory_growth(
+        device_allocation['gpu'], True
+    )
+    tf.config.set_visible_devices(
+        device_allocation['gpu'], 'GPU'
+    )
+    tf.config.set_logical_device_configuration(
+        device_allocation['gpu'],
+        [tf.config.LogicalDeviceConfiguration(memory_limit=device_allocation['memory'])]
+    )
+
 def main():
     """
     Main entry point to configure device allocations prior to launching the distributed program.

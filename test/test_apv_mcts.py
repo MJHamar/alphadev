@@ -1,8 +1,8 @@
 # we need to set a path to a config file
 import os
-config_path = os.path.join(__file__, 'apv_mcts_config.py')
+config_path = os.path.join(os.path.dirname(__file__), 'apv_mcts_config.yaml')
 import sys
-sys.path.append(config_path)
+sys.argv.append(config_path)
 
 from alphadev.search_v2 import APV_MCTS, Node as Node_V2
 

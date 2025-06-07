@@ -1,4 +1,4 @@
-experiment_name: AlphaDev-sort3
+experiment_name: AlphaDev-Sort3-APV-MCTS
 
 # Environment
 num_inputs: 17
@@ -13,7 +13,7 @@ num_latency_simulations: 1
 emulator_mode: 'i32'
 
 # Self-Play
-num_actors: 2
+num_actors: 3
 num_simulations: 100
 
 # UCB formula

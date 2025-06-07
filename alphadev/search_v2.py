@@ -1,7 +1,7 @@
 """
 Implementation of APV-MCTS
 """
-from typing import NamedTuple, Dict, Union, Sequence
+from typing import NamedTuple, Dict, Union, Sequence, Callable
 from time import time
 
 import tensorflow as tf
@@ -17,6 +17,7 @@ from .environment import AssemblyGame, AssemblyGameModel
 from .inference_service import InferenceTask, InferenceResult, AlphaDevInferenceService
 from .shared_memory import *
 from .config import ADConfig
+from .device_config import apply_device_config
 
 import logging
 logger = logging.getLogger(__name__)
@@ -188,15 +189,18 @@ class SharedTree(BaseMemoryManager):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
-        self._header = SharedTreeHeader(self._header_shm, 0)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
         
         self.reset()  # clear the header and input/output blocks
     
+    @property
+    def header(self) -> SharedTreeHeader:
+        return SharedTreeHeader(self._header_shm, 0)
+    
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
         SharedTreeHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
-        with self._header.index() as idx:
+        with self.header.index() as idx:
             idx.store(1) # do not write to the root.
         for i in range(self.num_blocks):
             self._node_cls.clear_block(self._data_shm, self.i2off(i))
@@ -218,7 +222,7 @@ class SharedTree(BaseMemoryManager):
             self._data_shm.unlink()
     
     def _update_index(self):
-        with self._header.index() as index_counter:
+        with self.header.index() as index_counter:
             index = index_counter.fetch_inc()
         if index >= self.num_blocks:
             self._local_write_head = None # we are done
@@ -289,7 +293,7 @@ class SharedTree(BaseMemoryManager):
         Check if the tree is full.
         The tree is full if the index is equal to the number of blocks.
         """
-        with self._header.index() as idx:
+        with self.header.index() as idx:
             return idx.load() >= self.num_blocks
 
 class TaskAllocatorHeader(BlockLayout):
@@ -297,9 +301,9 @@ class TaskAllocatorHeader(BlockLayout):
         'process_task': ArrayElement(np.int32, (ADConfig.num_actors,)),  # list of tasks assigned to each process
     }
 class SharedTaskAllocator(BaseMemoryManager):
-    def __init__(self):
+    def __init__(self, name: str = 'SharedTaskAllocator'):
         self._header_size = TaskAllocatorHeader.get_block_size()
-        self._header_name = 'task_allocator_header'
+        self._header_name = f'{name}_header'
         self._header_shm = None
         self._header = None
         self._is_main = False
@@ -308,8 +312,11 @@ class SharedTaskAllocator(BaseMemoryManager):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
-        self._header = TaskAllocatorHeader(self._header_shm, 0)
         self.reset()
+    
+    @property
+    def header(self) -> TaskAllocatorHeader:
+        return TaskAllocatorHeader(self._header_shm, 0)
     
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
@@ -318,7 +325,6 @@ class SharedTaskAllocator(BaseMemoryManager):
     def attach(self):
         self._is_main = False
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
-        self._header = TaskAllocatorHeader(self._header_shm, 0)
     
     def __del__(self):
         if self._is_main:
@@ -336,10 +342,10 @@ class SharedTaskAllocator(BaseMemoryManager):
         
         # reset the header
         self.reset()
-        self._header.process_task[:] = task_ids
+        self.header.process_task[:] = task_ids
     
     def get_task(self, process_id: int) -> int:
-        return self._header.process_task[process_id]
+        return self.header.process_task[process_id]
 
 class APV_MCTS(object):
     """
@@ -410,28 +416,55 @@ class APV_MCTS(object):
         self.exploration_fraction = exploration_fraction  # fraction of the prior to add Dirichlet noise to
         
         # declare shared memory ( no init )
-        self.tree = SharedTree(num_blocks=num_simulations, node_cls=node_class, name=f'{name}.tree')
+        self.tree_factory = functools.partial(
+            SharedTree,
+            num_simulations, node_class, f'{name}.tree')
         # TODO: this could be optional; and each process can have its own network instance instead.
-        self.inference_buffer = AlphaDevInferenceService(
-            num_blocks=self.inference_buffer_size,
-            network_factory=network_factory,
-            batch_size=batch_size,
-            factory_args=network_factory_args,
-            factory_kwargs=network_factory_kwargs,
-            name=f'{name}.inference'
-        )
-        self.task_allocator = SharedTaskAllocator()
+        self.inference_buffer_factory = functools.partial(
+            AlphaDevInferenceService,
+            self.inference_buffer_size,
+            network_factory,
+            batch_size,
+            network_factory_args,
+            network_factory_kwargs,
+            f'{name}.inference'
+            )
+        self.task_allocator_factory = functools.partial(
+            SharedTaskAllocator, f'{name}.task_allocator')
+        
         self._init_task_allocation = \
             [APV_MCTS.SEARCH_SIM_TASK] * (ADConfig.num_actors - 1) + [APV_MCTS.BACKUP_TASK] # last actor is the one listening to the evaluator
         
+        # construct local shared memory managers
+        self.tree = self.tree_factory()
+        self.inference_buffer = self.inference_buffer_factory()
+        self.task_allocator = self.task_allocator_factory()
+        
+        # configure the shared memory managers
+        self.tree.configure()
+        self.inference_buffer.configure()
+        self.task_allocator.configure()
+        
+        # set initial task allocation
+        self.task_allocator.allocate(self._init_task_allocation)
+        
+        # declare the inference process and actor pool
         # TODO: make optional
-        self.initialized = False
-        self.inference_process = mp.Process(target=self._init_inference, args=(inference_device_config,), name=f'{name}.inf_proc')
-        self._init_main()
-        self.inference_process.start()
+        self.inference_process = mp.Process(
+            target=_run_inference,
+            args=(
+                self.inference_buffer_factory,
+                inference_device_config,
+            ),
+            name=f'{name}.inf_proc')
+        
         self.actor_pool = mp.Pool(processes=ADConfig.num_actors)
-        print(f"APV_MCTS: Inference process started with PID {self.inference_process.pid}.")
-        print("Finished initialization.")
+        
+        # start the inference processs
+        self.inference_process.start()
+        logger.debug(f"APV_MCTS[main]: Inference process started with PID {self.inference_process.pid}.")
+        
+        logger.info("APV_MCTS[main]: Finished initialization.")
     
     def search(self, observation):
         """
@@ -441,171 +474,216 @@ class APV_MCTS(object):
         Finally, it returns a pointer to the root node, which can be used to perform post-mcts action selection.
         """
         # TODO: support only partially resetting the tree.
-        print('APV_MCTS[main process] Starting search simulation phase.')
+        logger.debug('APV_MCTS[main process] Starting search simulation phase.')
         self.tree.reset()
         
         self.inference_buffer.submit(node_offset=0, observation=observation)
         
-        print('APV_MCTS[main process] Waiting for inference service to return prior and value estimate.')
+        logger.debug('APV_MCTS[main process] Waiting for inference service to return prior and value estimate.')
         with self.inference_buffer.poll_ready() as inference_result:
             _, prior, _ = inference_result
-        print('APV_MCTS[main process] Received prior and value estimate from inference service.')
+        logger.debug('APV_MCTS[main process] Received prior and value estimate from inference service.')
         # Add exploration noise to the prior.
         noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
         prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
         
         legal_actions = self.model.legal_actions()
         
-        self.root: Node = self.tree.get_root()
-        self.root.set_legal_actions(legal_actions)
+        root: Node = self.tree.get_root()
+        root.set_legal_actions(legal_actions)
         
-        self.root.expand(prior)
-        print('APV_MCTS[main process] Root node initialized with prior and legal actions. Starting pool')
+        root.expand(prior)
+        logger.debug('APV_MCTS[main process] Root node initialized with prior and legal actions. Starting pool')
+        
         # all that is left is to start the pool.
-        statistics = self.actor_pool.map(self._run_task, range(ADConfig.num_actors))
-        for o in self.observers:
-            o.update(statistics, self.root, self.tree, self.inference_buffer)
-        
-        return self.root  # return the root node, which now contains the search results
-
-    def _init_main(self):
-        """
-        Initialize the root node of the search tree.
-        The root node is a special node that is not expanded and has no parent.
-        It is created in the shared memory and its attributes are set to zero.
-        """
-        logger.info("APV_MCTS[main process] Initializing the shared tree and inference service.")
-        # we can also test the inference service here 
-        # TODO: handle case where inference is not a process
-        self.task_allocator.configure()
-        self.task_allocator.allocate(self._init_task_allocation)
-        self.inference_buffer.configure()
-        self.tree.configure()
-        self.initialized = True
-    
-    def _init_actor(self):
-        """To be called from a subprocess"""
-        logger.info("APV_MCTS[actor process] Initializing the actor process.")
-        self.task_allocator.attach()
-        self.tree.attach()
-        self.inference_buffer.attach()
-        self.initialized = True
-    
-    def _init_inference(self, device_config):
-        """To be called from a subprocess"""
-        logger.info("APV_MCTS[inference process] Initializing the inference service.")
-        # TODO: setup tensorflow device config.
-        self.inference_buffer.attach()
-        self.initialized = True
-        # run indefinitely
-        self.inference_buffer.run()
-
-    def _phase_1(self):
-        """
-        Starting from the root (s_0), traverse the existing nodes in the tree following a search policy
-        a_L = argmax_a(Q + u); with u=puct(s_L) = c_puct * prior * sqrt(N) / (1 + N) and Q = W / N
-        until a leaf node is reached.
-        In each node (s_L) we visit, we increment the virtual loss as W(s_L,a_L) += vl_const; N(s_L,a_L) += 1
-        Once a leaf node is reached, we 
-        - obtain reward and legal actions from the model
-            r_L, mask_L = model.step(a[0..L])
-        - submit a new inference task to the inference service.
-        - backpropagate the reward for each t <= L as
-            W(s_t,a_t) = W(s_t,a_t) - vl_const + r_L*discount^(L-t); N(s_t,a_t) = N(s_t,a_t) - 1 + 1 [i.e. no actual update]
-        
-        Once the inference task is done, we will asynchronously make a second backward pass (and check tree consistency),
-        see `_phase_2` method.
-        """
-        print('APV_MCTS[phase 1] Starting search simulation phase.')
-        node = self.root
-        actions = []; trajectory = []
-        while node.expanded:
-            action = self.search_policy(node)
-            node = node.select(action) # increment virtual loss
-            actions.append(action)
-            trajectory.append(node)  # keep track of the trajectory for backpropagation
-        
-        # before simulating, initialize the new node.
-        new_node: Node = tree.append_child(trajectory[-2], actions[-1]) # pass the path to make sure only one block is reserved for this node.
-        if new_node is None:
-            # this node is already being evaluated by some other process.
-            for n, a in zip(trajectory[:-1], actions):
-                n.deselect(a)
-            return False  # we need to try again, the node was overwritten by another process
-        
-        # then run the simulation update the node with the results. This delay also enables other processes to write stuff
-        timestep = self.model.step(actions, update=False)
-        legal_actions = self.model.legal_actions()
-        # now we can check for tree consistency (whether any other process has overwritten the node)
-        if not new_node.is_consistent():
-            for n, a in zip(trajectory[:-1], actions):
-                n.deselect(a)
-            return False # we need to try again, the node was overwritten by another process
-        
-        # otherwise, submit a new inference task to the inference service.
-        observation = timestep.observation
-        self.inference_buffer.submit(
-            node_offset=new_node.offset,
-            observation=observation
+        logger.debug('APV_MCTS[main process] Starting actor pool with %d actors.', ADConfig.num_actors)
+        statistics = self.actor_pool.map(
+            _run_task,
+            [(i,
+              self.tree_factory, self.inference_buffer_factory, self.task_allocator_factory,
+              self.model, self.search_policy, self.discount
+              ) for i in range(ADConfig.num_actors)
+            ]
         )
-        # perform a backward pass with the reward and legal actions
-        reward = timestep.reward[0] # there might be other outputs but they are irrelevant for mcts
-        terminal = timestep.final()
         
-        new_node.set_terminal(terminal)
-        new_node.set_legal_actions(legal_actions)
-        new_node.set_reward(reward)
+        for o in self.observers:
+            o.update(statistics, root, self.tree, self.inference_buffer)
+        
+        return root  # return the root node, which now contains the search results
 
-        # backpropagate the reward for each t < L and remove the virtual loss.
-        reward = self.discount * reward  # discount the reward for the backpropagation
+def _run_inference(
+    inference_factory: Callable[[], AlphaDevInferenceService],
+    device_config: Union[Dict, None] = None
+    ):
+    """To be called from a subprocess"""
+    if device_config is not None:
+        logger.info("APV_MCTS[inference process] Applying device configuration")
+        apply_device_config(device_config)
+    # initialize the inference service
+    logger.info("APV_MCTS[inference process] Initializing inference service.")
+    # TODO: setup tensorflow device config.
+    inference_buffer = inference_factory()
+    inference_buffer.attach()
+    # run indefinitely
+    inference_buffer.run()
+
+def _phase_1(root: Node, tree: SharedTree, model: AssemblyGameModel,
+             search_policy: callable, inference_buffer: AlphaDevInferenceService,
+             discount: float):
+    """
+    Starting from the root (s_0), traverse the existing nodes in the tree following a search policy
+    a_L = argmax_a(Q + u); with u=puct(s_L) = c_puct * prior * sqrt(N) / (1 + N) and Q = W / N
+    until a leaf node is reached.
+    In each node (s_L) we visit, we increment the virtual loss as W(s_L,a_L) += vl_const; N(s_L,a_L) += 1
+    Once a leaf node is reached, we 
+    - obtain reward and legal actions from the model
+        r_L, mask_L = model.step(a[0..L])
+    - submit a new inference task to the inference service.
+    - backpropagate the reward for each t <= L as
+        W(s_t,a_t) = W(s_t,a_t) - vl_const + r_L*discount^(L-t); N(s_t,a_t) = N(s_t,a_t) - 1 + 1 [i.e. no actual update]
+    
+    Once the inference task is done, we will asynchronously make a second backward pass (and check tree consistency),
+    see `_phase_2` method.
+    """
+    logger.debug('APV_MCTS[phase 1] Starting search simulation phase.')
+    node = root
+    actions = []; trajectory = []
+    while node.expanded:
+        action = search_policy(node)
+        node = node.select(action) # increment virtual loss
+        actions.append(action)
+        trajectory.append(node)  # keep track of the trajectory for backpropagation
+    
+    # before simulating, initialize the new node.
+    new_node: Node = tree.append_child(trajectory[-2], actions[-1]) # pass the path to make sure only one block is reserved for this node.
+    if new_node is None:
+        # this node is already being evaluated by some other process.
         for n, a in zip(trajectory[:-1], actions):
-            n.visit_child(a, reward)
-            reward *= self.discount
-        
-        return True  # we successfully submitted the task for evaluation
+            n.deselect(a)
+        return False  # we need to try again, the node was overwritten by another process
+    
+    # then run the simulation update the node with the results. This delay also enables other processes to write stuff
+    timestep = model.step(actions, update=False)
+    legal_actions = model.legal_actions()
+    # now we can check for tree consistency (whether any other process has overwritten the node)
+    if not new_node.is_consistent():
+        for n, a in zip(trajectory[:-1], actions):
+            n.deselect(a)
+        return False # we need to try again, the node was overwritten by another process
+    
+    # otherwise, submit a new inference task to the inference service.
+    observation = timestep.observation
+    inference_buffer.submit(
+        node_offset=new_node.offset,
+        observation=observation
+    )
+    # perform a backward pass with the reward and legal actions
+    reward = timestep.reward[0] # there might be other outputs but they are irrelevant for mcts
+    terminal = timestep.final()
+    
+    new_node.set_terminal(terminal)
+    new_node.set_legal_actions(legal_actions)
+    new_node.set_reward(reward)
 
-    def _phase_2(self):
-        """
-        Process the predictions of the network.
-        - Poll the inference buffer for a result.
-        - Update the prior and value of the node with the result.
-        - Backpropagate the value estimate to the root node.
-        """
-        print('APV_MCTS[phase 2] Starting backup phase.')
-        with self.inference_buffer.poll_ready(timeout=10) as result:
-            if result is None: 
-                if self.tree.is_full():
-                    raise TreeFull()
+    # backpropagate the reward for each t < L and remove the virtual loss.
+    for n, a in zip(trajectory[:-1], actions):
+        reward *= discount
+        n.visit_child(a, reward)
+    
+    return True  # we successfully submitted the task for evaluation
+
+def _phase_2(tree: SharedTree, inference_buffer: AlphaDevInferenceService, discount: float):
+    """
+    Process the predictions of the network.
+    - Poll the inference buffer for a result.
+    - Update the prior and value of the node with the result.
+    - Backpropagate the value estimate to the root node.
+    """
+    with inference_buffer.poll_ready(timeout=10) as result:
+        if result is None: 
+            return False  # no result available, nothing to do here.
+        node_offset = result.node_offset
+        prior = result.prior
+        value = result.value
+        logger.debug('APV_MCTS[phase 2] result with offset %s.', node_offset)
+    # obtain the node from the shared tree and check for consistency.
+    node = tree.get_by_offset(node_offset)
+    if not node.is_consistent():
+        # the node was overwritten by another process, nothing to do here.
+        return False
+    # expand the current node
+    node.expand(prior) # reward, legal_actions and terminal are already set
+    # backpropagate without touching the virtual loss.
+    while not node.is_root:
+        parent = node.parent
+        # update the parent with the value estimate and visit count
+        parent.update_child(node.action_id, value)
+        # then move to the parent node and discount the value
+        node = parent
+        value *= discount
+    return True
+
+def _run_task(
+    args):
+        (
+            process_id,
+            tree_factory,
+            inference_factory,
+            task_allocator_factory,
+            model,
+            search_policy,
+            discount
+        ) = args
+        tree = tree_factory(); tree.attach()
+        inference_buffer = inference_factory(); inference_buffer.attach()
+        task_allocator = task_allocator_factory(); task_allocator.attach()
+        
+        
+        my_task_id = task_allocator.get_task(process_id)
+        root = tree.get_root()
+        stats = {
+            'process_id': process_id,
+            'task_ids': [my_task_id],
+            'num_fails': 0,
+            'num_successes': 0,
+            'start_time': time(),
+        }
+        logger.info(f"APV_MCTS[process {process_id}] Starting task with id {my_task_id}.")
+        should_stop = False
+        while not should_stop: # iterate indefinitely
+            try:
+                # query task 
+                stats['task_ids'].append(my_task_id)
+                if my_task_id == APV_MCTS.SEARCH_SIM_TASK:
+                    # run phase 1
+                    result = _phase_1(
+                        root=root, tree=tree, model=model,
+                        search_policy=search_policy,
+                        inference_buffer=inference_buffer,
+                        discount=discount
+                    )
+                elif my_task_id == APV_MCTS.BACKUP_TASK:
+                    # run phase 2
+                    result = _phase_2(tree=tree, inference_buffer=inference_buffer, discount=discount)
+                    if not result and tree.is_full() and inference_buffer.is_idle():
+                        # if we didn't manage to process the result and the inference buffer is done,
+                        # we can stop the process.
+                        should_stop = True
+                        logger.debug(f"APV_MCTS[process {process_id}] Inference buffer is done, stopping.")
+                        break
                 else:
-                    raise RuntimeError("No inference results for 10 seconds and tree is not full. Check.")
-            node_offset = result.node_offset
-            prior = result.prior
-            value = result.value
-        # obtain the node from the shared tree and check for consistency.
-        node = self.tree.get_by_offset(node_offset)
-        if not node.is_consistent():
-            # the node was overwritten by another process, nothing to do here.
-            return False
-        # expand the current node
-        node.expand(prior) # reward, legal_actions and terminal are already set
-        # backpropagate without touching the virtual loss.
-        while not node.is_root:
-            parent = node.parent
-            # update the parent with the value estimate and visit count
-            parent.update_child(node.action_id, value)
-            # then move to the parent node and discount the value
-            node = parent
-            value *= self.discount
-        return True
-
-    def _run_task(self, process_id: int):
-        if not self.initialized:
-            self._init_actor()
-        my_task_id = self.task_allocator.get_task(process_id)
-        print(f'APV_MCTS[actor {process_id}] Starting task execution my_task_id({my_task_id})')
-        my_task = self._phase_1 if my_task_id == APV_MCTS.SEARCH_SIM_TASK else self._phase_2
-        
-        try:
-            my_task()
-        except TreeFull:
-            pass # if tree is full do not schedule anything.
+                    logger.error(f"Unknown task id {my_task_id} for process {process_id}.")
+                    break
+                if result: stats['num_successes'] += 1
+                else:      stats['num_fails']     += 1
+                my_task_id = task_allocator.get_task(process_id)
+            except TreeFull:
+                logger.debug(f"APV_MCTS[process {process_id}] Tree is full, exiting.")
+                break
+            except Exception as e:
+                logger.error(f"APV_MCTS[process {process_id}] Error during task execution: {e}")
+                raise e
+        stats['end_time'] = time()
+        stats['duration'] = stats['end_time'] - stats['start_time']
+        logger.info(f"APV_MCTS[process {process_id}] Task completed with stats: {stats}")
+        return stats

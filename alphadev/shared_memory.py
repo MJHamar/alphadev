@@ -187,11 +187,14 @@ class IOBuffer(BaseMemoryManager):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
         self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=True, size=self._header_size)
-        self._header = BufferHeader(self._header_shm, 0, length=self._num_blocks)
         self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=True, size=self._input_size*self._num_blocks)
         self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=True, size=self._output_size*self._num_blocks)
         
         self.reset()  # clear the header and input/output blocks
+    
+    @property
+    def header(self):
+        return BufferHeader(self._header_shm, 0, length=self._num_blocks)
     
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
@@ -204,7 +207,6 @@ class IOBuffer(BaseMemoryManager):
     def attach(self):
         self._is_main = False
         self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
-        self._header = BufferHeader(self._header_shm, 0, length=self._num_blocks)
         self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=False, size=self._input_size)
         self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=False, size=self._output_size)
 
@@ -223,30 +225,30 @@ class IOBuffer(BaseMemoryManager):
             self._output_shm.unlink()
     
     def _next_in(self):
-        with self._header.in_index() as in_index:
+        with self.header.in_index() as in_index:
             index = in_index.fetch_inc()  # increment the in_index atomically
         index = index % self._num_blocks  # wrap around the index
-        assert not self._header.submitted[index], "Circular input buffer full."
+        assert not self.header.submitted[index], "Circular input buffer full."
         return index
     def _next_out(self):
-        with self._header.out_index() as out_index:
+        with self.header.out_index() as out_index:
             index = out_index.fetch_inc()  # increment the out_index atomically
         index = index % self._num_blocks  # wrap around the index
-        assert not self._header.ready[index], "Circular output buffer full."
+        assert not self.header.ready[index], "Circular output buffer full."
         return index
     
     def submit(self, **payload):
         index = self._next_in()
         iblock = self._input_element_cls(self._input_shm, index * self._input_size)
         iblock.write(**payload)
-        self._header.submitted[index] = True
+        self.header.submitted[index] = True
     
     def ready(self, payload_list: List[Dict[str, np.ndarray]]):
         for payload in payload_list:
             index = self._next_out()
             oblock = self._output_element_cls(self._output_shm, index * self._output_size)
             oblock.write(**payload)
-            self._header.ready[index] = True
+            self.header.ready[index] = True
     
     @contextlib.contextmanager
     def poll_submitted(self, max_samples:int, localize:bool=True):
@@ -259,12 +261,12 @@ class IOBuffer(BaseMemoryManager):
         start_mod = (self.submitted_read_head % self._num_blocks)
         start_mod = start_mod if start_mod != 0 else self._num_blocks-1  # avoid zero mod for circular buffer
         while (self.submitted_read_head % self._num_blocks) != start_mod and len(inp) < max_samples:
-            if self._header.submitted[self.submitted_read_head]:
+            if self.header.submitted[self.submitted_read_head]:
                 # read the output block and localize its contents. 
                 iblock = self._input_element_cls(self._input_shm, self.submitted_read_head * self._input_size)
                 if localize:
                     inp.append(iblock.read())
-                    self._header.submitted[self.submitted_read_head] = False  # clear the ready flag
+                    self.header.submitted[self.submitted_read_head] = False  # clear the ready flag
                 else:
                     inp.append(iblock); indices.append(self.submitted_read_head)  # keep the index for later use
             # increment the index
@@ -274,24 +276,29 @@ class IOBuffer(BaseMemoryManager):
         else:
             yield inp
             # clear the ready flag after the context is exited
-            for idx in indices: self._header.submitted[idx] = False
+            for idx in indices: self.header.submitted[idx] = False
 
     @contextlib.contextmanager
     def poll_ready(self, localize:bool=True, timeout=None):
         start = time()
         while timeout is None or time() - start > timeout:
-            if self._header.ready[self.ready_read_head]:
+            if self.header.ready[self.ready_read_head]:
                 break
             self.ready_read_head = (self.ready_read_head + 1) % self._num_blocks
         else:
-            return None # timeout reached.
+            yield None # timeout reached.
+            return
         # read the output block and localize its contents.
         oblock = self._output_element_cls(self._output_shm, self.ready_read_head * self._output_size)
         if localize:
             output = oblock.read()
-            self._header.ready[self.ready_read_head] = False  # clear the ready flag
+            self.header.ready[self.ready_read_head] = False  # clear the ready flag
             yield output
         else:
             yield oblock
             # clear the rady flag only after the context is exited
-            self._header.ready[self.ready_read_head] = False
+            self.header.ready[self.ready_read_head] = False
+
+    def is_idle(self):
+        header = self.header
+        return not header.submitted.any() and not header.ready.any()

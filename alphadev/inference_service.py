@@ -42,16 +42,10 @@ class AlphaDevInferenceService(IOBuffer):
         self._factory_kwargs = factory_kwargs or {}
     
     # not overriding configure() or reset().
+    # not overriding __del__() or attach() either
     
     def _create_network(self):
         return self._network_factory(*self._factory_args, **self._factory_kwargs)
-
-    def attach(self):
-        super().attach() # the shared memory.
-        # also instantiate the network.
-        self._network = self._create_network()
-    
-    # not overriding __del__() either
     
     def run(self):
         """Run the inference service.
@@ -59,6 +53,9 @@ class AlphaDevInferenceService(IOBuffer):
         Note that  IOBuffer onlly uses a lock for writing, reading is lock free. consequently,
         running the inference service on multiple processes can be quite redundant but not incorrect.
         """
+        if not hasattr(self, '_network'):
+            self._network = self._create_network()
+            print(f"AlphaDevInferenceService: created network {self._network}")
         def stack_requests(*requests):
             return tf.stack(requests, axis=0)
         num_timeouts = 0
