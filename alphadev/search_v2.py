@@ -159,6 +159,21 @@ class RootNode(Node):
         self.root_attrs[self.__class__._root_W_idx] += value
         self.root_attrs[self.__class__._root_N_idx] += 1
         self.deselect(self.action_id)
+
+    def expand(self, prior, value):
+        """
+        Overriding the expand method to set the root attributes.
+        The root node has a special visit count and value estimate.
+        """
+        self.prior = prior
+        self.root_attrs[self.__class__._root_W_idx] = value
+        self.header[self.__class__.hdr_expanded] = True
+    
+    def is_consistent(self):
+        return True
+    
+    def set_parent(self, parent_offset, action):
+        raise RuntimeError("Root node cannot have a parent. This is a bug in the code.")
     
     @property
     def value(self):
@@ -216,7 +231,8 @@ class SharedTree(BaseMemoryManager):
         assert self._is_main, "reset() should only be called in the main process."
         SharedTreeHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
         self._root_cls.clear_block(self._data_shm, 0)  # clear the root node
-        for i in range(1,self.num_blocks+1):
+        self.root = self._root_cls(self._data_shm, 0)  # instantiate the root node
+        for i in range(1,self.num_blocks+1): # block 0 is the root.
             self._node_cls.clear_block(self._data_shm, self.i2off(i))
     
     def attach(self):
@@ -473,7 +489,6 @@ class APV_MCTS(object):
         legal_actions = self.model.legal_actions()
         
         self.root: Node = self.tree.get_root()
-        self.root.set_root()
         self.root.set_legal_actions(legal_actions)
         
         self.root.expand(prior, value)
