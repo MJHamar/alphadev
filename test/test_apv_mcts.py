@@ -87,7 +87,7 @@ def run_mcts():
         exploration_fraction=exploration_fraction,
         discount=1.0,
         node_class=Node_V2,
-        batch_size=8,
+        batch_size=16,
     )
     outer_model = DummyModel(timestep)
     # while timestep.step_type != StepType.LAST:

@@ -12,41 +12,44 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class ArrayElement(NamedTuple):
-    dtype: np.dtype
-    shape: tuple
-    def size(self, *args, **kwargs):
+class ArrayElement(object):
+    def __init__(self, dtype: np.dtype, shape: tuple):
+        self.dtype = np.dtype(dtype)
+        self.shape = shape
+        self._size = None
+    
+    def _get_size(self, *args, **kwargs):
         return np.int32(np.dtype(self.dtype).itemsize * np.prod(self.shape))
+    
+    def size(self, *args, **kwargs):
+        if self._size is None:
+            self._size = self._get_size(*args, **kwargs)
+        return self._size
     def create(self, shm, offset, *args, **kwargs):
         return np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf, offset=offset)
 
-AtomicContext = functools.partial
-class AtomicCounterElement(NamedTuple):
-    def size(self, *args, **kwargs):
-        return np.dtype(np.int32).itemsize
-    def create(self, shm, offset, *args, **kwargs):
-        return functools.partial(
-            atomics.atomicview,
-            shm.buf[offset:offset + self.size(*args, **kwargs)], atype=atomics.INT
-            )
-
 class VarLenArrayElement(ArrayElement):
-    def size(self, length, *args, **kwargs):
+    def _get_size(self, length, *args, **kwargs):
         return np.dtype(self.dtype).itemsize * np.prod((length, *self.shape))
     def create(self, shm, offset, length, *args, **kwargs):
         return np.ndarray((length, *self.shape), dtype=self.dtype, buffer=shm.buf, offset=offset)
 
-class NestedArrayElement(NamedTuple):
+class NestedArrayElement(ArrayElement):
     dtype: np.dtype
     shape: tuple
     model: Union[Dict[str, np.ndarray], NamedTuple]
-    def size(self, *args, **kwargs):
+    def __init__(self, dtype, shape, model: Union[Dict[str, np.ndarray], NamedTuple]):
+        super().__init__(dtype, shape)
+        self.model = model
+    
+    def _get_size(self, *args, **kwargs):
         if isinstance(self.model, dict):
             return sum(element.dtype.itemsize*np.prod(element.shape) for element in self.model.values())
         elif isinstance(self.model, NamedTuple):
             return sum(getattr(self.model, name).dtype.itemsize * np.prod(getattr(self.model, name).shape) for name in self.model._fields)
         else:
             raise ValueError("self.model must be a dict or a NamedTuple.")
+    
     def create(self, shm, offset, *args, **kwargs):
         elements = {}
         crnt_offset = offset
@@ -65,6 +68,49 @@ class NestedArrayElement(NamedTuple):
             return elements
         elif isinstance(self.model, NamedTuple):
             return self.model._make(**elements)
+
+
+class AtomicContext:
+    """
+    Wrapper for atomics.atomicview with a peek() method that avoids having to initialize 
+    the atomic view context for read-only operations.
+    """
+    def __init__(self, buffer, offset, dtype=np.int32):
+        self._buffer = buffer
+        self._offset = offset
+        self._dtype = dtype
+        self._size = np.dtype(self._dtype).itemsize
+        assert np.dtype(self._dtype) == np.dtype(np.int32), "AtomicContext only supports int32 dtype."
+        self._atype = atomics.INT
+    
+    def __call__(self):
+        """return an atomicview context manager"""
+        return atomics.atomicview(
+            self._buffer[self._offset:self._offset+self._size],
+            atype=atomics.INT)
+    
+    def peek(self):
+        """
+        Peek the value without initializing the atomic view context.
+        Saves a bunch of time wasted on system calls.
+        """
+        return np.frombuffer(
+            self._buffer, offset=self._offset, count=1, dtype=self._dtype)[0]
+    
+    def copy(self):
+        """
+        Copy the atomic context to a new buffer and offset.
+        This is useful for creating a new atomic context with the same value.
+        """
+        raise NotImplementedError("AtomicContext cannot be copied.")
+
+class AtomicCounterElement(NamedTuple):
+    def size(self, *args, **kwargs):
+        return np.dtype(np.int32).itemsize
+    def create(self, shm, offset, *args, **kwargs):
+        return AtomicContext(
+            shm.buf, offset, dtype=np.int32)  # create an atomic context for the shared memory buffer
+
 
 class BlockLayout:
     _elements: Dict[str, ArrayElement] = {}
@@ -103,8 +149,7 @@ class BlockLayout:
         """Create a localized namedtuple with the contents of the block."""
         return namedtuple(self.__class__.__name__, self.__class__._elements.keys())(
             **{name: getattr(self, name).copy()
-               for name in self.__class__._elements.keys()
-               if type(getattr(self, name)) != AtomicContext}  # skip atomic counters for localization
+               for name in self.__class__._elements.keys()}  # skip atomic counters for localization
         )
     
     @classmethod

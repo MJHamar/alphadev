@@ -116,6 +116,8 @@ class AlphaDevConfig(object):
     # MCTS observers
     observe_mcts_policy: bool = True
     mcts_observer_ratio: float = 0.001
+    # profiling
+    do_profiling: bool = False
 
     def __post_init__(self):
         

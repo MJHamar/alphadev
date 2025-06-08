@@ -76,3 +76,5 @@ wanbd_run_id: null
 # Observers
 observe_mcts_policy: True
 mcts_observer_ratio: 0.001
+
+do_profiling: True

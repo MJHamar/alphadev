@@ -354,8 +354,7 @@ class SharedTree(BaseMemoryManager):
         Check if the tree is full.
         The tree is full if the index is equal to the number of blocks.
         """
-        with self.header.index() as idx:
-            return idx.load() >= self.num_blocks
+        return self.header.index.peek() >= self.num_blocks
 
 class TaskAllocatorHeader(BlockLayout):
     _elements = {
@@ -710,7 +709,9 @@ def _phase_2(tree: SharedTree, inference_buffer: AlphaDevInferenceService, disco
         value *= discount
     return True
 
-
+import cProfile
+import pstats
+import subprocess
 
 def _run_task(
     args):
@@ -744,6 +745,11 @@ def _run_task(
         }
         logger.debug(f"APV_MCTS[process {process_id}] Starting task with id {my_task_id}.")
         should_stop = False
+        
+        if ADConfig.do_profiling:
+            profiler = cProfile.Profile()
+            profiler.enable()
+        
         # num_iterations = 0
         while not should_stop: # iterate indefinitely
             try:
@@ -789,4 +795,14 @@ def _run_task(
         stats['end_time'] = time()
         stats['duration'] = stats['end_time'] - stats['start_time']
         logger.info("APV_MCTS[process %s] done. duration: %s; successes: %d, fails: %d", process_id, stats['duration'], stats['num_successes'], stats['num_fails'])
+
+        if ADConfig.do_profiling:
+            profiler.disable()
+            prof_stats = pstats.Stats(profiler)
+            prof_stats.sort_stats('cumulative')
+            # print_mask_stats(actor._model._environment._action_space_storage)
+            prof_stats.dump_stats(f'profile/apv_mcts_profile_{process_id}.prof')
+            subprocess.run(['flameprof', '-i', f'profile/apv_mcts_profile_{process_id}.prof', '-o', f'profile/apv_mcts_flamegraph_{process_id}.svg'])
+            logger.debug(f"APV_MCTS[process {process_id}] Profiling done, results saved.")
+        
         return stats
