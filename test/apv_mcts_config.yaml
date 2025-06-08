@@ -13,8 +13,8 @@ num_latency_simulations: 1
 emulator_mode: 'i32'
 
 # Self-Play
-num_actors: 2
-num_simulations: 5
+num_actors: 3
+num_simulations: 1000
 
 # UCB formula
 pb_c_base: 19652

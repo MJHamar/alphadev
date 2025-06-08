@@ -25,7 +25,7 @@ logging.basicConfig(
     format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
 )
 
-logger.setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
 
 # Shared memory has a fixed size. for each MCTS, we do not need to re-allocate it
 # but we do need to re-initialize it.
@@ -281,7 +281,7 @@ class SharedTree(BaseMemoryManager):
     def _update_index(self):
         with self.header.index() as index_counter:
             index = index_counter.fetch_inc()
-            logger.info('SharedTree._update_index (nb %d) prev: %d crnt: %d, next: %d', self.num_blocks, self._local_write_head, index, index_counter.load())
+            logger.debug('SharedTree._update_index (nb %d) prev: %d crnt: %d, next: %d', self.num_blocks, self._local_write_head, index, index_counter.load())
         if index >= self.num_blocks:
             self._local_write_head = None # we are done
         else:
@@ -527,7 +527,7 @@ class APV_MCTS(object):
         self.inference_process.start()
         logger.debug(f"APV_MCTS[main]: Inference process started with PID {self.inference_process.pid}.")
         
-        logger.info("APV_MCTS[main]: Finished initialization.")
+        logger.debug("APV_MCTS[main]: Finished initialization.")
     
     def search(self, observation):
         """
@@ -572,7 +572,7 @@ class APV_MCTS(object):
         for o in self.observers:
             o.update(statistics, root, self.tree, self.inference_buffer)
         
-        logger.info('APV_MCTS[main process] search done. Root (W/N):\n %s', list(zip(root.W, root.N)))
+        logger.debug('APV_MCTS[main process] search done. Root (W/N):\n %s', list(zip(root.W, root.N)))
         
         return root  # return the root node, which now contains the search results
 
@@ -582,10 +582,10 @@ def _run_inference(
     ):
     """To be called from a subprocess"""
     if device_config is not None:
-        logger.info("APV_MCTS[inference process] Applying device configuration")
+        logger.debug("APV_MCTS[inference process] Applying device configuration")
         apply_device_config(device_config)
     # initialize the inference service
-    logger.info("APV_MCTS[inference process] Initializing inference service.")
+    logger.debug("APV_MCTS[inference process] Initializing inference service.")
     # TODO: setup tensorflow device config.
     inference_buffer = inference_factory()
     inference_buffer.attach()
@@ -624,14 +624,14 @@ def _phase_1(root: Node, tree: SharedTree, model: AssemblyGameModel,
     logger.debug('APV_MCTS[phase 1] Reached leaf via %s.', list(zip(trajectory, actions)))
     # before simulating, initialize the new node.
     if node is not None:
-        logger.error('APV_MCTS[phase 1] Node %s is not None and not expanded', repr(node))
+        logger.debug('APV_MCTS[phase 1] Node %s is not None and not expanded', repr(node))
         # someone else is already evaluating this node.
         return False
     # otherwise, append new child and check if it worked.
     node = tree.append_child(trajectory[-1], actions[-1]) # pass the path to make sure only one block is reserved for this node.
     if node is None:
         # if it didn't work, clean up.
-        logger.error('APV_MCTS[phase 1] Failed to append child node.')
+        logger.debug('APV_MCTS[phase 1] Failed to append child node.')
         # this node is already being evaluated by some other process.
         for n, a in zip(trajectory, actions):
             n.deselect(a)
@@ -646,7 +646,7 @@ def _phase_1(root: Node, tree: SharedTree, model: AssemblyGameModel,
     logger.debug('APV_MCTS[phase 1] Simulation returned with reward %s.', timestep.reward)
     # now we can check for tree consistency (whether any other process has overwritten the node)
     if not node.is_consistent():
-        logger.error('APV_MCTS[phase 1] Node %s is not consistent.', repr(node))
+        logger.debug('APV_MCTS[phase 1] Node %s is not consistent.', repr(node))
         for n, a in zip(trajectory, actions):
             n.deselect(a)
         return False # we need to try again, the node was overwritten by another process
@@ -692,7 +692,7 @@ def _phase_2(tree: SharedTree, inference_buffer: AlphaDevInferenceService, disco
     node = tree.get_by_offset(node_offset)
     logger.debug('APV_MCTS[phase 2] result with offset %s (corr. node %s).', node_offset, repr(node))
     if not node.is_consistent():
-        logger.error('APV_MCTS[phase 2] Node %s is not consistent. parent\'s pointer %s, child %s,',
+        logger.debug('APV_MCTS[phase 2] Node %s is not consistent. parent\'s pointer %s, child %s,',
                     repr(node), repr(node.parent), repr(tree.get_node(node.parent.children[node.action_id]//tree._node_size)))
         # the node was overwritten by another process, nothing to do here.
         return False
@@ -700,7 +700,7 @@ def _phase_2(tree: SharedTree, inference_buffer: AlphaDevInferenceService, disco
     logger.debug('APV_MCTS[phase 2] Expanding node %s', repr(node))
     node.expand(prior) # reward, legal_actions and terminal are already set
     # backpropagate without touching the virtual loss.
-    logger.info('APV_MCTS[phase 2] Backpropagating value %s for node %s', value, repr(node))
+    logger.debug('APV_MCTS[phase 2] Backpropagating value %s for node %s', value, repr(node))
     while not node.is_root:
         parent = node.parent
         # update the parent with the value estimate and visit count
@@ -742,7 +742,7 @@ def _run_task(
             'num_successes': 0,
             'start_time': time(),
         }
-        logger.info(f"APV_MCTS[process {process_id}] Starting task with id {my_task_id}.")
+        logger.debug(f"APV_MCTS[process {process_id}] Starting task with id {my_task_id}.")
         should_stop = False
         # num_iterations = 0
         while not should_stop: # iterate indefinitely
@@ -758,7 +758,7 @@ def _run_task(
                         discount=discount
                     )
                     if result:
-                        logger.warn("APV_MCTS[process %s] Phase 1 done; success: %s full: %s, idle_ %s", process_id, result, tree.is_full(), inference_buffer.is_idle())
+                        logger.debug("APV_MCTS[process %s] Phase 1 done; success: %s full: %s, idle_ %s", process_id, result, tree.is_full(), inference_buffer.is_idle())
                     # # for debugging.
                     # if num_iterations == 5:
                     #     should_stop = True
@@ -767,7 +767,7 @@ def _run_task(
                     # run phase 2
                     result = _phase_2(tree=tree, inference_buffer=inference_buffer, discount=discount)
                     if result:
-                        logger.warn("APV_MCTS[process %s] Phase 2 done; success: %s full: %s, idle_ %s", process_id, result, tree.is_full(), inference_buffer.is_idle())
+                        logger.debug("APV_MCTS[process %s] Phase 2 done; success: %s full: %s, idle_ %s", process_id, result, tree.is_full(), inference_buffer.is_idle())
                     if tree.is_full() and inference_buffer.is_idle():
                         # if we didn't manage to process the result and the inference buffer is done,
                         # we can stop the process.
@@ -775,7 +775,7 @@ def _run_task(
                         logger.debug(f"APV_MCTS[process {process_id}] Inference buffer is done, stopping.")
                         break
                 else:
-                    logger.error(f"Unknown task id {my_task_id} for process {process_id}.")
+                    logger.debug(f"Unknown task id {my_task_id} for process {process_id}.")
                     break
                 if result: stats['num_successes'] += 1
                 else:      stats['num_fails']     += 1
@@ -784,9 +784,9 @@ def _run_task(
                 logger.debug(f"APV_MCTS[process {process_id}] Tree is full, exiting.")
                 break
             except Exception as e:
-                logger.error(f"APV_MCTS[process {process_id}] Error during task execution: {e}")
+                logger.debug(f"APV_MCTS[process {process_id}] debug during task execution: {e}")
                 raise e
         stats['end_time'] = time()
         stats['duration'] = stats['end_time'] - stats['start_time']
-        logger.warn("APV_MCTS[process %s] done. duration: %s; successes: %d, fails: %d", process_id, stats['duration'], stats['num_successes'], stats['num_fails'])
+        logger.info("APV_MCTS[process %s] done. duration: %s; successes: %d, fails: %d", process_id, stats['duration'], stats['num_successes'], stats['num_fails'])
         return stats

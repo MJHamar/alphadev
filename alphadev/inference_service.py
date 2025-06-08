@@ -10,6 +10,7 @@ from .shared_memory import *
 
 import logging
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 class InferenceTask(BlockLayout):
@@ -77,9 +78,9 @@ class AlphaDevInferenceService(IOBuffer):
                 inputs = tree.map_structure(stack_requests, *inputs)
                 # release the context as soon as the tensors are created.
             prior, *values = self._network(inputs)
-            print(f"AlphaDevInferenceService: prior type={type(prior)} values{values}")
+            logger.debug(f"AlphaDevInferenceService: prior type={type(prior)} values{values}")
             value = values[0] # ugly hack but there are versions of the network where >2 values are returned.
-            print(f"obtained shapes from network: offsets={node_offset}, prior={prior.shape}, value={value.shape}")
+            logger.debug(f"obtained shapes from network: offsets={node_offset}, prior={prior.shape}, value={value.shape}")
             self.ready([dict(
                 node_offset=off,
                 prior=p,

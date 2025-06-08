@@ -16,7 +16,7 @@ import numpy as np
 import logging
 logging.basicConfig(level=logging.DEBUG)
 
-num_simulations = 1000
+num_simulations = ADConfig.num_simulations
 
 dirichlet_alpha = 0.3
 exploration_fraction = 0.1
@@ -87,7 +87,7 @@ def run_mcts():
         exploration_fraction=exploration_fraction,
         discount=1.0,
         node_class=Node_V2,
-        batch_size=1,
+        batch_size=8,
     )
     outer_model = DummyModel(timestep)
     # while timestep.step_type != StepType.LAST:
