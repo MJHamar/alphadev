@@ -90,13 +90,14 @@ def run_mcts():
         batch_size=16,
     )
     outer_model = DummyModel(timestep)
-    # while timestep.step_type != StepType.LAST:
-    #     root = mcts.search(observation)
-    #     action = visit_count_policy(root, mask=outer_model.legal_actions())
-    #     timestep = outer_model.step(action)
-    root = mcts.search(observation)
-    action = visit_count_policy(root, mask=outer_model.legal_actions())
-    timestep = outer_model.step(action)
+    while timestep.step_type != StepType.LAST:
+        
+        root = mcts.search(observation)
+        action = visit_count_policy(root, mask=outer_model.legal_actions())
+        timestep = outer_model.step(action)
+    # root = mcts.search(observation)
+    # action = visit_count_policy(root, mask=outer_model.legal_actions())
+    # timestep = outer_model.step(action)
 
 
 if __name__ == "__main__":

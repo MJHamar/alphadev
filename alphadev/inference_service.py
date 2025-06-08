@@ -66,11 +66,11 @@ class AlphaDevInferenceService(IOBuffer):
         while True:
             with self.poll_submitted(self.batch_size, localize=False) as tasks:
                 if len(tasks) == 0:
-                    # num_timeouts += 1
-                    # if num_timeouts > 100000:
-                    #     # print(f"AlphaDevInferenceService: No tasks submitted for the last {num_timeouts} iterations, going to sleep for a bit.")
-                    #     num_timeouts = 0
-                    #     sleep(0.001) # TODO: adjust this to a config parameter.
+                    num_timeouts += 1
+                    if num_timeouts > 100000:
+                        # print(f"AlphaDevInferenceService: No tasks submitted for the last {num_timeouts} iterations, going to sleep for a bit.")
+                        num_timeouts = 0
+                        sleep(0.001) # TODO: adjust this to a config parameter.
                     continue
                 logger.debug(f"AlphaDevInferenceService: processing {len(tasks)} tasks")
                 node_offset = [t.node_offset for t in tasks] # list of node offsets to update

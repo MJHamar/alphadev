@@ -80,6 +80,7 @@ class Node(BlockLayout):
     
     def __init__(self, shm, offset):
         super().__init__(shm, offset)
+        self._parent = None
     
     def expand(self, prior):
         self.prior = prior
@@ -147,10 +148,6 @@ class Node(BlockLayout):
         return self.mask
     
     @property
-    def parent(self) -> 'Node':
-        assert not self.is_root, "Trying to access the parent of the Root!"
-        return self.__class__(self.shm, self.parent_offset)
-    @property
     def value(self):
         """To be called during backprop, ignores the virtual loss."""
         assert False, '%s.value called.' % (repr(self),)
@@ -175,17 +172,30 @@ class Node(BlockLayout):
     def terminal(self):      return self.header[self.__class__.hdr_terminal] != 0
     def set_terminal(self, terminal): self.header[self.__class__.hdr_terminal] = terminal
     @property
-    def is_root(self):       return self.header[self.__class__.hdr_action] == -1
+    def is_root(self):       return self.header[self.__class__.hdr_parent] == -1
 
     def set_root(self):
         """Set this node as the root node."""
         self.header[self.__class__.hdr_parent] = -1
         self.header[self.__class__.hdr_action] = -1
+        self._parent = None # make sure parent is not incorrectly set.
+    
+    def _get_parent(self):
+        if self.is_root:
+            return None
+        if self._parent is None: self._parent = self.__class__(self.shm, self.parent_offset)
+        return self._parent
     
     def set_parent(self, parent_offset, action):
         self.header[self.__class__.hdr_parent] = parent_offset
         self.header[self.__class__.hdr_action] = action
+        self._parent = None # make sure parent is not incorrectly set.
         logger.debug('%s.set_parent parent_offset %s action %s.', repr(self), parent_offset, action)
+    
+    @property
+    def parent(self) -> 'Node':
+        assert not self.is_root, "Root has no parent."
+        return self._get_parent()
     
     def set_child(self, action_id, child_offset):
         """Set the child offset for the given action_id."""
@@ -198,7 +208,7 @@ class Node(BlockLayout):
     def set_reward(self, reward):
         logger.debug('%s.set_reward called with reward %s.', repr(self), reward)
         self.parent.R[self.action_id] = reward
-        
+    
     def __repr__(self):
         return f'Node(offset={self.offset}, action_id={self.action_id})'
 
@@ -790,7 +800,7 @@ def _run_task(
                 logger.debug(f"APV_MCTS[process {process_id}] Tree is full, exiting.")
                 break
             except Exception as e:
-                logger.debug(f"APV_MCTS[process {process_id}] debug during task execution: {e}")
+                logger.error(f"APV_MCTS[process {process_id}] Error during task execution: {e}")
                 raise e
         stats['end_time'] = time()
         stats['duration'] = stats['end_time'] - stats['start_time']
