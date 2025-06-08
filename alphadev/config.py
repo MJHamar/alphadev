@@ -94,11 +94,10 @@ class AlphaDevConfig(object):
     replay_server_port: int = None
     # variable service
     variable_service_name: str = 'variable'
-    # inference service
-    make_inference_service: bool = False # if False, all actors will have their own version of the network
-    inference_service_backend: Literal['redis', 'shm'] = 'redis'
-    inference_service_name: str = 'inference'
-    inference_accumulation_period: int = 1.0
+    # search single-threaded or asynchronous
+    use_async_search: bool = True # if False, all actors will have their own version of the network
+    async_search_num_pools: int = 1 # number of parallel search pools to use in async search
+    async_search_processes_per_pool: Union[int, str] = 'auto' # number of processes per pool, 'auto' will distribute all available cores evently
     # device config
     device_config_path: Optional[str] = 'device_config.yaml'
     
@@ -117,7 +116,7 @@ class AlphaDevConfig(object):
     observe_mcts_policy: bool = True
     mcts_observer_ratio: float = 0.001
     # profiling
-    do_profiling: bool = False
+    do_mcts_profiling: bool = False
 
     def __post_init__(self):
         
@@ -177,6 +176,14 @@ class AlphaDevConfig(object):
             'port': self.redis_port,
             'db': self.redis_db
         }
+        
+        if self.use_async_search:
+            if isinstance(self.async_search_processes_per_pool, str) and self.async_search_processes_per_pool == 'auto':
+                self.async_search_processes_per_pool = os.cpu_count() // self.async_search_num_pools
+            elif isinstance(self.async_search_processes_per_pool, int):
+                pass
+            else:
+                raise ValueError("async_search_processes_per_pool must be 'auto' or an integer.")
         
         if self.replay_server_port is None:
             self.replay_server_port = portpicker.pick_unused_port()

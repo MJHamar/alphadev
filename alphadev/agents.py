@@ -52,7 +52,6 @@ from .observers import MCTSObserver
 from .service.service import Program, ReverbService, RPCService, RPCClient, SubprocessService
 from .config import AlphaDevConfig
 from .device_config import DeviceAllocationConfig
-from .inference_service import InferenceClient
 from .service.variable_service import VariableService
 
 
@@ -267,24 +266,6 @@ class DistributedMCTS:
             signature=signature)
         return [replay_table]
 
-    def inference(self, config: AlphaDevConfig):
-        """
-        The inference worker.
-        Runs the inference service in a separate process.
-        """
-        # create a temporary file where we write the inference config.
-        fname = os.path.abspath(os.path.curdir) + '/inference_config' + uuid().hex[:4] + '.yaml'
-
-        pickle.dump(config, open(fname, 'wb'))
-        # parameterize the subprocess call
-        subp = [sys.executable,
-            '-m',
-            'alphadev.inference_service',
-            fname]
-        # create a handle for the inference service
-        handle = InferenceClient(config)
-        return subp, handle, fname
-
     def learner(self, replay: reverb.Client, counter: counting.Counter,
                 variable_service: VariableService,
                 logger: loggers.Logger):
@@ -332,7 +313,6 @@ class DistributedMCTS:
         replay: reverb.Client,
         counter: counting.Counter,
         logger: loggers.Logger,
-        inference: InferenceClient = None,  # if none we use the network factory
         variable_service: VariableService = None,
     ) -> acme.EnvironmentLoop:
         """The actor process."""
@@ -343,18 +323,13 @@ class DistributedMCTS:
 
         mcts_observers = self._mcts_observers(logger)
         
-        network = inference
-        variable_client = None
-        if inference is None:
-            network = self._network_factory(self._env_spec.observations)
-            # If no inference client is provided, we create a new network.
-            tf2_utils.create_variables(network, [self._env_spec.observations])
-            # also create the variable service
-            variable_client = tf2_variable_utils.VariableClient(
-                client=variable_service,
-                variables={'network': network.trainable_variables},
-                update_period=self._variable_update_period,
-            )
+        network = self._network_factory(make_input_spec(self._env_spec.observations))
+        
+        variable_client = tf2_variable_utils.VariableClient(
+            client=variable_service,
+            variables={'network': network.trainable_variables},
+            update_period=self._variable_update_period,
+        )
 
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
@@ -408,7 +383,6 @@ class DistributedMCTS:
         self,
         counter: counting.Counter,
         logger: loggers.Logger,
-        inference: InferenceClient=None, # if none we use the network factory
         variable_service: VariableService = None,
     ):
         """The evaluation process."""
@@ -418,18 +392,13 @@ class DistributedMCTS:
 
         mcts_observers = self._mcts_observers(logger)
         
-        network = inference
-        variable_client = None
-        if inference is None:
-            network = self._network_factory(self._env_spec.actions)
-            # If no inference client is provided, we create a new network.
-            tf2_utils.create_variables(network, [self._env_spec.observations])
-            # also create the variable service
-            variable_client = tf2_variable_utils.VariableClient(
-                client=variable_service,
-                variables={'network': network.trainable_variables},
-                update_period=self._variable_update_period,
-            )
+        network = self._network_factory(make_input_spec(self._env_spec.observations))
+        
+        variable_client = tf2_variable_utils.VariableClient(
+            client=variable_service,
+            variables={'network': network.trainable_variables},
+            update_period=self._variable_update_period,
+        )
         
         if self._use_dual_value_network:
             actor = DualValueMCTSActor(
@@ -507,25 +476,6 @@ class DistributedMCTS:
                 device_config=learner_device_config,
                 )
 
-        if config.make_inference_service:
-            assert False, "Inference service doesn't work rn."
-            with program.group('inference'):
-                inference_device_config = self._device_config.get(
-                    DeviceAllocationConfig.make_process_key(
-                        DeviceAllocationConfig.ACTOR_PROCESS
-                    )
-                , None)
-                # TODO: no subprocessing is needed.
-                inference = program.add_service(
-                    SubprocessService(
-                        command_builder=self.inference, args=(config, ),)
-                )
-            actor_args = (replay, counter, logger, inference, None)
-            eval_args = (counter, logger, inference, None)
-        else:
-            actor_args = (replay, counter, logger, None, variable_service)
-            eval_args = (counter, logger, None, variable_service)
-
         with program.group('evaluator'):
             eval_device_config = self._device_config.get(
                 DeviceAllocationConfig.make_process_key(
@@ -537,7 +487,8 @@ class DistributedMCTS:
                     conn_config=config.distributed_backend_config,
                     instance_factory=self.evaluator,
                     instance_cls=acme.EnvironmentLoop,
-                    args=eval_args),
+                    args=(counter, logger, variable_service),
+                ),
                 device_config=eval_device_config
                 )
 
@@ -553,7 +504,9 @@ class DistributedMCTS:
                         conn_config=config.distributed_backend_config,
                         instance_factory=self.actor,
                         instance_cls=acme.EnvironmentLoop,
-                        args=actor_args),
+                        args=(
+                            replay, counter, logger, variable_service
+                        ),),
                     device_config=actor_device_config,
                     )
 

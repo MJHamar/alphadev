@@ -36,7 +36,6 @@ import tree
 
 from .observers import MCTSObserver
 from .search import visit_count_policy, mcts
-from .inference_service import InferenceClient
 
 import logging
 logger = logging.getLogger(__name__)
@@ -50,7 +49,7 @@ class MCTSActor(acmeMCTSActor):
         self,
         environment_spec: specs.EnvironmentSpec,
         model: models.Model,
-        network: Union[InferenceClient, snt.Module],
+        network: snt.Module,
         discount: float,
         num_simulations: int,
         search_policy: callable,
@@ -60,8 +59,6 @@ class MCTSActor(acmeMCTSActor):
         counter: Optional[counting.Counter] = None,
         observers: Optional[Sequence[MCTSObserver]] = [],
     ):
-        assert variable_client is None or isinstance(network, snt.Module), \
-            'If a variable client is provided, the network must be an snt.Module.'
         super().__init__(
             environment_spec=environment_spec,
             model=model,
@@ -80,16 +77,11 @@ class MCTSActor(acmeMCTSActor):
         self, observation: types.Observation) -> Tuple[types.Probs, types.Value]:
         """Performs a forward pass of the policy-value network."""
         # fix over acme implementation: accepts structured observations
-        if self._add_batch_dim:
-            logits, value = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
-        else:
-            logits, value = self._network(observation)
+        logits, value = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
 
         # Convert to numpy & take softmax.
-        if self._add_batch_dim:
-            logits = logits.numpy().squeeze(axis=0)
-        else:
-            logits = logits.numpy()
+        logits = logits.numpy().squeeze(axis=0)
+
         value = value.numpy().item()
         probs = special.softmax(logits)
 
