@@ -25,7 +25,7 @@ logging.basicConfig(
     format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
 )
 
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.WARNING)
 
 # Shared memory has a fixed size. for each MCTS, we do not need to re-allocate it
 # but we do need to re-initialize it.
@@ -187,6 +187,11 @@ class Node(BlockLayout):
         self.header[self.__class__.hdr_action] = action
         logger.debug('%s.set_parent parent_offset %s action %s.', repr(self), parent_offset, action)
     
+    def set_child(self, action_id, child_offset):
+        """Set the child offset for the given action_id."""
+        logger.debug('%s.set_child action_id %s child_offset %s. current child offset: %s', repr(self), action_id, child_offset, self.children[action_id])
+        self.children[action_id] = child_offset
+    
     def set_legal_actions(self, legal_actions):
         self.mask[:] = legal_actions
     
@@ -228,6 +233,7 @@ class SharedTree(BaseMemoryManager):
         # process-local
         self._is_main = False
         self._local_write_head = None
+        logger.debug('SharedTree initialized with %d blocks, node size %d, header size %d, data size %d.', self.num_blocks, self._node_size, self._header_size, self._data_size)
     
     def configure(self):
         """To be called by the parent process to allocate shared memory blocks."""
@@ -260,8 +266,7 @@ class SharedTree(BaseMemoryManager):
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)
 
         self.header = SharedTreeHeader(self._header_shm, 0)
-        with self.header.index() as index_counter:
-            self._local_write_head = index_counter.load() # get the current write head
+        self._update_index() # obtain a write location
     
     def __del__(self):
         logger.debug('SharedTree.__del__ called. is main: %s', self._is_main)
@@ -314,7 +319,7 @@ class SharedTree(BaseMemoryManager):
             return None
         
         child_offset = self.i2off(self._local_write_head)
-        parent.children[action] = child_offset
+        parent.set_child(action, child_offset)
         logger.debug('SharedTree.append_child: parent %s children[%d] set to %d.', repr(parent), action, child_offset)
         # now write the parent offset and action id to the child node's header
         child: Node = self._node_cls(self._data_shm, child_offset)
@@ -567,6 +572,8 @@ class APV_MCTS(object):
         for o in self.observers:
             o.update(statistics, root, self.tree, self.inference_buffer)
         
+        logger.info('APV_MCTS[main process] search done. Root (W/N):\n %s', list(zip(root.W, root.N)))
+        
         return root  # return the root node, which now contains the search results
 
 def _run_inference(
@@ -617,13 +624,14 @@ def _phase_1(root: Node, tree: SharedTree, model: AssemblyGameModel,
     logger.debug('APV_MCTS[phase 1] Reached leaf via %s.', list(zip(trajectory, actions)))
     # before simulating, initialize the new node.
     if node is not None:
+        logger.error('APV_MCTS[phase 1] Node %s is not None and not expanded', repr(node))
         # someone else is already evaluating this node.
         return False
     # otherwise, append new child and check if it worked.
     node = tree.append_child(trajectory[-1], actions[-1]) # pass the path to make sure only one block is reserved for this node.
     if node is None:
         # if it didn't work, clean up.
-        logger.debug('APV_MCTS[phase 1] Failed to append child node.')
+        logger.error('APV_MCTS[phase 1] Failed to append child node.')
         # this node is already being evaluated by some other process.
         for n, a in zip(trajectory, actions):
             n.deselect(a)
@@ -638,7 +646,7 @@ def _phase_1(root: Node, tree: SharedTree, model: AssemblyGameModel,
     logger.debug('APV_MCTS[phase 1] Simulation returned with reward %s.', timestep.reward)
     # now we can check for tree consistency (whether any other process has overwritten the node)
     if not node.is_consistent():
-        logger.debug('APV_MCTS[phase 1] Node %s is not consistent.', repr(node))
+        logger.error('APV_MCTS[phase 1] Node %s is not consistent.', repr(node))
         for n, a in zip(trajectory, actions):
             n.deselect(a)
         return False # we need to try again, the node was overwritten by another process
@@ -675,19 +683,21 @@ def _phase_2(tree: SharedTree, inference_buffer: AlphaDevInferenceService, disco
     with inference_buffer.poll_ready(timeout=10) as result:
         if result is None: 
             return False  # no result available, nothing to do here.
-        node_offset = result.node_offset
+        node_offset = result.node_offset.item()
+        logger.debug('APV_MCTS[phase 2] result before context exit: %s', node_offset)
         prior = result.prior
         value = result.value
     # obtain the node from the shared tree and check for consistency.
+    logger.debug('APV_MCTS[phase 2] result obtained offset %s (type %s)', node_offset, type(node_offset))
     node = tree.get_by_offset(node_offset)
-    logger.info('APV_MCTS[phase 2] result with offset %s (corr. node %s).', node_offset, repr(node))
+    logger.debug('APV_MCTS[phase 2] result with offset %s (corr. node %s).', node_offset, repr(node))
     if not node.is_consistent():
-        logger.info('APV_MCTS[phase 2] Node %s is not consistent. parent\'s pointer %s, child %s,',
+        logger.error('APV_MCTS[phase 2] Node %s is not consistent. parent\'s pointer %s, child %s,',
                     repr(node), repr(node.parent), repr(tree.get_node(node.parent.children[node.action_id]//tree._node_size)))
         # the node was overwritten by another process, nothing to do here.
         return False
     # expand the current node
-    logger.info('APV_MCTS[phase 2] Expanding node %s', repr(node))
+    logger.debug('APV_MCTS[phase 2] Expanding node %s', repr(node))
     node.expand(prior) # reward, legal_actions and terminal are already set
     # backpropagate without touching the virtual loss.
     logger.info('APV_MCTS[phase 2] Backpropagating value %s for node %s', value, repr(node))
@@ -747,6 +757,8 @@ def _run_task(
                         inference_buffer=inference_buffer,
                         discount=discount
                     )
+                    if result:
+                        logger.warn("APV_MCTS[process %s] Phase 1 done; success: %s full: %s, idle_ %s", process_id, result, tree.is_full(), inference_buffer.is_idle())
                     # # for debugging.
                     # if num_iterations == 5:
                     #     should_stop = True
@@ -755,8 +767,8 @@ def _run_task(
                     # run phase 2
                     result = _phase_2(tree=tree, inference_buffer=inference_buffer, discount=discount)
                     if result:
-                        logger.info("APV_MCTS[process {process_id}] Phase 2 done; success: %s full: %s, idle_ %s", result, tree.is_full(), inference_buffer.is_idle())
-                    if not result and tree.is_full() and inference_buffer.is_idle():
+                        logger.warn("APV_MCTS[process %s] Phase 2 done; success: %s full: %s, idle_ %s", process_id, result, tree.is_full(), inference_buffer.is_idle())
+                    if tree.is_full() and inference_buffer.is_idle():
                         # if we didn't manage to process the result and the inference buffer is done,
                         # we can stop the process.
                         should_stop = True
@@ -776,5 +788,5 @@ def _run_task(
                 raise e
         stats['end_time'] = time()
         stats['duration'] = stats['end_time'] - stats['start_time']
-        logger.info(f"APV_MCTS[process {process_id}] Task completed with stats: {stats}")
+        logger.warn("APV_MCTS[process %s] done. duration: %s; successes: %d, fails: %d", process_id, stats['duration'], stats['num_successes'], stats['num_fails'])
         return stats

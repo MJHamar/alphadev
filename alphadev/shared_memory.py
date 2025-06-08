@@ -10,7 +10,7 @@ import atomics
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class ArrayElement(NamedTuple):
     dtype: np.dtype
@@ -269,21 +269,16 @@ class IOBuffer(BaseMemoryManager):
                 iblock = self._input_element_cls(self._input_shm, self.submitted_read_head * self._input_size)
                 if localize:
                     inp.append(iblock.read())
-                    self.header.submitted[self.submitted_read_head] = False  # clear the ready flag
                 else:
-                    inp.append(iblock); indices.append(self.submitted_read_head)  # keep the index for later use
+                    inp.append(iblock)
+                indices.append(self.submitted_read_head)  # keep the index for later use
             # increment the index
             self.submitted_read_head = (self.submitted_read_head + 1) % self._num_blocks
         if len(inp) > 0:
-            logger.debug("IOBuffer: poll_submitted() inputs %s", [i.node_offset for i in inp])
-        if localize:
-            yield inp
-        else:
-            yield inp
-            # clear the ready flag after the context is exited
-            self.header.submitted[indices] = False
-        # if len(inp) > 0:
-        #     logger.debug("IOBuffer: poll_submitted() found %d submitted blocks. num_submitted=%d", len(inp), self.header.submitted.sum())
+            logger.debug("IOBuffer: poll_submitted() inputs %s", [str(i)[:20] + '...' for i in inp])
+        yield inp
+        # clear the submitted flag after the context is exited
+        self.header.submitted[indices] = False
 
     @contextlib.contextmanager
     def poll_ready(self, localize:bool=True, timeout=None):
@@ -295,20 +290,15 @@ class IOBuffer(BaseMemoryManager):
                 break
             self.ready_read_head = (self.ready_read_head + 1) % self._num_blocks
         else:
-            logger.debug("IOBuffer: poll_ready() timeout reached: %s.", (str(time() - start > timeout) if timeout else "no timeout"))
             yield None # timeout reached.
             return
         # read the output block and localize its contents.
         oblock = self._output_element_cls(self._output_shm, self.ready_read_head * self._output_size)
-        logger.debug("IOBuffer: poll_ready() ready offset %d.", oblock.node_offset)
         if localize:
-            output = oblock.read()
-            self.header.ready[self.ready_read_head] = False  # clear the ready flag
-            yield output
-        else:
-            yield oblock
-            # clear the rady flag only after the context is exited
-            self.header.ready[self.ready_read_head] = False
+            oblock = oblock.read()
+        yield oblock
+        # clear the rady flag only after the context is exited
+        self.header.ready[self.ready_read_head] = False
 
     def is_idle(self):
         header = self.header
