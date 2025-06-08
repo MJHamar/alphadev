@@ -21,6 +21,11 @@ from .device_config import apply_device_config
 
 import logging
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
+)
+
+logger.setLevel(logging.DEBUG)
 
 # Shared memory has a fixed size. for each MCTS, we do not need to re-allocate it
 # but we do need to re-initialize it.
@@ -62,12 +67,13 @@ class Node(BlockLayout):
     _num_actions = ADConfig.task_spec.num_actions       # number of actions depends on the task specification
     hdr_parent = 0; hdr_action = 1; hdr_expanded = 2; hdr_terminal = 3
     _elements = {
-        'header': ArrayElement(np.int32,   (4,)          ), # parent_offset, action_id, terminal, expanded
-        'prior':  ArrayElement(np.float32, (_num_actions,)), # prior probabilities of actions
-        'R':      ArrayElement(np.float32, (_num_actions,)), # One-time reward observed at this node
-        'W':      ArrayElement(np.float32, (_num_actions,)), # predicted value + empirical discounted return
-        'N':      ArrayElement(np.int32,   (_num_actions,)), # number of visits to the node
-        'mask':   ArrayElement(np.bool_,   (_num_actions,)), # mask of valid actions leading to this node
+        'header':   ArrayElement(np.int32,   (4,)          ), # parent_offset, action_id, terminal, expanded
+        'prior':    ArrayElement(np.float32, (_num_actions,)), # prior probabilities of actions
+        'R':        ArrayElement(np.float32, (_num_actions,)), # One-time reward observed at this node
+        'W':        ArrayElement(np.float32, (_num_actions,)), # predicted value + empirical discounted return
+        'N':        ArrayElement(np.int32,   (_num_actions,)), # number of visits to the node
+        'mask':     ArrayElement(np.bool_,   (_num_actions,)), # mask of valid actions leading to this node
+        'children': ArrayElement(np.uint32,  (_num_actions,)), # offsets to the children nodes
     }
     # virtual loss constant
     const_vl = -1.0
@@ -81,35 +87,64 @@ class Node(BlockLayout):
     
     def select(self, action_id):
         """Increment W by const_vl and N by 1 for the given action_id."""
+        logger.debug('%s.select called with action_id %s.', repr(self), action_id)
         self.W[action_id] += self.const_vl
         self.N[action_id] += 1
+        child_offset = self.children[action_id]
+        if child_offset == 0:
+            logger.debug('%s.select: child offset is 0, returning None.', repr(self))
+            return None
+        return self.__class__(self.shm, child_offset)
+    
     def deselect(self, action_id, reward=0.0):
         """Inverse operation of select."""
+        logger.debug('%s.deselect called with action_id %s and reward %s.', repr(self), action_id, reward)
         self.W[action_id] += -self.const_vl + reward
         self.N[action_id] -= 1
     def visit_child(self, action_id, value):
         """W = W - const_vl + value; N = N - 1 + 1 for the given action_id."""
+        logger.debug('%s.visit_child called with action_id %s and value %s.', repr(self), action_id, value)
         self.W[action_id] += -self.const_vl + value
         # N = N - 1 + 1 -> N = N, so this is a no-op
     def update_child(self, action_id, value):
         """Update the child without touching the virtual loss."""
+        logger.debug('%s.update_child called with action_id %s and value %s.', repr(self), action_id, value)
         self.W[action_id] += value
         self.N[action_id] += 1
     
     def is_consistent(self):
+        logger.debug('%s.is_consistent called.', repr(self))
+        if self.is_root:
+            return True
         return self.parent.children[self.action_id] == self.offset
     
+    @property
     def children_values(self):
         """To be called during search for selecting children. considers the virtual loss."""
+        logger.debug('%s.children_values called.', repr(self))
         return np.where(
             self.mask & (self.N != 0),
             np.divide(self.W, self.N),
             0.0
         )
     
+    @property
     def children_visits(self):
         """To be called during search for selecting children. considers the virtual loss."""
+        logger.debug('%s.children_visits called.', repr(self))
         return self.N
+    
+    @property
+    def children_priors(self):
+        """To be called during search for selecting children. considers the virtual loss."""
+        logger.debug('%s.children_priors called.', repr(self))
+        return self.prior
+
+    @property
+    def action_mask(self):
+        """To be called during search for selecting children. considers the virtual loss."""
+        logger.debug('%s.action_mask called.', repr(self))
+        return self.mask
     
     @property
     def parent(self) -> 'Node':
@@ -118,6 +153,7 @@ class Node(BlockLayout):
     @property
     def value(self):
         """To be called during backprop, ignores the virtual loss."""
+        assert False, '%s.value called.' % (repr(self),)
         parent = self.parent # instantiate once
         return (
             parent.W[self.action_id] / parent.N[self.action_id]
@@ -125,6 +161,9 @@ class Node(BlockLayout):
     @property
     def visit_count(self):
         """To be called during backprop, ignores the virtual loss."""
+        logger.debug('%s.visit_count called', repr(self))
+        if self.is_root:
+            return np.sum(self.N)
         return self.parent.N[self.action_id]
     @property
     def parent_offset(self): return self.header[self.__class__.hdr_parent]
@@ -146,12 +185,17 @@ class Node(BlockLayout):
     def set_parent(self, parent_offset, action):
         self.header[self.__class__.hdr_parent] = parent_offset
         self.header[self.__class__.hdr_action] = action
+        logger.debug('%s.set_parent parent_offset %s action %s.', repr(self), parent_offset, action)
     
     def set_legal_actions(self, legal_actions):
         self.mask[:] = legal_actions
     
     def set_reward(self, reward):
+        logger.debug('%s.set_reward called with reward %s.', repr(self), reward)
         self.parent.R[self.action_id] = reward
+        
+    def __repr__(self):
+        return f'Node(offset={self.offset}, action_id={self.action_id})'
 
 
 class SharedTreeHeader(BlockLayout):
@@ -191,14 +235,15 @@ class SharedTree(BaseMemoryManager):
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
         
+        self.header = SharedTreeHeader(self._header_shm, 0)
+        with self.header.index() as index_counter:
+            self._local_write_head = index_counter.load() # get the current write head
+        
         self.reset()  # clear the header and input/output blocks
-    
-    @property
-    def header(self) -> SharedTreeHeader:
-        return SharedTreeHeader(self._header_shm, 0)
     
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
+        logger.debug('SharedTree.reset called.')
         SharedTreeHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
         with self.header.index() as idx:
             idx.store(1) # do not write to the root.
@@ -209,21 +254,29 @@ class SharedTree(BaseMemoryManager):
         root.set_root()
     
     def attach(self):
+        logger.debug('SharedTree.attach')
         self._is_main = False
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)
+
+        self.header = SharedTreeHeader(self._header_shm, 0)
+        with self.header.index() as index_counter:
+            self._local_write_head = index_counter.load() # get the current write head
     
     def __del__(self):
+        logger.debug('SharedTree.__del__ called. is main: %s', self._is_main)
+        del self.header
+        self._header_shm.close()
+        self._data_shm.close()
         if self._is_main:
             # only the main process should delete the shared memory
-            self._header_shm.close()
             self._header_shm.unlink()
-            self._data_shm.close()
             self._data_shm.unlink()
     
     def _update_index(self):
         with self.header.index() as index_counter:
             index = index_counter.fetch_inc()
+            logger.info('SharedTree._update_index (nb %d) prev: %d crnt: %d, next: %d', self.num_blocks, self._local_write_head, index, index_counter.load())
         if index >= self.num_blocks:
             self._local_write_head = None # we are done
         else:
@@ -238,7 +291,7 @@ class SharedTree(BaseMemoryManager):
         """We successfully wrote to the block, we can find the next block."""
         self._local_write_head = self._update_index()
     
-    def append_child(self, parent_offset: int, action: int) -> Union[Node, None]:
+    def append_child(self, parent: Node, action: int) -> Union[Node, None]:
         """
         Attempt to append a child node to the parent node by
         first writing the offset corresponding to the 
@@ -252,9 +305,9 @@ class SharedTree(BaseMemoryManager):
         This way, we be almost certain that the tree will stay consistent.
         Losing one or two children due to race conditions is acceptable.
         """
+        logger.debug('SharedTree.append_child called with parent_offset %s and action %s.', parent, action)
         if self.is_full():
             raise TreeFull() # signal the caller that no more blocks are available.
-        parent = self.get_by_offset(parent_offset)
         if parent.children[action] != 0:
             # another process already appended this action.
             self.fail()
@@ -262,14 +315,17 @@ class SharedTree(BaseMemoryManager):
         
         child_offset = self.i2off(self._local_write_head)
         parent.children[action] = child_offset
+        logger.debug('SharedTree.append_child: parent %s children[%d] set to %d.', repr(parent), action, child_offset)
         # now write the parent offset and action id to the child node's header
         child: Node = self._node_cls(self._data_shm, child_offset)
-        child.set_parent(parent_offset, action)
+        child.set_parent(parent.offset, action)
         # now check if the write was successful
         if parent.children[action] == child_offset:
+            logger.debug('SharedTree.append_child: append successful. index %d new node: %s.', self._local_write_head, repr(child))
             self.succeed()
             return child
         else:
+            logger.debug('SharedTree.append_child: append failed, this node: %s, parent: %s.', repr(child), repr(parent))
             self.fail()
             return None
     
@@ -279,7 +335,7 @@ class SharedTree(BaseMemoryManager):
     def get_node(self, index) -> Node:
         """Return the root node, at offset 0."""
         if index == 0:
-            return self.root
+            return self.get_root()
         return self._node_cls(self._data_shm, self.i2off(index))
     
     def get_root(self):
@@ -312,11 +368,10 @@ class SharedTaskAllocator(BaseMemoryManager):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
+        
+        self.header = TaskAllocatorHeader(self._header_shm, 0)
+        
         self.reset()
-    
-    @property
-    def header(self) -> TaskAllocatorHeader:
-        return TaskAllocatorHeader(self._header_shm, 0)
     
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
@@ -325,11 +380,14 @@ class SharedTaskAllocator(BaseMemoryManager):
     def attach(self):
         self._is_main = False
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
+        self.header = TaskAllocatorHeader(self._header_shm, 0)
     
     def __del__(self):
+        logger.debug('SharedTaskAllocator.__del__ called. is main: %s', self._is_main)
+        del self.header
+        self._header_shm.close()
         if self._is_main:
             # only the main process should delete the shared memory
-            self._header_shm.close()
             self._header_shm.unlink()
     
     def allocate(self, task_ids: Sequence[int]) -> Dict[int, int]:
@@ -548,48 +606,63 @@ def _phase_1(root: Node, tree: SharedTree, model: AssemblyGameModel,
     logger.debug('APV_MCTS[phase 1] Starting search simulation phase.')
     node = root
     actions = []; trajectory = []
-    while node.expanded:
+    while node is not None and node.expanded: # if node was never visited, the parent with return None.
         action = search_policy(node)
+        actions.append(action)   # keep track of actions taken.
+        trajectory.append(node)  # keep track of parents.
+
         node = node.select(action) # increment virtual loss
-        actions.append(action)
-        trajectory.append(node)  # keep track of the trajectory for backpropagation
+        logger.debug('APV_MCTS[phase 1] Selected action %s and got node %s.', action, repr(node))
     
+    logger.debug('APV_MCTS[phase 1] Reached leaf via %s.', list(zip(trajectory, actions)))
     # before simulating, initialize the new node.
-    new_node: Node = tree.append_child(trajectory[-2], actions[-1]) # pass the path to make sure only one block is reserved for this node.
-    if new_node is None:
+    if node is not None:
+        # someone else is already evaluating this node.
+        return False
+    # otherwise, append new child and check if it worked.
+    node = tree.append_child(trajectory[-1], actions[-1]) # pass the path to make sure only one block is reserved for this node.
+    if node is None:
+        # if it didn't work, clean up.
+        logger.debug('APV_MCTS[phase 1] Failed to append child node.')
         # this node is already being evaluated by some other process.
-        for n, a in zip(trajectory[:-1], actions):
+        for n, a in zip(trajectory, actions):
             n.deselect(a)
         return False  # we need to try again, the node was overwritten by another process
     
+    logger.debug('APV_MCTS[phase 1] Appended new node %s with offset %s.', repr(node), node.offset)
+    logger.debug('APV_MCTS[phase 1] Calling model with actions %s.', actions)
     # then run the simulation update the node with the results. This delay also enables other processes to write stuff
-    timestep = model.step(actions, update=False)
+    timestep = model.step(actions)
     legal_actions = model.legal_actions()
+    
+    logger.debug('APV_MCTS[phase 1] Simulation returned with reward %s.', timestep.reward)
     # now we can check for tree consistency (whether any other process has overwritten the node)
-    if not new_node.is_consistent():
-        for n, a in zip(trajectory[:-1], actions):
+    if not node.is_consistent():
+        logger.debug('APV_MCTS[phase 1] Node %s is not consistent.', repr(node))
+        for n, a in zip(trajectory, actions):
             n.deselect(a)
         return False # we need to try again, the node was overwritten by another process
     
     # otherwise, submit a new inference task to the inference service.
     observation = timestep.observation
     inference_buffer.submit(
-        node_offset=new_node.offset,
+        node_offset=node.offset,
         observation=observation
     )
+    logger.debug('APV_MCTS[phase 1] Submitted inference task for node %s', repr(node))
     # perform a backward pass with the reward and legal actions
     reward = timestep.reward[0] # there might be other outputs but they are irrelevant for mcts
-    terminal = timestep.final()
+    terminal = timestep.last()
     
-    new_node.set_terminal(terminal)
-    new_node.set_legal_actions(legal_actions)
-    new_node.set_reward(reward)
+    node.set_terminal(terminal)
+    node.set_legal_actions(legal_actions)
+    node.set_reward(reward)
 
     # backpropagate the reward for each t < L and remove the virtual loss.
-    for n, a in zip(trajectory[:-1], actions):
+    for n, a in zip(trajectory, actions):
         reward *= discount
         n.visit_child(a, reward)
-    
+    logger.debug('APV_MCTS[phase 1] Backpropagated reward %s for actions %s.', reward, actions)
     return True  # we successfully submitted the task for evaluation
 
 def _phase_2(tree: SharedTree, inference_buffer: AlphaDevInferenceService, discount: float):
@@ -605,15 +678,19 @@ def _phase_2(tree: SharedTree, inference_buffer: AlphaDevInferenceService, disco
         node_offset = result.node_offset
         prior = result.prior
         value = result.value
-        logger.debug('APV_MCTS[phase 2] result with offset %s.', node_offset)
     # obtain the node from the shared tree and check for consistency.
     node = tree.get_by_offset(node_offset)
+    logger.info('APV_MCTS[phase 2] result with offset %s (corr. node %s).', node_offset, repr(node))
     if not node.is_consistent():
+        logger.info('APV_MCTS[phase 2] Node %s is not consistent. parent\'s pointer %s, child %s,',
+                    repr(node), repr(node.parent), repr(tree.get_node(node.parent.children[node.action_id]//tree._node_size)))
         # the node was overwritten by another process, nothing to do here.
         return False
     # expand the current node
+    logger.info('APV_MCTS[phase 2] Expanding node %s', repr(node))
     node.expand(prior) # reward, legal_actions and terminal are already set
     # backpropagate without touching the virtual loss.
+    logger.info('APV_MCTS[phase 2] Backpropagating value %s for node %s', value, repr(node))
     while not node.is_root:
         parent = node.parent
         # update the parent with the value estimate and visit count
@@ -622,6 +699,8 @@ def _phase_2(tree: SharedTree, inference_buffer: AlphaDevInferenceService, disco
         node = parent
         value *= discount
     return True
+
+
 
 def _run_task(
     args):
@@ -634,6 +713,11 @@ def _run_task(
             search_policy,
             discount
         ) = args
+        logging.basicConfig(
+            format=f'%(asctime)s - APV_MCTS[process {process_id}] - %(levelname)s - %(message)s',
+            level=logging.DEBUG,
+        )
+        
         tree = tree_factory(); tree.attach()
         inference_buffer = inference_factory(); inference_buffer.attach()
         task_allocator = task_allocator_factory(); task_allocator.attach()
@@ -650,6 +734,7 @@ def _run_task(
         }
         logger.info(f"APV_MCTS[process {process_id}] Starting task with id {my_task_id}.")
         should_stop = False
+        # num_iterations = 0
         while not should_stop: # iterate indefinitely
             try:
                 # query task 
@@ -662,9 +747,15 @@ def _run_task(
                         inference_buffer=inference_buffer,
                         discount=discount
                     )
+                    # # for debugging.
+                    # if num_iterations == 5:
+                    #     should_stop = True
+                    # num_iterations += 1
                 elif my_task_id == APV_MCTS.BACKUP_TASK:
                     # run phase 2
                     result = _phase_2(tree=tree, inference_buffer=inference_buffer, discount=discount)
+                    if result:
+                        logger.info("APV_MCTS[process {process_id}] Phase 2 done; success: %s full: %s, idle_ %s", result, tree.is_full(), inference_buffer.is_idle())
                     if not result and tree.is_full() and inference_buffer.is_idle():
                         # if we didn't manage to process the result and the inference buffer is done,
                         # we can stop the process.

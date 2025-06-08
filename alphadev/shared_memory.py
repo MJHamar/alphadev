@@ -8,6 +8,10 @@ import functools
 import tree
 import atomics
 
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
 class ArrayElement(NamedTuple):
     dtype: np.dtype
     shape: tuple
@@ -190,11 +194,9 @@ class IOBuffer(BaseMemoryManager):
         self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=True, size=self._input_size*self._num_blocks)
         self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=True, size=self._output_size*self._num_blocks)
         
+        self.header = BufferHeader(self._header_shm, 0, length=self._num_blocks)
+        
         self.reset()  # clear the header and input/output blocks
-    
-    @property
-    def header(self):
-        return BufferHeader(self._header_shm, 0, length=self._num_blocks)
     
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
@@ -209,19 +211,17 @@ class IOBuffer(BaseMemoryManager):
         self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
         self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=False, size=self._input_size)
         self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=False, size=self._output_size)
-
+        self.header = BufferHeader(self._header_shm, 0, length=self._num_blocks)
+    
     def __del__(self):
         """Clean up shared memory blocks in the main process."""
-        if hasattr(self, '_is_main') and not self._is_main:
-            return
-        if hasattr(self, '_header_shm'):
-            self._header_shm.close()
+        del self.header
+        self._header_shm.close()
+        self._input_shm.close()
+        self._output_shm.close()
+        if self._is_main:
             self._header_shm.unlink()
-        if hasattr(self, '_input_shm'):
-            self._input_shm.close()
             self._input_shm.unlink()
-        if hasattr(self, '_output_shm'):
-            self._output_shm.close()
             self._output_shm.unlink()
     
     def _next_in(self):
@@ -242,6 +242,7 @@ class IOBuffer(BaseMemoryManager):
         iblock = self._input_element_cls(self._input_shm, index * self._input_size)
         iblock.write(**payload)
         self.header.submitted[index] = True
+        logger.debug("IOBuffer: submit() called, set submitted at index=%d. offset %s", index, iblock.node_offset)
     
     def ready(self, payload_list: List[Dict[str, np.ndarray]]):
         for payload in payload_list:
@@ -249,6 +250,7 @@ class IOBuffer(BaseMemoryManager):
             oblock = self._output_element_cls(self._output_shm, index * self._output_size)
             oblock.write(**payload)
             self.header.ready[index] = True
+            logger.debug("IOBuffer: ready() called, set ready at index=%d. offset %s", index, oblock.node_offset)
     
     @contextlib.contextmanager
     def poll_submitted(self, max_samples:int, localize:bool=True):
@@ -256,10 +258,11 @@ class IOBuffer(BaseMemoryManager):
         Linear search once through the submitted blocks; picking up where the last read left off.
         Appends the first `max_samples` blocks that are ready to be processed.
         """
+        # logger.debug("IOBuffer: poll_submitted() called with max_samples=%d, localize=%s", max_samples, localize)
         inp = []; indices = []
         
         start_mod = (self.submitted_read_head % self._num_blocks)
-        start_mod = start_mod if start_mod != 0 else self._num_blocks-1  # avoid zero mod for circular buffer
+        start_mod = start_mod - 1 if start_mod != 0 else self._num_blocks-1  # avoid zero mod for circular buffer
         while (self.submitted_read_head % self._num_blocks) != start_mod and len(inp) < max_samples:
             if self.header.submitted[self.submitted_read_head]:
                 # read the output block and localize its contents. 
@@ -271,25 +274,33 @@ class IOBuffer(BaseMemoryManager):
                     inp.append(iblock); indices.append(self.submitted_read_head)  # keep the index for later use
             # increment the index
             self.submitted_read_head = (self.submitted_read_head + 1) % self._num_blocks
+        if len(inp) > 0:
+            logger.debug("IOBuffer: poll_submitted() inputs %s", [i.node_offset for i in inp])
         if localize:
             yield inp
         else:
             yield inp
             # clear the ready flag after the context is exited
-            for idx in indices: self.header.submitted[idx] = False
+            self.header.submitted[indices] = False
+        # if len(inp) > 0:
+        #     logger.debug("IOBuffer: poll_submitted() found %d submitted blocks. num_submitted=%d", len(inp), self.header.submitted.sum())
 
     @contextlib.contextmanager
     def poll_ready(self, localize:bool=True, timeout=None):
+        # logger.debug("IOBuffer: poll_ready() called with localize=%s, timeout=%s", localize, timeout)
         start = time()
-        while timeout is None or time() - start > timeout:
+        while timeout is None or time() - start < timeout:
             if self.header.ready[self.ready_read_head]:
+                logger.debug("IOBuffer: poll_ready() found ready block at index %d.", self.ready_read_head)
                 break
             self.ready_read_head = (self.ready_read_head + 1) % self._num_blocks
         else:
+            logger.debug("IOBuffer: poll_ready() timeout reached: %s.", (str(time() - start > timeout) if timeout else "no timeout"))
             yield None # timeout reached.
             return
         # read the output block and localize its contents.
         oblock = self._output_element_cls(self._output_shm, self.ready_read_head * self._output_size)
+        logger.debug("IOBuffer: poll_ready() ready offset %d.", oblock.node_offset)
         if localize:
             output = oblock.read()
             self.header.ready[self.ready_read_head] = False  # clear the ready flag

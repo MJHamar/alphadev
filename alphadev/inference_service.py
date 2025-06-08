@@ -8,6 +8,9 @@ from .config import ADConfig
 from .environment import AssemblyGame
 from .shared_memory import *
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 class InferenceTask(BlockLayout):
     _elements = {
@@ -64,10 +67,11 @@ class AlphaDevInferenceService(IOBuffer):
                 if len(tasks) == 0:
                     num_timeouts += 1
                     if num_timeouts > 10:
-                        print(f"AlphaDevInferenceService: No tasks submitted for the last {num_timeouts} iterations, going to sleep for a bit.")
+                        # print(f"AlphaDevInferenceService: No tasks submitted for the last {num_timeouts} iterations, going to sleep for a bit.")
                         num_timeouts = 0
-                        sleep(5.0) # TODO: adjust this to a config parameter.
+                        sleep(0.001) # TODO: adjust this to a config parameter.
                     continue
+                logger.debug(f"AlphaDevInferenceService: processing {len(tasks)} tasks")
                 node_offset = [t.node_offset for t in tasks] # list of node offsets to update
                 inputs = [t.observation for t in tasks] # list of observations to evaluate
                 inputs = tree.map_structure(stack_requests, *inputs)

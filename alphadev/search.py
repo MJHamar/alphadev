@@ -301,8 +301,9 @@ class PUCTSearchPolicy(SearchPolicy):
 
 def visit_count_policy(root: Node, temperature: float = 1.0, mask: np.ndarray = None) -> int:
     visits = root.children_visits
-    masked_visits = visits * mask # multiply by the mask to keep the shape, but make invalid actions impossible to choose    
-    rescaled_visits = masked_visits**(1 / temperature)
+    if mask is not None:
+        visits = visits * mask # multiply by the mask to keep the shape, but make invalid actions impossible to choose    
+    rescaled_visits = visits**(1 / temperature)
     probs = rescaled_visits / np.sum(rescaled_visits)
     # check_numerics(probs)
     

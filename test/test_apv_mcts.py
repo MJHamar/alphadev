@@ -16,7 +16,7 @@ import numpy as np
 import logging
 logging.basicConfig(level=logging.DEBUG)
 
-num_simulations = 1000
+num_simulations = 10
 
 dirichlet_alpha = 0.3
 exploration_fraction = 0.1
@@ -33,25 +33,29 @@ def dummy_eval_factory():
 
 class DummyModel:
     """Dummy model that does nothing."""
+    def __init__(self, timestep):
+        self.ts = timestep
+    
     def save_checkpoint(self):
         pass
 
     def load_checkpoint(self):
         pass
     
-    def step(self, observation: np.ndarray):
+    def step(self, actions: np.ndarray):
         """Dummy step function that returns a random prior and value."""
-        return TimeStep(
-            step_type=StepType.MID if observation < num_simulations else StepType.LAST,
+        self.ts = TimeStep(
+            step_type=StepType.MID if self.ts.observation['program_length'] < num_simulations else StepType.LAST,
             observation=CPUState(
-                registers=observation.registers,
-                memory=observation.memory,
-                program=observation.program,
-                program_length=observation.program_length+1
+                registers=self.ts.observation['registers'],
+                memory=self.ts.observation['memory'],
+                program=self.ts.observation['program'],
+                program_length=self.ts.observation['program_length']+1
             )._asdict(),
             reward=np.zeros((3,), dtype=np.float32),
             discount=1.0
         )
+        return self.ts
     
     def legal_actions(self):
         """Returns a list of legal actions."""
@@ -60,8 +64,21 @@ class DummyModel:
 
 def run_mcts():
     """Run the MCTS algorithm with a dummy model and evaluation function."""
+    observation = CPUState(
+        registers=np.zeros((ADConfig.task_spec.num_inputs, ADConfig.task_spec.num_regs), dtype=np.int32),  # Dummy registers
+        memory=np.zeros((ADConfig.task_spec.num_inputs, ADConfig.task_spec.num_mem), dtype=np.int32),  # Dummy memory
+        program=np.zeros((ADConfig.task_spec.max_program_size,3), dtype=np.int32),  # Dummy program
+        program_length=np.zeros((1,), dtype=np.int32),  # Dummy program length
+    )._asdict() # Dummy observation
+    
+    timestep = TimeStep(
+        step_type=StepType.FIRST,
+        observation=observation,
+        reward=np.zeros((3,), dtype=np.float32),
+        discount=1.0
+    )
     mcts = APV_MCTS(
-        model=DummyModel(),
+        model=DummyModel(timestep),
         search_policy=PUCTSearchPolicy(),
         network_factory=dummy_eval_factory,
         num_simulations=num_simulations,
@@ -70,24 +87,12 @@ def run_mcts():
         exploration_fraction=exploration_fraction,
         discount=1.0,
         node_class=Node_V2,
-        batch_size=16,
+        batch_size=1,
     )
-    observation = CPUState(
-        registers=np.zeros((ADConfig.task_spec.num_inputs, ADConfig.task_spec.num_regs), dtype=np.int32),  # Dummy registers
-        memory=np.zeros((ADConfig.task_spec.num_inputs, ADConfig.task_spec.num_mem), dtype=np.int32),  # Dummy memory
-        program=np.zeros((ADConfig.task_spec.max_program_size,3), dtype=np.int32),  # Dummy program
-        program_length=np.zeros((1,), dtype=np.int32),  # Dummy program length
-    )._asdict() # Dummy observation
-    timestep = TimeStep(
-        step_type=StepType.FIRST,
-        observation=observation,
-        reward=np.zeros((3,), dtype=np.float32),
-        discount=1.0
-    )
-    outer_model = DummyModel()
+    outer_model = DummyModel(timestep)
     while timestep.step_type != StepType.LAST:
         root = mcts.search(observation)
-        action = visit_count_policy(root)
+        action = visit_count_policy(root, mask=outer_model.legal_actions())
         timestep = outer_model.step(action)
 
 
