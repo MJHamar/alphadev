@@ -292,7 +292,9 @@ class SharedTree(BaseMemoryManager):
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)
 
         self.header = SharedTreeHeader(self._header_shm, 0)
-        self._update_index() # obtain a write location
+    
+    def init_index(self):
+        self._local_write_head = self._update_index() # obtain a write location
 
     def __del__(self):
         logger.debug('SharedTree.__del__ called. is main: %s', self._is_main)
@@ -310,9 +312,10 @@ class SharedTree(BaseMemoryManager):
             logger.debug('SharedTree._update_index (nb %d) prev: %d crnt: %d, next: %d', self.num_blocks, self._local_write_head, index, index_counter.load())
         if index >= self.num_blocks:
             self._local_write_head = None # we are done
+            return None
         else:
             self._local_write_head = index
-        return index
+            return index
 
     def fail(self):
         """We didn't manage to write, try again next time to the same block."""
@@ -343,7 +346,13 @@ class SharedTree(BaseMemoryManager):
             # another process already appended this action.
             self.fail()
             return None
-
+        
+        if self._local_write_head is None:
+            # we are done, no more blocks available.
+            logger.debug('SharedTree.append_child: no more blocks available, returning None.')
+            self.fail()
+            return None
+        
         child_offset = self.i2off(self._local_write_head)
         parent.set_child(action, child_offset)
         logger.debug('SharedTree.append_child: parent %s children[%d] set to %d.', repr(parent), action, child_offset)
@@ -361,6 +370,7 @@ class SharedTree(BaseMemoryManager):
             return None
 
     def i2off(self, index: int) -> int:
+        logger.debug('SharedTree.i2off called with index %d node size %d.', index, self._node_size)
         return index * self._node_size
 
     def get_node(self, index) -> NodeBase:
@@ -497,7 +507,8 @@ class APV_MCTS(object):
             network_factory_kwargs={},
             inference_device_config: Union[Dict, None] = None,
             observers: Sequence = [],
-            name:str='apv-mcts' # needs to be specified is multiple instances are used.
+            name:str='apv-mcts', # needs to be specified is multiple instances are used.
+            do_profiling: bool = False,
         ):
         self.model = model # a (learned) model of the environment.
         self.search_policy = search_policy # a function that takes a node and returns an action to take.
@@ -514,6 +525,8 @@ class APV_MCTS(object):
         self.exploration_fraction = exploration_fraction  # fraction of the prior to add Dirichlet noise to
         
         self.const_vl = const_vl  # constant virtual loss to apply during rollouts
+        
+        self.do_profiling = do_profiling  # whether to enable profiling
         
         # declare shared memory ( no init )
         self.tree_factory = functools.partial(
@@ -603,7 +616,7 @@ class APV_MCTS(object):
             _run_task,
             [(i,
               self.tree_factory, self.inference_buffer_factory, self.task_allocator_factory,
-              self.model, self.search_policy, self.discount
+              self.model, self.search_policy, self.discount, self.do_profiling
               ) for i in range(self.num_actors)
             ]
         )
@@ -753,6 +766,11 @@ import cProfile
 import pstats
 import subprocess
 
+# process-local shared memory managers to save on initialization time.
+_task_tree = None
+_task_inference_buffer = None
+_task_task_allocator = None
+
 def _run_task(
     args):
         (
@@ -763,17 +781,28 @@ def _run_task(
             model,
             search_policy,
             discount,
-            # do_profiling
+            do_profiling
         ) = args
         logging.basicConfig(
             format=f'%(asctime)s - APV_MCTS[process {process_id}] - %(levelname)s - %(message)s',
             level=logging.DEBUG,
         )
-
-        tree = tree_factory(); tree.attach()
-        inference_buffer = inference_factory(); inference_buffer.attach()
-        task_allocator = task_allocator_factory(); task_allocator.attach()
-
+        global _task_tree, _task_inference_buffer, _task_task_allocator
+        if _task_tree is None:
+            logger.debug(f"APV_MCTS[process {process_id}] Initializing shared tree.")
+            _task_tree = tree_factory()
+            _task_tree.attach()
+        if _task_inference_buffer is None:
+            logger.debug(f"APV_MCTS[process {process_id}] Initializing inference buffer.")
+            _task_inference_buffer = inference_factory()
+            _task_inference_buffer.attach()
+        if _task_task_allocator is None:
+            logger.debug(f"APV_MCTS[process {process_id}] Initializing task allocator.")
+            _task_task_allocator = task_allocator_factory()
+            _task_task_allocator.attach()
+        tree = _task_tree
+        inference_buffer = _task_inference_buffer
+        task_allocator = _task_task_allocator
 
         my_task_id = task_allocator.get_task(process_id)
         root = tree.get_root()
@@ -786,7 +815,9 @@ def _run_task(
         }
         logger.debug(f"APV_MCTS[process {process_id}] Starting task with id {my_task_id}.")
         should_stop = False
-
+        
+        tree.init_index()  # initialize the local write head for this process and run.
+        
         # if do_profiling:
         #     profiler = cProfile.Profile()
         #     profiler.enable()
