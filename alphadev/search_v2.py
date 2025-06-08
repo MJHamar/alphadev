@@ -638,7 +638,6 @@ def _run_inference(
         apply_device_config(device_config)
     # initialize the inference service
     logger.debug("APV_MCTS[inference process] Initializing inference service.")
-    # TODO: setup tensorflow device config.
     inference_buffer = inference_factory()
     inference_buffer.attach()
     # run indefinitely
@@ -818,11 +817,10 @@ def _run_task(
         
         tree.init_index()  # initialize the local write head for this process and run.
         
-        # if do_profiling:
-        #     profiler = cProfile.Profile()
-        #     profiler.enable()
-
-        # num_iterations = 0
+        if do_profiling:
+            profiler = cProfile.Profile()
+            profiler.enable()
+        
         while not should_stop: # iterate indefinitely
             try:
                 # query task
@@ -837,10 +835,6 @@ def _run_task(
                     )
                     if result:
                         logger.debug("APV_MCTS[process %s] Phase 1 done; success: %s full: %s, idle_ %s", process_id, result, tree.is_full(), inference_buffer.is_idle())
-                    # # for debugging.
-                    # if num_iterations == 5:
-                    #     should_stop = True
-                    # num_iterations += 1
                 elif my_task_id == APV_MCTS.BACKUP_TASK:
                     # run phase 2
                     result = _phase_2(tree=tree, inference_buffer=inference_buffer, discount=discount)
@@ -867,14 +861,14 @@ def _run_task(
         stats['end_time'] = time()
         stats['duration'] = stats['end_time'] - stats['start_time']
         logger.info("APV_MCTS[process %s] done. duration: %s; successes: %d, fails: %d", process_id, stats['duration'], stats['num_successes'], stats['num_fails'])
-
-        # if ADConfig.do_profiling:
-        #     profiler.disable()
-        #     prof_stats = pstats.Stats(profiler)
-        #     prof_stats.sort_stats('cumulative')
-        #     # print_mask_stats(actor._model._environment._action_space_storage)
-        #     prof_stats.dump_stats(f'profile/apv_mcts_profile_{process_id}.prof')
-        #     subprocess.run(['flameprof', '-i', f'profile/apv_mcts_profile_{process_id}.prof', '-o', f'profile/apv_mcts_flamegraph_{process_id}.svg'])
-        #     logger.debug(f"APV_MCTS[process {process_id}] Profiling done, results saved.")
-
+        
+        if do_profiling:
+            profiler.disable()
+            prof_stats = pstats.Stats(profiler)
+            prof_stats.sort_stats('cumulative')
+            # print_mask_stats(actor._model._environment._action_space_storage)
+            prof_stats.dump_stats(f'profile/apv_mcts_profile_{process_id}.prof')
+            subprocess.run(['flameprof', '-i', f'profile/apv_mcts_profile_{process_id}.prof', '-o', f'profile/apv_mcts_flamegraph_{process_id}.svg'])
+            logger.debug(f"APV_MCTS[process {process_id}] Profiling done, results saved.")
+        
         return stats
