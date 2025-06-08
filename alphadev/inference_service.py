@@ -4,7 +4,6 @@ import numpy as np
 import sonnet as snn
 import tensorflow as tf
 
-from .config import ADConfig
 from .environment import AssemblyGame
 from .shared_memory import *
 
@@ -13,32 +12,52 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-class InferenceTask(BlockLayout):
+class InferenceTaskBase(BlockLayout):
+    _required_attributes = ['node_offset', 'observation']
     _elements = {
         'node_offset': ArrayElement(np.int32, ()),  # offset of the node in the shared memory, needed for expansion/backpropagation
-        'observation': NestedArrayElement(dtype=np.float32, shape=(), model=AssemblyGame(ADConfig.task_spec).observation_spec()),
     }
+    @classmethod
+    def define(cls, input_model: Union[dict, NamedTuple]):
+        class InferenceTask(cls):
+            _elements = cls._elements.copy()
+            _elements['observation'] = NestedArrayElement(
+                dtype=np.float32, shape=(), model=input_model)
+        return InferenceTask
 
-class InferenceResult(BlockLayout):
+class InferenceResultBase(BlockLayout):
+    _required_attributes = ['node_offset', 'prior', 'value']
     _elements = {
         'node_offset': ArrayElement(np.int32, ()),  # offset of the node in the shared memory, needed for expansion/backpropagation
-        'prior': ArrayElement(np.float32, (ADConfig.task_spec.num_actions,)),  # prior probabilities of actions
-        'value': ArrayElement(np.float32, ()),  # **SCALAR** value estimate of the node
     }
+    @classmethod
+    def define(cls, num_actions):
+        class InferenceResult(cls):
+            _elements = cls._elements.copy()
+            _elements.update({
+                'prior': ArrayElement(np.float32, (num_actions,)),  # prior probabilities of actions
+                'value': ArrayElement(np.float32, ()), # **SCALAR** value estimate of the node
+            })
+        return InferenceResult
 
 class AlphaDevInferenceService(IOBuffer):
     def __init__(self, 
             num_blocks:int,
             network_factory: Callable[[], snn.Module],
+            input_spec:dict,
+            num_actions:int,
             batch_size:int = 1,
             factory_args:tuple = (),
             factory_kwargs:dict = {},
             name:str = 'AlphaDevInferenceService'
             ):
+        # define the input and output elements
+        self.input_element = InferenceTaskBase.define(input_spec)
+        self.output_element = InferenceResultBase.define(num_actions)
         super().__init__(
             num_blocks=num_blocks,
-            input_element=InferenceTask,
-            output_element=InferenceResult,
+            input_element=self.input_element,
+            output_element=self.output_element,
             name=name)
         self.batch_size = max(batch_size, 1)
         self._network_factory = network_factory # to be initialized in the 

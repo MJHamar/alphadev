@@ -1,20 +1,17 @@
-# we need to set a path to a config file
-import os
-config_path = os.path.join(os.path.dirname(__file__), 'apv_mcts_config.yaml')
-import sys
-sys.argv.append(config_path)
-
-from alphadev.search_v2 import APV_MCTS, Node as Node_V2
+from alphadev.search_v2 import APV_MCTS
 
 from alphadev.environment import CPUState
 from alphadev.search import PUCTSearchPolicy, visit_count_policy
-from alphadev.config import ADConfig
+from alphadev.config import AlphaDevConfig
 
 from dm_env import TimeStep, StepType
 import numpy as np
 
 import logging
 logging.basicConfig(level=logging.DEBUG)
+
+import os
+ADConfig = AlphaDevConfig.from_yaml(f'{os.path.dirname(__file__)}/apv_mcts_config.yaml')
 
 num_simulations = ADConfig.num_simulations
 
@@ -41,6 +38,15 @@ class DummyModel:
 
     def load_checkpoint(self):
         pass
+    
+    def observation_spec(self):
+        return CPUState(
+            registers=np.zeros((ADConfig.task_spec.num_inputs, ADConfig.task_spec.num_regs), dtype=np.int32),  # Dummy registers
+            memory=np.zeros((ADConfig.task_spec.num_inputs, ADConfig.task_spec.num_mem), dtype=np.int32),  # Dummy memory
+            program=np.zeros((ADConfig.task_spec.max_program_size,3), dtype=np.int32),  # Dummy program
+            program_length=np.zeros((1,), dtype=np.int32),  # Dummy program length
+        )._asdict() # Dummy observation
+
     
     def step(self, actions: np.ndarray):
         """Dummy step function that returns a random prior and value."""
@@ -83,15 +89,15 @@ def run_mcts():
         network_factory=dummy_eval_factory,
         num_simulations=num_simulations,
         num_actions=ADConfig.task_spec.num_actions,
+        num_actors=ADConfig.num_actors,
+        discount=1.0,
         dirichlet_alpha=dirichlet_alpha,
         exploration_fraction=exploration_fraction,
-        discount=1.0,
-        node_class=Node_V2,
+        const_vl=-1.0,
         batch_size=16,
     )
     outer_model = DummyModel(timestep)
     while timestep.step_type != StepType.LAST:
-        
         root = mcts.search(observation)
         action = visit_count_policy(root, mask=outer_model.legal_actions())
         timestep = outer_model.step(action)

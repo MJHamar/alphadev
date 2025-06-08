@@ -28,12 +28,6 @@ class ArrayElement(object):
     def create(self, shm, offset, *args, **kwargs):
         return np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf, offset=offset)
 
-class VarLenArrayElement(ArrayElement):
-    def _get_size(self, length, *args, **kwargs):
-        return np.dtype(self.dtype).itemsize * np.prod((length, *self.shape))
-    def create(self, shm, offset, length, *args, **kwargs):
-        return np.ndarray((length, *self.shape), dtype=self.dtype, buffer=shm.buf, offset=offset)
-
 class NestedArrayElement(ArrayElement):
     dtype: np.dtype
     shape: tuple
@@ -68,7 +62,6 @@ class NestedArrayElement(ArrayElement):
             return elements
         elif isinstance(self.model, NamedTuple):
             return self.model._make(**elements)
-
 
 class AtomicContext:
     """
@@ -113,12 +106,21 @@ class AtomicCounterElement(NamedTuple):
 
 
 class BlockLayout:
+    _required_attributes = []  
     _elements: Dict[str, ArrayElement] = {}
+    
+    @classmethod
+    def define(cls):
+        """Define the shared memory blocks. Should be called in the parent process."""
+        raise NotImplementedError("define() should be implemented in the subclass.")
     
     def __init__(self, shm, offset, *args, **kwargs):
         self.shm = shm
         self.offset = offset
         self._create_elements(*args, **kwargs)
+        assert all(
+            hasattr(self, name) for name in self.__class__._required_attributes
+        ), f"BlockLayout {self.__class__.__name__} is missing required elements: {self.__class__._required_attributes}"
     
     def _create_elements(self, *args, **kwargs):
         crnt_offset = self.offset
@@ -138,7 +140,7 @@ class BlockLayout:
                 element = getattr(self, name)
                 if isinstance(element, np.ndarray):
                     element[...] = value
-                elif isinstance(element, (dict, NamedTuple)):
+                elif isinstance(element, (dict, namedtuple)):
                     tree.map_structure(write_element, element, value)
                 else:
                     raise ValueError(f"Element {name} is not a numpy array.")
@@ -189,13 +191,21 @@ class BaseMemoryManager:
         """Clean up shared memory blocks (ideally) from the main process."""
         raise NotImplementedError("__del__() should be implemented in the subclass.")
 
-class BufferHeader(BlockLayout):
+class BufferHeaderBase(BlockLayout):
+    _required_attributes = ['in_index', 'out_index', 'submitted', 'ready']
     _elements = {
         'in_index': AtomicCounterElement(),  # index of the next block to be used
         'out_index': AtomicCounterElement(),  # index of the next block to be used
-        'submitted': VarLenArrayElement(np.bool_, ()), # boolean mask of submitted blocks
-        'ready': VarLenArrayElement(np.bool_, ()),  # boolean mask of ready blocks
     }
+    @classmethod
+    def define(cls, length: int):
+        class BufferHeader(cls):
+            _elements = cls._elements.copy()
+            _elements.update({
+                'submitted': ArrayElement(np.bool_, (length,)), # boolean mask of submitted blocks
+                'ready': ArrayElement(np.bool_, (length,)),  # boolean mask of ready blocks
+            })
+        return BufferHeader
 
 class IOBuffer(BaseMemoryManager):
     """The IOBuffer handles asynchronous communication between processes.
@@ -213,7 +223,8 @@ class IOBuffer(BaseMemoryManager):
     def __init__(
         self, num_blocks, input_element: BlockLayout,
         output_element: BlockLayout, name: str = 'IOBuffer'):
-        self._header_size = BufferHeader.get_block_size(length=num_blocks)
+        self._header_cls = BufferHeaderBase.define(length=num_blocks)
+        self._header_size = self._header_cls.get_block_size(length=num_blocks)
         self._header_name = f'{name}_header'
 
         self._input_size = input_element.get_block_size()
@@ -239,14 +250,14 @@ class IOBuffer(BaseMemoryManager):
         self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=True, size=self._input_size*self._num_blocks)
         self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=True, size=self._output_size*self._num_blocks)
         
-        self.header = BufferHeader(self._header_shm, 0, length=self._num_blocks)
+        self.header = self._header_cls(self._header_shm, 0, length=self._num_blocks)
         
         self.reset()  # clear the header and input/output blocks
     
     def reset(self):
         assert self._is_main, "reset() should only be called in the main process."
         # clear the header and input/output blocks
-        BufferHeader.clear_block(self._header_shm, 0, length=self._num_blocks)
+        self._header_cls.clear_block(self._header_shm, 0, length=self._num_blocks)
         for i in range(self._num_blocks):
             self._input_element_cls.clear_block(self._input_shm, i * self._input_size)
             self._output_element_cls.clear_block(self._output_shm, i * self._output_size)
@@ -256,7 +267,7 @@ class IOBuffer(BaseMemoryManager):
         self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
         self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=False, size=self._input_size)
         self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=False, size=self._output_size)
-        self.header = BufferHeader(self._header_shm, 0, length=self._num_blocks)
+        self.header = self._header_cls(self._header_shm, 0, length=self._num_blocks)
     
     def __del__(self):
         """Clean up shared memory blocks in the main process."""
