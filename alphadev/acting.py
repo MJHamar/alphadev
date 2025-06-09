@@ -27,6 +27,7 @@ from acme.agents.tf.mcts import models
 from acme.agents.tf.mcts import types
 from acme.tf import variable_utils as tf2_variable_utils
 
+
 import dm_env
 import numpy as np
 from scipy import special
@@ -36,6 +37,8 @@ import tree
 
 from .observers import MCTSObserver
 from .search import visit_count_policy, mcts
+from .search_v2 import APV_MCTS
+from .network import NetworkFactory, make_input_spec
 
 import logging
 logger = logging.getLogger(__name__)
@@ -49,11 +52,19 @@ class MCTSActor(acmeMCTSActor):
         self,
         environment_spec: specs.EnvironmentSpec,
         model: models.Model,
-        network: snt.Module,
+        network_factory: NetworkFactory,
         discount: float,
         num_simulations: int,
         search_policy: callable,
         temperature_fn: callable,
+        search_retain_subtree: bool = True,
+        use_apv_mcts: bool = False,
+        apv_processes_per_pool: int = 2,
+        dirichlet_alpha: float = 1.0,
+        exploration_fraction: float = 0.0,
+        virtual_loss_const: float = -1.0,
+        search_batch_size: int = 1,
+        # TODO: variable client can only be initialized within the worker processes of the distributed agent.
         variable_client: Optional[tf2_variable_utils.VariableClient] = None,
         adder: Optional[adders.Adder] = None,
         counter: Optional[counting.Counter] = None,
@@ -62,7 +73,7 @@ class MCTSActor(acmeMCTSActor):
         super().__init__(
             environment_spec=environment_spec,
             model=model,
-            network=network,
+            network=NetworkFactory(make_input_spec(environment_spec.observations)), # NOTE: unused when use_apv_mcts is True
             discount=discount,
             num_simulations=num_simulations,
             adder=adder,
@@ -72,10 +83,32 @@ class MCTSActor(acmeMCTSActor):
         self._temperature_fn = temperature_fn
         self._counter = counter
         self._observers = observers
-
+        
+        self._use_apv_mcts = use_apv_mcts
+        if self._use_apv_mcts:
+            self._apv_processes_per_pool = apv_processes_per_pool
+            self.mcts = APV_MCTS(
+                model=model,
+                search_policy=search_policy,
+                network_factory=network_factory,
+                num_simulations=num_simulations,
+                num_actions=environment_spec.actions._num_values,
+                num_actors=apv_processes_per_pool,
+                discount=discount,
+                dirichlet_alpha=dirichlet_alpha,
+                exploration_fraction=exploration_fraction,
+                const_vl=virtual_loss_const,
+                batch_size=search_batch_size,
+                # TODO pass config
+                network_factory_args=(environment_spec.observations),
+                retain_subtree=search_retain_subtree,
+                name='APV_MCTS'
+            )
+    
     def _forward(
         self, observation: types.Observation) -> Tuple[types.Probs, types.Value]:
         """Performs a forward pass of the policy-value network."""
+        assert not self._use_apv_mcts, "Use APV_MCTS instead of _forward for MCTSActor."
         # fix over acme implementation: accepts structured observations
         logits, value = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
 
@@ -92,16 +125,20 @@ class MCTSActor(acmeMCTSActor):
         if self._model.needs_reset:
             self._model.reset(observation)
 
-        # Compute a fresh MCTS plan.
-        root = mcts(
-            observation,
-            model=self._model,
-            search_policy=self._search_policy, # FIX: use the given search policy.
-            evaluation=self._forward,
-            num_simulations=self._num_simulations,
-            num_actions=self._num_actions,
-            discount=self._discount,
-        )
+        if self._use_apv_mcts:
+            self._last_root = self.mcts.search(observation, self._last_root) # TODO: pass last root to keep subtree intact
+        else:
+            # Compute a fresh MCTS plan.
+            self._last_root = mcts(
+                observation,
+                model=self._model,
+                search_policy=self._search_policy, # FIX: use the given search policy.
+                evaluation=self._forward,
+                num_simulations=self._num_simulations,
+                num_actions=self._num_actions,
+                discount=self._discount,
+                # TODO: pass last root to keep subtree intact
+            )
         # Select an action according to the search policy.
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
@@ -115,7 +152,7 @@ class MCTSActor(acmeMCTSActor):
             self._model.reset(observation)
         action_mask = self._model.legal_actions()
         # perform masked visit count policy
-        probs = visit_count_policy(root, temperature=temperature, mask=action_mask)
+        probs = visit_count_policy(self._last_root, temperature=temperature, mask=action_mask)
         assert probs.shape == (self._num_actions,), f"Expected probs shape {(self._num_actions,)}, got {probs.shape}."
         # sample an action from the masked visit count policy
         action = np.int32(np.random.choice(self._actions, p=probs))
@@ -125,7 +162,7 @@ class MCTSActor(acmeMCTSActor):
 
         for observer in self._observers:
             observer.on_action_selection(
-                node=root, probs=probs, action=action,
+                node=self._last_root, probs=probs, action=action,
                 training_steps=training_steps, temperature=temperature)
 
         return action

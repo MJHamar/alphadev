@@ -94,12 +94,15 @@ def run_mcts():
         dirichlet_alpha=dirichlet_alpha,
         exploration_fraction=exploration_fraction,
         const_vl=-1.0,
+        retain_subtree=True,
         batch_size=16,
     )
     outer_model = DummyModel(timestep)
+    action = None
     while timestep.step_type != StepType.LAST:
-        root = mcts.search(observation)
-        action = visit_count_policy(root, mask=outer_model.legal_actions())
+        root = mcts.search(observation, last_action=action)
+        action_probs = visit_count_policy(root, mask=outer_model.legal_actions())
+        action = np.random.choice(ADConfig.task_spec.num_actions, p=action_probs)
         timestep = outer_model.step(action)
     # root = mcts.search(observation)
     # action = visit_count_policy(root, mask=outer_model.legal_actions())

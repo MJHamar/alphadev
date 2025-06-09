@@ -14,7 +14,10 @@ emulator_mode: 'i32'
 
 # Self-Play
 num_actors: 3
-num_simulations: 1000
+max_moves: 10
+num_simulations: 10
+discount: 1.0
+search_retain_subtree: True
 
 # UCB formula
 pb_c_base: 19652
@@ -60,9 +63,7 @@ priority_exponent: 0.6
 redis_host: 'localhost'
 redis_port: 6379
 redis_db: 0
-inference_service_name: 'inference'
 variable_service_name: 'variable'
-inference_accumulation_period: 0.001
 device_config_path: './device_config.yaml'
 # Logging
 use_wandb: False
@@ -77,4 +78,4 @@ wanbd_run_id: null
 observe_mcts_policy: True
 mcts_observer_ratio: 0.001
 
-do_profiling: True
+do_mcts_profiling: True

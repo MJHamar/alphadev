@@ -37,6 +37,7 @@ class AlphaDevConfig(object):
     max_moves: int = 100
     num_simulations: int = 5
     discount: float = 1.0
+    search_retain_subtree: bool = True
 
     # Root prior exploration noise.
     root_dirichlet_alpha: float = 0.03
