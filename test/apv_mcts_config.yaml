@@ -18,6 +18,9 @@ max_moves: 100
 num_simulations: 1000
 discount: 1.0
 search_retain_subtree: True
+search_batch_size: 16
+async_search_num_pools: 1
+async_search_processes_pr_pool: 3
 
 # UCB formula
 pb_c_base: 19652

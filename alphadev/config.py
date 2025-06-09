@@ -99,6 +99,7 @@ class AlphaDevConfig(object):
     use_async_search: bool = True # if False, all actors will have their own version of the network
     async_search_num_pools: int = 1 # number of parallel search pools to use in async search
     async_search_processes_per_pool: Union[int, str] = 'auto' # number of processes per pool, 'auto' will distribute all available cores evently
+    search_batch_size: int = 1
     # device config
     device_config_path: Optional[str] = 'device_config.yaml'
     

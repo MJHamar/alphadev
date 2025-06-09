@@ -38,7 +38,7 @@ import tensorflow as tf
 import tree
 
 from .observers import MCTSObserver
-from .search import visit_count_policy, mcts
+from .search import visit_count_policy, mcts, Node
 from .search_v2 import APV_MCTS
 from .network import NetworkFactory, make_input_spec
 from .service.variable_service import VariableService
@@ -50,7 +50,7 @@ logger.setLevel(logging.DEBUG)
 
 class MCTSActor(acmeMCTSActor):
     """Executes a policy- and value-network guided MCTS search."""
-
+    _st_node = Node
     def __init__(
         self,
         environment_spec: specs.EnvironmentSpec,
@@ -129,6 +129,7 @@ class MCTSActor(acmeMCTSActor):
                 num_simulations=self._num_simulations,
                 num_actions=self._environment_spec.actions._num_values,
                 discount=self._discount,
+                node_class=self.__class__._st_node,
             ))
         self.last_action = None  # Last action selected by the actor.
 

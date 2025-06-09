@@ -79,11 +79,11 @@ class DualValueAZLearner(AZLearner):
         return loss
 
 class DualValueMCTSActor(MCTSActor):
+    _st_node = DvNode
     # override the _forward method to account for the correctness and latency logits from the network.
     def _forward(self, observation):
         """Performs a forward pass of the policy-value network."""
         if self._add_batch_dim:
-            
             logits, value, _, _ = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
         else:
             logits, value, _, _ = self._network(observation)
@@ -104,16 +104,7 @@ class DualValueMCTSActor(MCTSActor):
 
         # Compute a fresh MCTS plan.
         # NOTE: we use a modified implementation here.
-        root = mcts(
-            observation,
-            model=self._model,
-            search_policy=self._search_policy,
-            evaluation=self._forward,
-            num_simulations=self._num_simulations,
-            num_actions=self._num_actions,
-            discount=self._discount,
-            node_class=DvNode,
-        )
+        root = self.mcts.search(observation)
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
         training_steps = self._counter.get_counts().get(self._counter.get_steps_key(), 0)

@@ -1,4 +1,5 @@
 """Performance tests for the environment."""
+import os
 from time import time
 import cProfile
 import pstats
@@ -18,6 +19,8 @@ from alphadev.network import AlphaDevNetwork, NetworkFactory
 from alphadev.alphadev_acme import make_agent
 from acme.specs import make_environment_spec
 from acme.environment_loop import EnvironmentLoop
+
+CFG_PATH = f'{os.path.dirname(__file__)}/apv_mcts_config.yaml'
 
 class DummyNetwork(snn.Module):
     def __init__(self, num_actions):
@@ -49,6 +52,8 @@ task_a10_i10 = make_ts(10)
 
 env_10 = AssemblyGame(task_spec=task_a10_i10)
 
+config = AlphaDevConfig.from_yaml()
+
 actor_10 = MCTSActor(
     environment_spec=make_environment_spec(env_10),
     network=DummyNetwork(num_actions=task_a10_i10.num_actions),
@@ -58,6 +63,21 @@ actor_10 = MCTSActor(
     num_simulations=100,# make 100 rollouts
     discount=1.0,
 )
+
+def make_apv_actor(config: AlphaDevConfig) -> MCTSActor:
+    return MCTSActor(
+        environment_spec=make_environment_spec(env_10),
+        model=AssemblyGameModel(task_spec=task_a10_i10),
+        network_factory=NetworkFactory(config),
+        discount=config.discount,
+        num_simulations=config.num_simulations,
+        search_policy=PUCTSearchPolicy(config.pb_c_base, config.pb_c_init),
+        temperature_fn=config.temperature_fn,
+        search_retain_subtree=config.search_retain_subtree,
+        use_apv_mcts=True,
+        apv_processes_per_pool=config.async_search_processes_per_pool,
+        search_batch_size=config.search_batch_size,
+    )
 
 # realistic scenario
 def actor_env_from_config(path) -> EnvironmentLoop:
