@@ -20,6 +20,7 @@ from .search import PUCTSearchPolicy
 from .network import AlphaDevNetwork, NetworkFactory, make_input_spec
 from .environment import AssemblyGame, AssemblyGameModel, EnvironmentFactory, ModelFactory
 from .service.variable_service import VariableService
+from .service.inference_service import InferenceFactory
 
 import logging
 logger = logging.getLogger(__name__)
@@ -44,16 +45,40 @@ def make_agent(config: AlphaDevConfig):
     search_policy = PUCTSearchPolicy(config.pb_c_base, config.pb_c_init)
     
     if config.distributed:
+        if config.use_async_search:
+            inference_factory = InferenceFactory(
+                num_blocks=config.num_simulations,
+                input_spec=env_spec.observations,
+                output_spec=config.task_spec.num_actions, # TODO: obtain output spec from the network.
+                batch_size=config.search_batch_size,
+                network_factory=net_factory,
+                variable_update_period=config.variable_update_period,
+                network_factory_args=(make_input_spec(env_spec.observations),),
+            )
+        else:
+            inference_factory = None
+        # -- distributed MCTS agent
         return DistributedMCTS(
+            # device configuration for the different processes.
             device_config=config.device_config,
+            # basic params
             environment_factory=env_factory,
             network_factory=net_factory,
             model_factory=mod_factory,
             optimizer_factory=opt_factory,
+            environment_spec=env_spec,
+            # search
             search_policy=search_policy,
             temperature_fn=config.temperature_fn,
             num_actors=config.num_actors,
             num_simulations=config.num_simulations,
+            discount=config.discount,
+            variable_update_period=config.variable_update_period,
+            dirichlet_alpha=config.root_dirichlet_alpha,
+            exploration_fraction=config.root_exploration_fraction,
+            search_retain_subtree=config.search_retain_subtree,
+            use_apv_mcts=config.use_async_search,
+            # training parameters
             batch_size=config.batch_size,
             prefetch_size=config.prefetch_size,
             target_update_period=config.target_update_period,
@@ -64,9 +89,11 @@ def make_agent(config: AlphaDevConfig):
             priority_exponent=config.priority_exponent,
             n_step=config.n_step,
             learning_rate=config.lr_init,
-            discount=config.discount,
-            environment_spec=env_spec,
-            variable_update_period=config.variable_update_period,
+            # APV MCTS parameters
+            inference_factory=inference_factory,
+            apv_processes_per_pool=config.async_search_processes_per_pool,
+            virtual_loss_const=config.search_virtual_loss_const,
+            # Other parameters
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger_factory=config.logger_factory,
             observers=config.env_observers,
@@ -75,22 +102,25 @@ def make_agent(config: AlphaDevConfig):
     else:
         cfg_logger = config.logger_factory()
         return MCTS(
-            network=net_factory(make_input_spec(env_spec.observations)),
             model=mod_factory(None),
+            network_factory=net_factory,
             optimizer=opt_factory(),
+            search_policy=search_policy,
+            temperature_fn=config.temperature_fn,
             n_step=config.n_step,
             discount=config.discount,
             replay_capacity=config.max_replay_size, # TODO
-            num_simulations=config.num_simulations,
             environment_spec=env_spec,
-            search_policy=search_policy,
-            temperature_fn=config.temperature_fn,
             batch_size=config.batch_size,
+            
+            num_simulations=config.num_simulations,
+            dirichlet_alpha=config.root_dirichlet_alpha,
+            exploration_fraction=config.root_exploration_fraction,
+            search_retain_subtree=config.search_retain_subtree,
+            
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger=cfg_logger,
             mcts_observers=config.search_observers,
-            variable_service=VariableService(config),
-            variable_update_period=config.variable_update_period
         )
 
 def run_single_threaded(config: AlphaDevConfig, agent: MCTS):

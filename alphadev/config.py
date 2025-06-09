@@ -66,6 +66,9 @@ class AlphaDevConfig(object):
     value_max: float = 3.0  # These two parameters are task / reward-
     value_num_bins: int = 301  # dependent and need to be adjusted.
     categorical_value_loss: bool = True # wheether to treat the value functions as a distribution
+    use_apv_mcts: bool = False # whether to use APV MCTS or single-threaded MCTS
+    apv_processes_per_pool: Union[int, str] = 'auto' # number of processes per pool, 'auto' will distribute all available cores evenly
+    
 
     ### Training
     training_steps: int = 1000 #int(1000e3)
@@ -97,9 +100,9 @@ class AlphaDevConfig(object):
     variable_service_name: str = 'variable'
     # search single-threaded or asynchronous
     use_async_search: bool = True # if False, all actors will have their own version of the network
-    async_search_num_pools: int = 1 # number of parallel search pools to use in async search
     async_search_processes_per_pool: Union[int, str] = 'auto' # number of processes per pool, 'auto' will distribute all available cores evently
     search_batch_size: int = 1
+    async_seach_virtual_loss: float = -1.0 
     # device config
     device_config_path: Optional[str] = 'device_config.yaml'
     

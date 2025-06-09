@@ -17,7 +17,7 @@ Reimplementation of `acme.agents.tf.mcts.acting` that doesn't such so much.
 
 """A MCTS actor."""
 
-from typing import Optional, Tuple, Sequence, Dict
+from typing import Optional, Tuple, Sequence, Callable
 from collections import namedtuple
 import functools
 
@@ -50,40 +50,45 @@ logger.setLevel(logging.DEBUG)
 
 class MCTSActor(acmeMCTSActor):
     """Executes a policy- and value-network guided MCTS search."""
-    _st_node = Node
+    _st_node = Node # node implementation for single-threaded MCTS.
     def __init__(
         self,
         environment_spec: specs.EnvironmentSpec,
         model: models.Model,
-        network_factory: NetworkFactory,
         discount: float,
         num_simulations: int,
         search_policy: callable,
         temperature_fn: callable,
-        search_retain_subtree: bool = True,
-        use_apv_mcts: bool = False,
-        apv_processes_per_pool: int = 2,
         dirichlet_alpha: float = 1.0,
         exploration_fraction: float = 0.0,
-        virtual_loss_const: float = -1.0,
-        search_batch_size: int = 1,
-        inference_device_config: Optional[Dict[str, str]] = None,
-        variable_service: Optional[VariableService] = None,
-        variable_update_period: int = 100,
+        search_retain_subtree: bool = True,
+        # implementation-specific parameters
+        use_apv_mcts: bool = False, # whether to use APV MCTS or single-threaded MCTS
+        # single-threaded mode
+        network: Optional[snt.Module] = None,
+        variable_client: Optional[Callable] = None,
+        # APV MCTS mode
+        inference_factory: Optional[NetworkFactory] = None,
+        apv_processes_per_pool: Optional[int] = None,
+        virtual_loss_const: Optional[float] = None,
+        # other
         adder: Optional[adders.Adder] = None,
         counter: Optional[counting.Counter] = None,
         observers: Optional[Sequence[MCTSObserver]] = [],
+        name: str = 'mcts_actor',
     ):
-        if use_apv_mcts:
-            network = None
-            variable_client = None
-        else:
-            network = NetworkFactory(make_input_spec(environment_spec.observations))
-            variable_client = tf2_variable_utils.VariableClient(
-                client=variable_service,
-                variables={'network': network.trainable_variables},
-                update_period=variable_update_period,
+        # check parameters
+        _required_params = (
+            [inference_factory, apv_processes_per_pool, virtual_loss_const]
+            if use_apv_mcts else
+            [network]
         )
+        assert all(param is not None for param in _required_params), \
+            "If use_apv_mcts is True, inference_factory, apv_processes_per_pool and virtual_loss_const must be provided. " \
+            "If use_apv_mcts is False, network_factory and variable_service must be provided."
+        
+        # make sure we don't pass the network to the parent class if apv is used.
+        if use_apv_mcts: network = None; variable_client = None
         
         super().__init__(
             environment_spec=environment_spec,
@@ -94,33 +99,38 @@ class MCTSActor(acmeMCTSActor):
             adder=adder,
             variable_client=variable_client,
         )
+        self.name = name
+        
+        self._dirichlet_alpha = dirichlet_alpha
+        self._exploration_fraction = exploration_fraction
+        self._retain_subtree = search_retain_subtree
+        
         self._search_policy = search_policy
         self._temperature_fn = temperature_fn
         self._counter = counter
         self._observers = observers
         
         self._use_apv_mcts = use_apv_mcts
+        
         if self._use_apv_mcts:
             self.mcts = APV_MCTS(
-                model=model,
-                search_policy=search_policy,
-                network_factory=network_factory,
-                num_simulations=num_simulations,
-                num_actions=environment_spec.actions._num_values,
+                model=self._model,
+                search_policy=self._search_policy,
+                num_simulations=self._num_simulations,
+                num_actions=self._num_actions,
                 num_actors=apv_processes_per_pool,
-                discount=discount,
-                dirichlet_alpha=dirichlet_alpha,
-                exploration_fraction=exploration_fraction,
+                inference_factory=inference_factory,
+                discount=self._discount,
+                dirichlet_alpha=self._dirichlet_alpha,
+                exploration_fraction=self._exploration_fraction,
                 const_vl=virtual_loss_const,
-                batch_size=search_batch_size,
-                variable_service=variable_service,
-                variable_update_period=variable_update_period,
-                network_factory_args=(environment_spec.observations),
-                inference_device_config=inference_device_config,
-                retain_subtree=search_retain_subtree,
-                name='APV_MCTS'
+                retain_subtree=self._retain_subtree,
+                do_profiling=False,
+                observers=[], # TODO: implement
+                name=f'{self.name}_search',
             )
         else:
+            # unify the APIs of the two MCTS implementations.
             self.mcts = namedtuple('single_threaded_mcts', ['search'])(search=functools.partial(
                 mcts,
                 model=self._model,
@@ -129,6 +139,8 @@ class MCTSActor(acmeMCTSActor):
                 num_simulations=self._num_simulations,
                 num_actions=self._environment_spec.actions._num_values,
                 discount=self._discount,
+                dirichlet_alpha=self._dirichlet_alpha,
+                exploration_fraction=self._exploration_fraction,
                 node_class=self.__class__._st_node,
             ))
         self.last_action = None  # Last action selected by the actor.

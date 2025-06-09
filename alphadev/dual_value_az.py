@@ -103,8 +103,7 @@ class DualValueMCTSActor(MCTSActor):
             self._model.reset(observation)
 
         # Compute a fresh MCTS plan.
-        # NOTE: we use a modified implementation here.
-        root = self.mcts.search(observation)
+        root = self.mcts.search(observation, self.last_action)
 
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
         training_steps = self._counter.get_counts().get(self._counter.get_steps_key(), 0)
@@ -117,14 +116,14 @@ class DualValueMCTSActor(MCTSActor):
         probs = visit_count_policy(root, temperature=temperature, mask=action_mask)
         assert probs.shape == (self._num_actions,), f"Expected probs shape {(self._num_actions,)}, got {probs.shape}."
         # sample an action from the masked visit count policy
-        action = np.int32(np.random.choice(self._actions, p=probs))
+        self.last_action = np.int32(np.random.choice(self._actions, p=probs))
 
         # Save the policy probs so that we can add them to replay in `observe()`.
         self._probs = probs.astype(np.float32)
 
         for observer in self._observers:
             observer.on_action_selection(
-                node=root, probs=probs, action=action,
+                node=root, probs=probs, action=self.last_action,
                 training_steps=training_steps, temperature=temperature)
 
-        return action
+        return self.last_action

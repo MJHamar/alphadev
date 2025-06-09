@@ -50,6 +50,7 @@ from .acting import MCTSActor
 from .search import PUCTSearchPolicy
 from .observers import MCTSObserver
 from .service.service import Program, ReverbService, RPCService, RPCClient, SubprocessService
+from .service.inference_service import InferenceFactory
 from .config import AlphaDevConfig
 from .device_config import DeviceAllocationConfig
 from .service.variable_service import VariableService
@@ -60,19 +61,22 @@ class MCTS(agent.Agent):
 
     def __init__(
         self,
-        network: snt.Module,
         model: models.Model,
+        network_factory: NetworkFactory,
         optimizer: snt.Optimizer,
         search_policy: Callable[[search.Node], types.Action],
         temperature_fn: Callable[[int], float],
         n_step: int,
         discount: float,
         replay_capacity: int,
-        num_simulations: int,
         environment_spec: specs.EnvironmentSpec,
         batch_size: int,
-        variable_service: VariableService,
-        variable_update_period: int=10,
+        # Search parameters
+        num_simulations: int,
+        dirichlet_alpha: float = 1.0,
+        exploration_fraction: float = 0.0,
+        search_retain_subtree: bool = True,
+        # Other parameters
         use_dual_value_network: bool = False,
         logger: loggers.Logger = None,
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
@@ -105,6 +109,7 @@ class MCTS(agent.Agent):
         dataset = datasets.make_reverb_dataset(server_address=address)
         dataset = dataset.batch(batch_size, drop_remainder=True)
 
+        network = network_factory(make_input_spec(environment_spec.observations))
         tf2_utils.create_variables(network, [environment_spec.observations])
 
         # Now create the agent components: actor & learner.
@@ -117,14 +122,24 @@ class MCTS(agent.Agent):
             actor = DualValueMCTSActor(
                 environment_spec=environment_spec,
                 model=model,
-                network=network,
                 discount=discount,
-                adder=adder,
                 num_simulations=num_simulations,
                 search_policy=search_policy,
                 temperature_fn=temperature_fn,
+                dirichlet_alpha=dirichlet_alpha,
+                exploration_fraction=exploration_fraction,
+                search_retain_subtree=search_retain_subtree,
+                # implementation-specific parameters
+                # NOTE: we do not support APV MCTS in single-threaded agents.
+                use_apv_mcts=False,
+                # single-threaded mode
+                network=network_factory,
+                variable_client=None, # no need for variable service in single-threaded mode
+                # other
+                adder=adder,
                 counter=self.counter,
                 observers=mcts_observers,
+                name='MCTSActor'
             )
             learner = DualValueAZLearner(
                 network=network,
@@ -133,21 +148,29 @@ class MCTS(agent.Agent):
                 discount=discount,
                 logger=self.logger,
                 counter=self.counter,
-                variable_service=variable_service,
-                varibale_update_period=variable_update_period,
             )
         else:
             actor = MCTSActor(
                 environment_spec=environment_spec,
                 model=model,
-                network=network,
                 discount=discount,
-                adder=adder,
                 num_simulations=num_simulations,
                 search_policy=search_policy,
                 temperature_fn=temperature_fn,
+                dirichlet_alpha=dirichlet_alpha,
+                exploration_fraction=exploration_fraction,
+                search_retain_subtree=search_retain_subtree,
+                # implementation-specific parameters
+                # NOTE: we do not support APV MCTS in single-threaded agents.
+                use_apv_mcts=False,
+                # single-threaded mode
+                network=network_factory,
+                variable_client=None, # no need for variable service in single-threaded mode
+                # other
+                adder=adder,
                 counter=self.counter,
                 observers=mcts_observers,
+                name='MCTSActor'
             )
             learner = learning.AZLearner(
                 network=network,
@@ -156,8 +179,6 @@ class MCTS(agent.Agent):
                 discount=discount,
                 logger=self.logger,
                 counter=self.counter,
-                variable_service=variable_service,
-                variable_update_period=variable_update_period,
             )
 
         # The parent class combines these together into one 'agent'.
@@ -174,15 +195,26 @@ class DistributedMCTS:
 
     def __init__(
         self,
+        # device configuration for the different processes.
         device_config: DeviceAllocationConfig,
+        # basic params
         environment_factory: Callable[[], dm_env.Environment],
         network_factory: Callable[[specs.DiscreteArray], snt.Module],
         model_factory: Callable[[specs.EnvironmentSpec], models.Model],
         optimizer_factory: Callable[[], snt.Optimizer],
+        environment_spec: specs.EnvironmentSpec,
+        # search
         search_policy: Callable[[search.Node], types.Action],
         temperature_fn: Callable[[int], float],
         num_actors: int,
         num_simulations: int = 50,
+        discount: float = 0.99,
+        variable_update_period: int = 1000,
+        dirichlet_alpha: float = 1.0,
+        exploration_fraction: float = 0.0,
+        search_retain_subtree: bool = True,
+        use_apv_mcts: bool = False,
+        # training
         batch_size: int = 256,
         prefetch_size: int = 4,
         target_update_period: int = 100,
@@ -192,33 +224,42 @@ class DistributedMCTS:
         importance_sampling_exponent: float = 0.2,
         priority_exponent: float = 0.6,
         n_step: int = 5,
-        learning_rate: float = 1e-3,
-        discount: float = 0.99,
-        environment_spec: Optional[specs.EnvironmentSpec] = None,
-        variable_update_period: int = 1000,
+        learning_rate: float = 1e-3,        
+        # APV MCTS parameters
+        inference_factory: Optional[NetworkFactory] = None,
+        apv_processes_per_pool: Optional[int] = None,
+        virtual_loss_const: Optional[float] = None,
+        # Other parameters
         use_dual_value_network: bool = False,
         logger_factory: Callable[[], loggers.Logger] = None,
         observers: Optional[acme.utils.observers.base.EnvLoopObserver] = [],
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
     ):
-
-        if environment_spec is None:
-            environment_spec = specs.make_environment_spec(environment_factory())
+        # check parameters
 
         # Internalize the device configuration.
         self._device_config = device_config
 
-        # These 'factories' create the relevant components on the workers.
+        # These factories create the relevant components on the workers.
         self._environment_factory = environment_factory
         self._network_factory = network_factory
         self._model_factory = model_factory
         self._optimizer_factory = optimizer_factory
-        self._search_policy = search_policy
+        self._env_spec = environment_spec
 
-        # Internalize hyperparameters.
+        # Search-related parameters
+        self._search_policy = search_policy
+        self._temperature_fn = temperature_fn
         self._num_actors = num_actors
         self._num_simulations = num_simulations
-        self._env_spec = environment_spec
+        self._discount = discount
+        self._variable_update_period = variable_update_period
+        self._dirichlet_alpha = dirichlet_alpha
+        self._exploration_fraction = exploration_fraction
+        self._search_retain_subtree = search_retain_subtree
+        self._use_apv_mcts = use_apv_mcts
+        
+        # Training parameters
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
         self._target_update_period = target_update_period
@@ -229,11 +270,21 @@ class DistributedMCTS:
         self._priority_exponent = priority_exponent
         self._n_step = n_step
         self._learning_rate = learning_rate
-        self._discount = discount
-        self._variable_update_period = variable_update_period
+        # If using APV MCTS, we need to provide the inference factory and related parameters.
+        if use_apv_mcts:
+            assert inference_factory is not None, 'Inference factory must be provided for APV MCTS.'
+            assert apv_processes_per_pool is not None, 'Number of processes per pool must be provided for APV MCTS.'
+            assert virtual_loss_const is not None, 'Virtual loss constant must be provided for APV MCTS.'
+            self._inference_factory = inference_factory
+            self._search_num_actors = apv_processes_per_pool
+            self._search_virual_loss_const = virtual_loss_const
+        else:
+            # make sure we don't pass these accidentally.
+            self._inference_factory = inference_factory
+            self._search_num_actors = apv_processes_per_pool
+            self._search_virual_loss_const = virtual_loss_const
+        
         self._use_dual_value_network = use_dual_value_network
-        self._temperature_fn = temperature_fn
-
         # set up logging
         if logger_factory is not None:
             self._logger_factory = logger_factory
@@ -310,6 +361,7 @@ class DistributedMCTS:
 
     def actor(
         self,
+        index: int,
         replay: reverb.Client,
         counter: counting.Counter,
         logger: loggers.Logger,
@@ -323,8 +375,15 @@ class DistributedMCTS:
 
         mcts_observers = self._mcts_observers(logger)
         
-        network = self._network_factory(make_input_spec(self._env_spec.observations))
-        
+        if self._use_apv_mcts:
+            network = variable_client = None
+        else:
+            network = self._network_factory(make_input_spec(self._env_spec.observations))
+            variable_client = tf2_variable_utils.VariableClient(
+                client=variable_service,
+                variables={'network': network.trainable_variables},
+                update_period=self._variable_update_period,
+            )
 
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
@@ -337,32 +396,54 @@ class DistributedMCTS:
             actor = DualValueMCTSActor(
                 environment_spec=self._env_spec,
                 model=model,
-                network=network,
                 discount=self._discount,
-                adder=adder,
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
-                variable_service=variable_service,
-                variable_update_period=self._variable_update_period,
+                dirichlet_alpha=self.dirichlet_alpha,
+                exploration_fraction=self._exploration_fraction,
+                search_retain_subtree=self._search_retain_subtree,
+                # implementation-specific parameters
+                use_apv_mcts=self._use_apv_mcts,
+                # single-threaded mode
+                network=network,
+                variable_client=variable_client,
+                # APV MCTS mode
+                inference_factory=self._inference_factory,
+                apv_processes_per_pool=self._search_num_actors,
+                virtual_loss_const=self._search_virual_loss_const,
+                # other
+                adder=adder,
                 counter=counter,
                 observers=mcts_observers,
+                name=f'actor/{index}'
             )
         else:
             # Create the agent.
             actor = MCTSActor(
                 environment_spec=self._env_spec,
                 model=model,
-                network=network,
                 discount=self._discount,
-                adder=adder,
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
-                variable_service=variable_service,
-                variable_update_period=self._variable_update_period,
+                dirichlet_alpha=self.dirichlet_alpha,
+                exploration_fraction=self._exploration_fraction,
+                search_retain_subtree=self._search_retain_subtree,
+                # implementation-specific parameters
+                use_apv_mcts=self._use_apv_mcts,
+                # single-threaded mode
+                network=network,
+                variable_client=variable_client,
+                # APV MCTS mode
+                inference_factory=self._inference_factory,
+                apv_processes_per_pool=self._search_num_actors,
+                virtual_loss_const=self._search_virual_loss_const,
+                # other
+                adder=adder,
                 counter=counter,
                 observers=mcts_observers,
+                name=f'actor/{index}'
             )
 
         observers = self._observers(logger)
@@ -389,40 +470,66 @@ class DistributedMCTS:
 
         mcts_observers = self._mcts_observers(logger)
         
-        network = self._network_factory(make_input_spec(self._env_spec.observations))
-        
-        variable_client = tf2_variable_utils.VariableClient(
-            client=variable_service,
-            variables={'network': network.trainable_variables},
-            update_period=self._variable_update_period,
-        )
+        if self._use_apv_mcts:
+            network = variable_client = None
+        else:
+            network = self._network_factory(make_input_spec(self._env_spec.observations))
+            variable_client = tf2_variable_utils.VariableClient(
+                client=variable_service,
+                variables={'network': network.trainable_variables},
+                update_period=self._variable_update_period,
+            )
         
         if self._use_dual_value_network:
             actor = DualValueMCTSActor(
                 environment_spec=self._env_spec,
                 model=model,
-                network=network,
                 discount=self._discount,
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
+                dirichlet_alpha=self.dirichlet_alpha,
+                exploration_fraction=self._exploration_fraction,
+                search_retain_subtree=self._search_retain_subtree,
+                # implementation-specific parameters
+                use_apv_mcts=self._use_apv_mcts,
+                # single-threaded mode
+                network=network,
                 variable_client=variable_client,
+                # APV MCTS mode
+                inference_factory=self._inference_factory,
+                apv_processes_per_pool=self._search_num_actors,
+                virtual_loss_const=self._search_virual_loss_const,
+                # other
                 counter=counter,
                 observers=mcts_observers,
+                name=f'evaluator'
             )
         else:
             # Create the agent.
             actor = MCTSActor(
                 environment_spec=self._env_spec,
                 model=model,
-                network=network,
                 discount=self._discount,
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
+                dirichlet_alpha=self.dirichlet_alpha,
+                exploration_fraction=self._exploration_fraction,
+                search_retain_subtree=self._search_retain_subtree,
+                # implementation-specific parameters
+                use_apv_mcts=self._use_apv_mcts,
+                # single-threaded mode
+                network=network,
                 variable_client=variable_client,
+                # APV MCTS mode
+                inference_factory=self._inference_factory,
+                apv_processes_per_pool=self._search_num_actors,
+                virtual_loss_const=self._search_virual_loss_const,
+                # other
                 counter=counter,
                 observers=mcts_observers,
+                name=f'evaluator'
             )
 
         observers = self._observers(logger)
@@ -502,9 +609,9 @@ class DistributedMCTS:
                         instance_factory=self.actor,
                         instance_cls=acme.EnvironmentLoop,
                         args=(
-                            replay, counter, logger, variable_service
+                            idx, replay, counter, logger, variable_service
                         ),),
-                    device_config=actor_device_config,
+                    device_config=actor_device_config, # NOTE: only used when using single-threaded actors
                     )
-
+        
         return program
