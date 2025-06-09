@@ -24,7 +24,7 @@ logging.basicConfig(
     format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
 )
 
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # Shared memory has a fixed size. for each MCTS, we do not need to re-allocate it
 # but we do need to re-initialize it.
@@ -302,10 +302,12 @@ class SharedTree(BaseMemoryManager):
             prev_root = self.get_root()
             logger.debug('SharedTree.reset: previous root is %s. children %s', repr(prev_root), [(i,c) for i,c in enumerate(prev_root.children)])
             new_root_offset = prev_root.children[last_action]
-            assert new_root_offset != 0, \
-                "SharedTree.reset: last_action %s is not a valid action for the current root %s." % (last_action, repr(prev_root))
-            new_root = self.get_by_offset(new_root_offset)
-            logger.debug('SharedTree.reset: last_action %s, prev_root %s.', last_action, repr(prev_root))
+            if new_root_offset == 0:
+                new_root = None # do not retain the subtree
+                logger.debug("SharedTree.reset: last_action %s was never visited. defaulting to empty tree.", last_action)
+            else:
+                new_root = self.get_by_offset(new_root_offset)
+                logger.debug('SharedTree.reset: last_action %s, prev_root %s.', last_action, repr(prev_root))
         else:
             new_root = None
         # reset the header's counter and available array.
@@ -358,8 +360,8 @@ class SharedTree(BaseMemoryManager):
         logger.debug('SharedTree.reset: header available array set to %s.', [(i,a) for i, a in enumerate(self.header.available)])
         # this array can now be used to allocate new nodes.
         # sanity check
-        assert last_action is None or root.offset != 0, \
-            "SharedTree.reset: last_action %s was provided but root is at offset %s. (should not be 0)" % (last_action, root.offset)
+        assert new_root is None or root.offset != 0, \
+            "SharedTree.reset: last_action %s was visited before, but root is at offset %s. (should not be 0)" % (last_action, root.offset)
 
     def attach(self):
         logger.debug('SharedTree.attach')
@@ -681,9 +683,9 @@ class APV_MCTS(object):
         self.tree.reset(last_action=last_action)
         
         root: NodeBase = self.tree.get_root()
-        if last_action is None:
+        if not root.expanded: # this is guaranteed to be the case if last_action was None or the corr. node was never visited.
             self.inference_buffer.submit(node_offset=0, observation=observation)
-
+            
             logger.debug('APV_MCTS[main process] Waiting for inference service to return prior and value estimate.')
             with self.inference_buffer.poll_ready() as inference_result:
                 _, prior, _ = inference_result
@@ -692,10 +694,6 @@ class APV_MCTS(object):
             noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
             prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
             
-            legal_actions = self.model.legal_actions()
-
-            root.set_legal_actions(legal_actions)
-
             root.expand(prior)
             logger.debug('APV_MCTS[main process] Root node initialized with prior and legal actions. Starting pool')
         else:
@@ -703,10 +701,10 @@ class APV_MCTS(object):
             root.set_prior(
                 root.prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
             )
-            # legal actions are already set
-            # it is already expanded as well.
-            assert root.expanded, "Last root must be expanded."
-
+        if not root.mask.any():
+            legal_actions = self.model.legal_actions()
+            root.set_legal_actions(legal_actions)
+        
         # all that is left is to start the pool.
         logger.debug('APV_MCTS[main process] Starting actor pool with %d actors.', self.num_actors)
         statistics = self.actor_pool.map(
@@ -717,13 +715,11 @@ class APV_MCTS(object):
               ) for i in range(self.num_actors)
             ]
         )
-
         for o in self.observers:
             o.update(statistics, root, self.tree, self.inference_buffer)
-
         logger.debug('APV_MCTS[main process] search done. Root (W/N):\n %s', list(zip(root.W, root.N)))
-        print('need input')
-        input("press Enter to continue...")  # for debugging purposes, remove in production
+        # print('need input')
+        # input("press Enter to continue...")  # for debugging purposes, remove in production
         return root  # return the root node, which now contains the search results
 
 def _run_inference(
@@ -903,6 +899,10 @@ def _run_task(
         task_allocator = _task_task_allocator
 
         my_task_id = task_allocator.get_task(process_id)
+        if my_task_id == APV_MCTS.SEARCH_SIM_TASK:
+            # FIXME: this will break everything if task allocation is dynamic.
+            tree.init_index()  # initialize the local write head for this process and run.
+        
         root = tree.get_root()
         stats = {
             'process_id': process_id,
@@ -923,7 +923,6 @@ def _run_task(
                 # query task
                 stats['task_ids'].append(my_task_id)
                 if my_task_id == APV_MCTS.SEARCH_SIM_TASK:
-                    tree.init_index()  # initialize the local write head for this process and run.
                     # run phase 1
                     result = _phase_1(
                         root=root, tree=tree, model=model,
@@ -958,7 +957,7 @@ def _run_task(
                 raise e
         stats['end_time'] = time()
         stats['duration'] = stats['end_time'] - stats['start_time']
-        logger.info("APV_MCTS[process %s] done. duration: %s; successes: %d, fails: %d", process_id, stats['duration'], stats['num_successes'], stats['num_fails'])
+        logger.info("APV_MCTS[process %s] done. task %s; duration: %s; successes: %d, fails: %d; index %s", process_id, stats['task_ids'][-1], stats['duration'], stats['num_successes'], stats['num_fails'], tree.header.index.peek())
         
         if do_profiling:
             profiler.disable()
