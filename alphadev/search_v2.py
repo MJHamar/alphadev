@@ -15,6 +15,7 @@ import tree
 
 from .environment import AssemblyGame, AssemblyGameModel
 from .inference_service import InferenceTaskBase, InferenceResultBase, AlphaDevInferenceService
+from .service.variable_service import VariableService
 from .shared_memory import *
 from .device_config import apply_device_config
 
@@ -586,6 +587,8 @@ class APV_MCTS(object):
             const_vl: float = 1.0,
             batch_size: int = 1,
             inference_buffer_size: int = None,
+            variable_service: Optional[VariableService] = None,
+            variable_update_period: int = 100,
             network_factory_args=(),
             network_factory_kwargs={},
             inference_device_config: Optional[Dict] = None,
@@ -627,6 +630,8 @@ class APV_MCTS(object):
             self.model.observation_spec(),
             self.num_actions,
             batch_size,
+            variable_service,
+            variable_update_period,
             network_factory_args,
             network_factory_kwargs,
             f'{name}.inference'

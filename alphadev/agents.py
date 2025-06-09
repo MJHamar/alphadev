@@ -325,11 +325,6 @@ class DistributedMCTS:
         
         network = self._network_factory(make_input_spec(self._env_spec.observations))
         
-        variable_client = tf2_variable_utils.VariableClient(
-            client=variable_service,
-            variables={'network': network.trainable_variables},
-            update_period=self._variable_update_period,
-        )
 
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
@@ -348,7 +343,8 @@ class DistributedMCTS:
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
-                variable_client=variable_client,
+                variable_service=variable_service,
+                variable_update_period=self._variable_update_period,
                 counter=counter,
                 observers=mcts_observers,
             )
@@ -363,7 +359,8 @@ class DistributedMCTS:
                 num_simulations=self._num_simulations,
                 search_policy=self._search_policy,
                 temperature_fn=self._temperature_fn,
-                variable_client=variable_client,
+                variable_service=variable_service,
+                variable_update_period=self._variable_update_period,
                 counter=counter,
                 observers=mcts_observers,
             )
