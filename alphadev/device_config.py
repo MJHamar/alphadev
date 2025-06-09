@@ -29,7 +29,7 @@ class DeviceAllocationConfig:
     
     def __init__(self, config: AlphaDevConfig):
         self.config = config
-        self.inference_mode = config.make_inference_service
+        self.inference_mode = False # TODO: remove
         self.num_actors = config.num_actors if not self.inference_mode else 1
         self.gpus = tf.config.list_physical_devices('GPU')
         # determine the network size in a new process so that we don't interfere with the main process

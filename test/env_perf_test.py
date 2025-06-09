@@ -15,8 +15,9 @@ from alphadev.acting import MCTSActor
 from alphadev.search import PUCTSearchPolicy
 from alphadev.utils import TaskSpec, generate_sort_inputs
 from alphadev.config import AlphaDevConfig
-from alphadev.network import AlphaDevNetwork, NetworkFactory
+from alphadev.network import AlphaDevNetwork, NetworkFactory, make_input_spec
 from alphadev.alphadev_acme import make_agent
+from alphadev.service.inference_service import InferenceFactory
 from acme.specs import make_environment_spec
 from acme.environment_loop import EnvironmentLoop
 
@@ -52,7 +53,7 @@ task_a10_i10 = make_ts(10)
 
 env_10 = AssemblyGame(task_spec=task_a10_i10)
 
-config = AlphaDevConfig.from_yaml()
+config = AlphaDevConfig.from_yaml(CFG_PATH)
 
 actor_10 = MCTSActor(
     environment_spec=make_environment_spec(env_10),
@@ -65,25 +66,41 @@ actor_10 = MCTSActor(
 )
 
 def make_apv_actor(config: AlphaDevConfig) -> MCTSActor:
+    env_10_spec = make_environment_spec(env_10)
+    net_factory = NetworkFactory(config)
+    inference_factory = InferenceFactory(
+        num_blocks=config.num_simulations,
+        input_spec=env_10_spec.observations,
+        output_spec=config.task_spec.num_actions, # TODO: obtain output spec from the network.
+        batch_size=config.search_batch_size,
+        network_factory=net_factory,
+        variable_update_period=config.variable_update_period,
+        network_factory_args=(make_input_spec(env_10_spec.observations),),
+    )
     return MCTSActor(
-        environment_spec=make_environment_spec(env_10),
+        environment_spec=env_10_spec,
         model=AssemblyGameModel(task_spec=task_a10_i10),
-        network_factory=NetworkFactory(config),
         discount=config.discount,
         num_simulations=config.num_simulations,
         search_policy=PUCTSearchPolicy(config.pb_c_base, config.pb_c_init),
         temperature_fn=config.temperature_fn,
-        search_retain_subtree=config.search_retain_subtree,
+        dirichlet_alpha=config.root_dirichlet_alpha,
+        exploration_fraction=config.root_exploration_fraction,
         use_apv_mcts=True,
+        search_retain_subtree=config.search_retain_subtree,
         apv_processes_per_pool=config.async_search_processes_per_pool,
         search_batch_size=config.search_batch_size,
+        network=None,
+        variable_client=None,
+        # APV MCTS mode
+        inference_factory=inference_factory,
+        virtual_loss_const=config.async_seach_virtual_loss,
     )
 
 # realistic scenario
 def actor_env_from_config(path) -> EnvironmentLoop:
     """Load the configuration from a file."""
     config = AlphaDevConfig.from_yaml(path)
-    assert not config.distributed, "This test is not for distributed agents."
     agent = make_agent(config)
     environment = EnvironmentFactory(config)()
     env_executor = EnvironmentLoop(

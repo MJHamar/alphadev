@@ -113,6 +113,7 @@ class MCTSActor(acmeMCTSActor):
         self._use_apv_mcts = use_apv_mcts
         
         if self._use_apv_mcts:
+            print(f"Using APV_MCTS with {apv_processes_per_pool} processes per pool.")
             self.mcts = APV_MCTS(
                 model=self._model,
                 search_policy=self._search_policy,
@@ -137,7 +138,7 @@ class MCTSActor(acmeMCTSActor):
                 search_policy=self._search_policy,
                 evaluation=self._forward,
                 num_simulations=self._num_simulations,
-                num_actions=self._environment_spec.actions._num_values,
+                num_actions=self._num_actions,
                 discount=self._discount,
                 dirichlet_alpha=self._dirichlet_alpha,
                 exploration_fraction=self._exploration_fraction,
@@ -165,7 +166,7 @@ class MCTSActor(acmeMCTSActor):
         if self._model.needs_reset:
             self._model.reset(observation)
 
-        root = self.mcts.search(observation, self.last_action) # TODO: pass last root to keep subtree intact
+        root = self.mcts.search(observation=observation, last_action=self.last_action) # TODO: pass last root to keep subtree intact
         
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
         if self._counter is None:

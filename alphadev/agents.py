@@ -550,7 +550,7 @@ class DistributedMCTS:
         variable_service = VariableService(config)
 
         with program.group('counter'):
-            counter: RPCClient = program.add_service(
+            self.counter: RPCClient = program.add_service(
                 RPCService(
                     conn_config=config.distributed_backend_config,
                     instance_factory=counting.Counter,

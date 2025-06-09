@@ -156,6 +156,7 @@ class InferenceFactory:
         self._output_spec = output_spec
         self._batch_size = batch_size
         self._network_factory = network_factory
+        self._variable_service = None  # to be set later
         self._variable_update_period = variable_update_period
         self._network_factory_args = network_factory_args
         self._network_factory_kwargs = network_factory_kwargs

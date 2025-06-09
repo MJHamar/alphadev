@@ -19,8 +19,8 @@ num_simulations: 1000
 discount: 1.0
 search_retain_subtree: True
 search_batch_size: 16
-async_search_num_pools: 1
-async_search_processes_pr_pool: 3
+use_apv_mcts: True
+async_search_processes_per_pool: 3
 
 # UCB formula
 pb_c_base: 19652
@@ -41,7 +41,7 @@ representation_attention_position_encoding: absolute
 representation_attention_num_layers: 6
 value_max: 30.0
 value_num_bins: 301
-categorical_value_loss: True
+categorical_value_loss: False
 
 # Training
 training_steps: 1000
@@ -54,7 +54,7 @@ momentum: 0.9
 episode_accumulation_period: 2
 
 # Distributed training
-distributed: False
+distributed: True
 prefetch_size: 4
 variable_update_period: 50
 target_update_period: 10

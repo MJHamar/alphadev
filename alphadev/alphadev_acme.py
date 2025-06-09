@@ -20,6 +20,7 @@ from .search import PUCTSearchPolicy
 from .network import AlphaDevNetwork, NetworkFactory, make_input_spec
 from .environment import AssemblyGame, AssemblyGameModel, EnvironmentFactory, ModelFactory
 from .service.variable_service import VariableService
+from .device_config import DeviceAllocationConfig
 from .service.inference_service import InferenceFactory
 
 import logging
@@ -60,7 +61,7 @@ def make_agent(config: AlphaDevConfig):
         # -- distributed MCTS agent
         return DistributedMCTS(
             # device configuration for the different processes.
-            device_config=config.device_config,
+            device_config=DeviceAllocationConfig(config),
             # basic params
             environment_factory=env_factory,
             network_factory=net_factory,
@@ -92,7 +93,7 @@ def make_agent(config: AlphaDevConfig):
             # APV MCTS parameters
             inference_factory=inference_factory,
             apv_processes_per_pool=config.async_search_processes_per_pool,
-            virtual_loss_const=config.search_virtual_loss_const,
+            virtual_loss_const=config.async_seach_virtual_loss,
             # Other parameters
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger_factory=config.logger_factory,
