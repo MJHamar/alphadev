@@ -377,6 +377,7 @@ class DistributedMCTS:
         
         if self._use_apv_mcts:
             network = variable_client = None
+            self._inference_factory.set_variable_service(variable_service)
         else:
             network = self._network_factory(make_input_spec(self._env_spec.observations))
             variable_client = tf2_variable_utils.VariableClient(
@@ -472,6 +473,7 @@ class DistributedMCTS:
         
         if self._use_apv_mcts:
             network = variable_client = None
+            self._inference_factory.set_variable_service(variable_service)
         else:
             network = self._network_factory(make_input_spec(self._env_spec.observations))
             variable_client = tf2_variable_utils.VariableClient(

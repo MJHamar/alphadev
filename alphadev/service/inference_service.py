@@ -161,6 +161,14 @@ class InferenceFactory:
         self._network_factory_kwargs = network_factory_kwargs
         self._name = name
     
+    def set_variable_service(self, variable_service: VariableService):
+        """
+        Set the variable service for the inference factory.
+        This is used to update the variables in the inference service.
+        """
+        self._variable_service = variable_service
+        return self
+    
     def __call__(
         self, variable_service: Optional[VariableService] = None, name:str = None) -> AlphaDevInferenceService:
         """
@@ -172,7 +180,7 @@ class InferenceFactory:
             output_spec=self._output_spec,
             batch_size=self._batch_size,
             network_factory=self._network_factory,
-            variable_service=variable_service,
+            variable_service=variable_service or self._variable_service,
             variable_update_period=self._variable_update_period,
             factory_args=self._network_factory_args,
             factory_kwargs=self._network_factory_kwargs,
