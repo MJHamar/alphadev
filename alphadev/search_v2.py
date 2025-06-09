@@ -225,11 +225,20 @@ class NodeBase(BlockLayout):
     def __repr__(self):
         return f'{self.__class__.__name__}(offset={self.offset}, action_id={self.action_id})'
 
-class SharedTreeHeader(BlockLayout):
-    _required_attributes = ['index']
+class SharedTreeHeaderBase(BlockLayout):
+    _required_attributes = ['index', 'root_offset', 'available']
     _elements = {
         'index': AtomicCounterElement(),  # index of the next block to be used
+        'root_offset': ArrayElement(np.int32, ()),  # offset of the root node in the shared memory
     }
+    def define(cls, length: int):
+        class SharedTreeHeader(cls):
+            _elements = cls._elements.copy()
+            # enumeration of blocks that are available for writing
+            # at tree initialization.
+            # `index` is used to index this array.
+            _elements['available'] = ArrayElement(np.bool_, (length,))
+        return SharedTreeHeader
 
 class TreeFull(Exception): pass
 
@@ -241,14 +250,23 @@ class SharedTree(BaseMemoryManager):
     1. header block stores the index of the next block to be used.
     2. data block stores the nodes of the tree
     """
-    def __init__(self, num_blocks, node_width, vl_constant, name: str = 'SharedTree'):
-        self.num_blocks = num_blocks + 1 # 1 for the root.
+    def __init__(self, num_nodes:int, node_width:int, vl_constant:float, name: str = 'SharedTree'):
+        """
+        Initialize the shared tree with the given number of nodes and node width.
+        
+        :param num_nodes: number of nodes in the tree, including the root.
+        :param node_width: maximum number of children per node, i.e. number of actions in the environment.
+        :param vl_constant: constant virtual loss to apply during rollouts.
+        """
+        self.num_nodes = num_nodes
+        self.num_blocks = self.num_nodes * 2 # double the size so we can also retain the tree from earlier searches.
+        self._header_cls = SharedTreeHeaderBase.define(length=self.num_blocks)
         self._node_cls = NodeBase.define(
             width=node_width,  # number of actions in the environment
             vl_constant=vl_constant  # constant virtual loss to apply during rollouts
         )
         # declare shared memory regions
-        self._header_size = SharedTreeHeader.get_block_size(length=num_blocks)
+        self._header_size = self._header_cls.get_block_size()
         self._header_name = f'{name}_header'
 
         self._node_size = self._node_cls.get_block_size()
@@ -267,23 +285,71 @@ class SharedTree(BaseMemoryManager):
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
 
-        self.header = SharedTreeHeader(self._header_shm, 0)
+        self.header = self._header_cls(self._header_shm, 0)
         with self.header.index() as index_counter:
             self._local_write_head = index_counter.load() # get the current write head
 
         self.reset()  # clear the header and input/output blocks
 
-    def reset(self):
+    def reset(self, last_action: Union[int, None] = None):
         assert self._is_main, "reset() should only be called in the main process."
         logger.debug('SharedTree.reset called.')
-        SharedTreeHeader.clear_block(self._header_shm, 0, length=self.num_blocks)
-        with self.header.index() as idx:
-            idx.store(1) # do not write to the root.
-        for i in range(self.num_blocks):
-            self._node_cls.clear_block(self._data_shm, self.i2off(i))
-        # initialize the root node
-        root: NodeBase = self.get_root()
+        if last_action is not None:
+            prev_root = self.get_root()
+            new_root_offset = prev_root.children[last_action]
+            assert new_root_offset != 0, \
+                "SharedTree.reset: last_action %s is not a valid action for the current root %s." % (last_action, repr(prev_root))
+            new_root = self.get_by_offset(new_root_offset)
+            logger.debug('SharedTree.reset: last_action %s, prev_root %s.', last_action, repr(prev_root))
+        else:
+            new_root = None
+        # reset the header's counter and available array.
+        self._header_cls.clear_block(self._header_shm, 0)
+        
+        # helper array to see which indices are available
+        available_mask = np.ones(self.num_blocks, dtype=np.bool_)
+
+        if new_root is not None:
+            logger.debug('SharedTree.reset: copying last root %s to new root %s.', repr(new_root), repr(root))
+            # configure the new root node's offset
+            self.header.root_offset[...] = new_root.offset
+            root = self.get_root()
+            assert root.offset == new_root.offset, \
+                f"Expected root offset {new_root.offset}, got {root.offset}."
+            
+            # set the available indices to Falsse for the subtree of the last root.
+            frontier = [root]
+            while frontier:
+                # BFS to traverse the tree
+                node = frontier.pop(0)
+                # the index corresponding to this node is not available
+                available_mask[self.off2i(node.offset)] = False
+                for child_offset in node.children:
+                    if child_offset != 0: # i.e. is initialized
+                        child = self.get_by_offset(child_offset)
+                        frontier.append(child)
+        else:
+            root: NodeBase = self.get_root() # node at offset 0
+            available_mask[self.off2i(root.offset)] = False  # root is never available for writing.
+        # set the root node's header
         root.set_root()
+        
+        # clear all nodes that are available for writing.
+        for i in range(self.num_blocks):
+            if available_mask[i]:
+                self._node_cls.clear_block(self._data_shm, self.i2off(i))
+        
+        # set the available array in the header
+        available_indices = np.arange(self.num_blocks)[available_mask]
+        assert available_indices.shape[0] >= self.num_nodes, \
+            f"Expected at least {self.num_nodes} available indices, got {available_indices.shape[0]}."
+        self.header.available[:available_indices.shape[0]] = available_indices
+        # this array can now be used to allocate new nodes.
+        # sanity check
+        assert self.header.available[self.header.index.peek()], \
+            "SharedTree.reset: available array is not initialized correctly."
+        assert last_action is None or root.offset == 0, \
+            "SharedTree.reset: last_action %s was provided but root is at offset %s. (should not be 0)" % (last_action, root.offset)
 
     def attach(self):
         logger.debug('SharedTree.attach')
@@ -291,7 +357,7 @@ class SharedTree(BaseMemoryManager):
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)
 
-        self.header = SharedTreeHeader(self._header_shm, 0)
+        self.header = self._header_cls(self._header_shm, 0)
     
     def init_index(self):
         self._local_write_head = self._update_index() # obtain a write location
@@ -309,13 +375,13 @@ class SharedTree(BaseMemoryManager):
     def _update_index(self):
         with self.header.index() as index_counter:
             index = index_counter.fetch_inc()
-            logger.debug('SharedTree._update_index (nb %d) prev: %d crnt: %d, next: %d', self.num_blocks, self._local_write_head, index, index_counter.load())
-        if index >= self.num_blocks:
+            logger.debug('SharedTree._update_index (nb %d) prev: %d crnt: %d', self.num_blocks, self._local_write_head, self.header.available[index])
+        if index >= self.num_nodes:
             self._local_write_head = None # we are done
             return None
         else:
-            self._local_write_head = index
-            return index
+            self._local_write_head = self.header.available[index]
+            return self._local_write_head
 
     def fail(self):
         """We didn't manage to write, try again next time to the same block."""
@@ -372,6 +438,11 @@ class SharedTree(BaseMemoryManager):
     def i2off(self, index: int) -> int:
         logger.debug('SharedTree.i2off called with index %d node size %d.', index, self._node_size)
         return index * self._node_size
+    def off2i(self, offset: int) -> int:
+        logger.debug('SharedTree.off2i called with offset %d node size %d.', offset, self._node_size)
+        if offset % self._node_size != 0:
+            raise ValueError(f"Offset {offset} is not a multiple of node size {self._node_size}.")
+        return offset // self._node_size
 
     def get_node(self, index) -> NodeBase:
         """Return the root node, at offset 0."""
@@ -380,7 +451,7 @@ class SharedTree(BaseMemoryManager):
         return self._node_cls(self._data_shm, self.i2off(index))
 
     def get_root(self):
-        return self._node_cls(self._data_shm, 0)
+        return self._node_cls(self._data_shm, self.header.root_offset.item())
 
     def get_by_offset(self, offset: int) -> NodeBase:
         return self._node_cls(self._data_shm, offset)
@@ -390,7 +461,7 @@ class SharedTree(BaseMemoryManager):
         Check if the tree is full.
         The tree is full if the index is equal to the number of blocks.
         """
-        return self.header.index.peek() >= self.num_blocks
+        return self.header.index.peek() >= self.num_nodes
 
 class TaskAllocatorHeaderBase(BlockLayout):
     _required_attributes = ['process_task']
@@ -497,9 +568,9 @@ class APV_MCTS(object):
             num_simulations,
             num_actions,
             num_actors,
-            discount,
-            dirichlet_alpha,
-            exploration_fraction,
+            discount = 1.0,
+            dirichlet_alpha = 1.0,
+            exploration_fraction = 0.0,
             const_vl: float = 1.0,
             batch_size: int = 1,
             inference_buffer_size: int = None,
@@ -581,7 +652,7 @@ class APV_MCTS(object):
 
         logger.debug("APV_MCTS[main]: Finished initialization.")
 
-    def search(self, observation):
+    def search(self, observation, last_root: NodeBase = None) -> NodeBase:
         """
         Perform APV-MCTS search on the given observation.
         This method initializes the search tree with root corresponding to the given observation,
@@ -590,25 +661,34 @@ class APV_MCTS(object):
         """
         # TODO: support only partially resetting the tree.
         logger.debug('APV_MCTS[main process] Starting search simulation phase.')
-        self.tree.reset()
+        self.tree.reset(last_root=last_root)
+        if last_root is None:
+            self.inference_buffer.submit(node_offset=0, observation=observation)
 
-        self.inference_buffer.submit(node_offset=0, observation=observation)
+            logger.debug('APV_MCTS[main process] Waiting for inference service to return prior and value estimate.')
+            with self.inference_buffer.poll_ready() as inference_result:
+                _, prior, _ = inference_result
+            logger.debug('APV_MCTS[main process] Received prior and value estimate from inference service.')
+            # Add exploration noise to the prior.
+            noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
+            prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
+            
+            legal_actions = self.model.legal_actions()
 
-        logger.debug('APV_MCTS[main process] Waiting for inference service to return prior and value estimate.')
-        with self.inference_buffer.poll_ready() as inference_result:
-            _, prior, _ = inference_result
-        logger.debug('APV_MCTS[main process] Received prior and value estimate from inference service.')
-        # Add exploration noise to the prior.
-        noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
-        prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
+            root: NodeBase = self.tree.get_root()
+            root.set_legal_actions(legal_actions)
 
-        legal_actions = self.model.legal_actions()
-
-        root: NodeBase = self.tree.get_root()
-        root.set_legal_actions(legal_actions)
-
-        root.expand(prior)
-        logger.debug('APV_MCTS[main process] Root node initialized with prior and legal actions. Starting pool')
+            root.expand(prior)
+            logger.debug('APV_MCTS[main process] Root node initialized with prior and legal actions. Starting pool')
+        else:
+            noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
+            last_root.set_prior(
+                last_root.prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
+            )
+            # legal actions are already set
+            # it is already expanded as well.
+            assert last_root.expanded, "Last root must be expanded."
+            root = last_root
 
         # all that is left is to start the pool.
         logger.debug('APV_MCTS[main process] Starting actor pool with %d actors.', self.num_actors)
