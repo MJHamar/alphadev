@@ -91,7 +91,7 @@ class AlphaDevInferenceService(IOBuffer):
                 variables={'network': network.trainable_variables},
                 update_period=self._variable_update_period,
             )
-        return network, variable_client
+        return tf.function(network), variable_client
     
     def run(self):
         """Run the inference service.
