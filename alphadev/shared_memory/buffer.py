@@ -99,29 +99,29 @@ class IOBuffer(BaseMemoryManager):
             self._input_shm.unlink()
             self._output_shm.unlink()
     
-    def _next_in(self):
+    def _next_in(self, num_blocks: Optional[int] = 1):
         with self.header.in_index() as in_index:
-            index = in_index.fetch_inc()  # increment the in_index atomically
-        index = index % self._num_blocks  # wrap around the index
-        assert not self.header.submitted[index], "Circular input buffer full."
-        return index
-    def _next_out(self):
+            index = in_index.fetch_add(num_blocks)  # increment the in_index atomically
+        indices = np.arange(index, index + num_blocks) % self._num_blocks
+        assert not self.header.submitted[indices].any(), "Circular input buffer full."
+        return indices
+    def _next_out(self, num_blocks: Optional[int] = 1):
         with self.header.out_index() as out_index:
-            index = out_index.fetch_inc()  # increment the out_index atomically
-        index = index % self._num_blocks  # wrap around the index
-        assert not self.header.ready[index], "Circular output buffer full."
-        return index
+            index = out_index.fetch_add(num_blocks)  # increment the out_index atomically
+        indices = np.arange(index, index + num_blocks) % self._num_blocks
+        assert not self.header.ready[indices], "Circular output buffer full."
+        return indices
     
     def submit(self, **payload):
-        index = self._next_in()
+        index = self._next_in()[0]
         iblock = self._input_element_cls(self._input_shm, index * self._input_size)
         iblock.write(**payload)
         self.header.submitted[index] = True
         logger.debug("IOBuffer: submit() called, set submitted at index=%d. offset %s", index, iblock.node_offset)
     
     def ready(self, payload_list: List[Dict[str, np.ndarray]]):
-        for payload in payload_list:
-            index = self._next_out()
+        indices = self._next_out(len(payload_list))
+        for index, payload in zip(indices, payload_list):
             oblock = self._output_element_cls(self._output_shm, index * self._output_size)
             oblock.write(**payload)
             self.header.ready[index] = True

@@ -56,7 +56,7 @@ class DeviceAllocationConfig:
                 network, [env_spec.observations],
                 batch_size=batch_size,
             )
-            memory_info = tf.config.experimental.get_memory_info('GPU:0')
+            memory_info = tf.config.experimental.get_memory_info(gpus[0])
             print("Peak Memory Usage:", memory_info['peak'])
             return memory_info['peak']
         else:
