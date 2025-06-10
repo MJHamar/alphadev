@@ -47,7 +47,7 @@ import numpy as np
 from .dual_value_az import DualValueAZLearner, DualValueMCTSActor
 from .network import NetworkFactory, make_input_spec
 from .acting import MCTSActor
-from .search import PUCTSearchPolicy
+from .search.base import PUCTSearchPolicy
 from .observers import MCTSObserver
 from .service.service import Program, ReverbService, RPCService, RPCClient, SubprocessService
 from .service.inference_service import InferenceFactory

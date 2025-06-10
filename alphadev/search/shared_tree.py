@@ -2,13 +2,13 @@ from typing import Union, Callable, Dict, List, Optional
 import multiprocessing.shared_memory as mp_shm
 import numpy as np
 
-from .base import BlockLayout, ArrayElement, AtomicCounterElement, BaseMemoryManager
+from ..shared_memory.base import BlockLayout, ArrayElement, AtomicCounterElement, BaseMemoryManager
 
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class NodeBase(BlockLayout):
+class SharedNodeBase(BlockLayout):
     """
     Node in the search tree, residing directly in the shared memory.
     Each node corresponds to a game state and contains edges to its successor states,
@@ -223,7 +223,7 @@ class SharedTreeHeaderBase(BlockLayout):
 
 class TreeFull(Exception): pass
 
-class SharedTree(BaseMemoryManager):
+class SharedTree(TreeBase, BaseMemoryManager):
     """
     Shared Memory which stores a tree structure.
 

@@ -25,8 +25,10 @@ class ArrayElement(object):
         if self._size is None:
             self._size = self._get_size(*args, **kwargs)
         return self._size
-    def create(self, shm, offset, *args, **kwargs):
-        return np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf, offset=offset)
+    def create(self, shm=None, offset=None, *args, **kwargs):
+        # if shm is None, numpy ignores the offset 
+        buffer = shm.buf if shm is not None else None
+        return np.ndarray(self.shape, dtype=self.dtype, buffer=buffer, offset=offset)
 
 class NestedArrayElement(ArrayElement):
     dtype: np.dtype
@@ -44,8 +46,9 @@ class NestedArrayElement(ArrayElement):
         else:
             raise ValueError("self.model must be a dict or a NamedTuple.")
     
-    def create(self, shm, offset, *args, **kwargs):
+    def create(self, shm=None, offset=None, *args, **kwargs):
         elements = {}
+        buffer = shm.buf if shm is not None else None
         crnt_offset = offset
         if isinstance(self.model, dict):
             for name, element in self.model.items():
@@ -63,6 +66,7 @@ class NestedArrayElement(ArrayElement):
         elif isinstance(self.model, NamedTuple):
             return self.model._make(**elements)
 
+# Actomics should only be used in a multiprocessing context.
 class AtomicContext:
     """
     Wrapper for atomics.atomicview with a peek() method that avoids having to initialize 
@@ -103,7 +107,6 @@ class AtomicCounterElement(NamedTuple):
         return AtomicContext(
             shm.buf, offset, dtype=np.uint64)  # create an atomic context for the shared memory buffer
 
-
 class BlockLayout:
     _required_attributes = []  
     _elements: Dict[str, ArrayElement] = {}
@@ -113,7 +116,7 @@ class BlockLayout:
         """Define the shared memory blocks. Should be called in the parent process."""
         raise NotImplementedError("define() should be implemented in the subclass.")
     
-    def __init__(self, shm, offset, *args, **kwargs):
+    def __init__(self, shm=None, offset=None, *args, **kwargs):
         self.shm = shm
         self.offset = offset
         self._create_elements(*args, **kwargs)
@@ -121,10 +124,25 @@ class BlockLayout:
             hasattr(self, name) for name in self.__class__._required_attributes
         ), f"BlockLayout {self.__class__.__name__} is missing required elements: {self.__class__._required_attributes}"
     
+    class jit_element:
+        """
+        Construct the element just in time and cache it.
+        Function, so it needs to be called.
+        """
+        def __init__(self, name, element_spec, shm=None, offset=None, *args, **kwargs):
+            self.name = name; self.element_spec = element_spec
+            self.shm = shm; self.offset = offset
+            self.args = args; self.kwargs = kwargs
+            self._data = None
+        def __call__(self):
+            if self._data is None:
+                self._data = self.element_spec.create(self.shm, self.offset, *self.args, **self.kwargs)
+            return self._data
+    
     def _create_elements(self, *args, **kwargs):
-        crnt_offset = self.offset
+        crnt_offset = self.offset or 0
         for name, element_spec in self.__class__._elements.items():
-            setattr(self, name, element_spec.create(self.shm, crnt_offset, *args, **kwargs))
+            self.jit_element(name, element_spec, self.shm, crnt_offset, *args, **kwargs)
             crnt_offset += element_spec.size(*args, **kwargs)
     
     def write(self, **kwargs):
@@ -136,7 +154,7 @@ class BlockLayout:
             element[...] = value
         for name, value in kwargs.items():
             if hasattr(self, name):
-                element = getattr(self, name)
+                element = getattr(self, name)()
                 if isinstance(element, np.ndarray):
                     element[...] = value
                 elif isinstance(element, (dict, namedtuple)):
@@ -149,12 +167,12 @@ class BlockLayout:
     def read(self):
         """Create a localized namedtuple with the contents of the block."""
         return namedtuple(self.__class__.__name__, self.__class__._elements.keys())(
-            **{name: getattr(self, name).copy()
+            **{name: getattr(self, name)().copy()
                for name in self.__class__._elements.keys()}  # skip atomic counters for localization
         )
     
     @classmethod
-    def clear_block(cls, shm, offset, *args, **kwargs):
+    def clear_block(cls, shm=None, offset=None, *args, **kwargs):
         """
         Initialize a block of shared memory at the given offset.
         """

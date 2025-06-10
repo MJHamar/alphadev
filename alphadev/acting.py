@@ -38,7 +38,7 @@ import tensorflow as tf
 import tree
 
 from .observers import MCTSObserver
-from .search import visit_count_policy, mcts, Node
+from .search.base import visit_count_policy, mcts, Node
 from .search_v2 import APV_MCTS
 from .network import NetworkFactory, make_input_spec
 from .service.variable_service import VariableService

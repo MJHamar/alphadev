@@ -46,6 +46,25 @@ class InferenceResultBase(BlockLayout):
             })
         return InferenceResult
 
+class AlphaDevInferenceClient(IOBuffer):
+    """
+    Client for the inference service.
+    Contains information on how to connect to the inference_service's shared memory.
+    Provides methods to submit inference tasks and read results.
+    """
+    def __init__(self,
+        num_blocks: int,
+        input_cls: InferenceTaskBase,
+        output_cls: InferenceResultBase,
+        name: int,
+    ):
+        super().__init__(
+            num_blocks=num_blocks,
+            input_element=input_cls,
+            output_element=output_cls,
+            name=name
+        )
+
 class AlphaDevInferenceService(IOBuffer):
     def __init__(self, 
             num_blocks:int,
@@ -135,6 +154,18 @@ class AlphaDevInferenceService(IOBuffer):
             ) for off, p, v in zip(node_offsets, prior, value)])
             ready_end = tf.timestamp()
             logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
+
+    def get_client(self) -> 'AlphaDevInferenceClient':
+        """
+        Create a client for the inference service.
+        The client can be used to submit inference tasks and read results.
+        """
+        return AlphaDevInferenceClient(
+            num_blocks=self.num_blocks,
+            input_cls=self.input_element,
+            output_cls=self.output_element,
+            name=self.name
+        )
 
 class InferenceFactory:
     """

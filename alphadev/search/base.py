@@ -140,25 +140,35 @@ class NodeContainer():
         raise NotImplementedError(
             "NodeContainer is not iterable. Use `nodes()` to be explicit about iterating over the nodes.")
 
-@dataclasses.dataclass
-class DvNode(Node):
-    _reward: np.ndarray = dataclasses.field(default_factory=lambda: np.zeros(3, dtype=np.float32))
-    """Just like a Node, but rewards are 3D vectors."""
-    def _make_children(self, num_kids):
-        return DvNodeContainer(num_kids)
+class MCTSBase:
+    """Base class for MCTS algorithms."""
+    def __init__(self,
+        model: models.Model,
+        search_policy: SearchPolicy,
+        evaluation: types.EvaluationFn,
+        num_simulations: int,
+        num_actions: int,
+        discount: float = 1.,
+        dirichlet_alpha: float = 1,
+        exploration_fraction: float = 0.,
+    ):
+        self.model = model
+        self.search_policy = search_policy
+        self.evaluation = evaluation
+        self.num_simulations = num_simulations
+        self.num_actions = num_actions
+        self.discount = discount
+        self.dirichlet_alpha = dirichlet_alpha
+        self.exploration_fraction = exploration_fraction
     
-    @property
-    def reward(self) -> np.ndarray:
-        """Return the reward of this node."""
-        return self._reward[0]
-    @reward.setter
-    def reward(self, value: float):
-        self._reward = value
-
-# NOTE: unfortunately, python doesn't support generics in any meaningful way.
-class DvNodeContainer(NodeContainer):
-    default_node = DvNode()
-
+    def __call__(self, observation: types.Observation) -> Node:
+        raise NotImplementedError(
+            "MCTSBase is an abstract class and cannot be called directly. "
+            "Please use a subclass that implements the __call__ method."
+        )
+    
+    def init_tree(self, observation: types.Observation) -> Node:
+        
 
 def mcts(
     observation: types.Observation,

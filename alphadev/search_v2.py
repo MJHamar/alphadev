@@ -15,7 +15,7 @@ from .environment import AssemblyGame, AssemblyGameModel
 from .service.inference_service import AlphaDevInferenceService, run_inference, InferenceFactory
 from .service.variable_service import VariableService
 from .shared_memory.base import BlockLayout, ArrayElement, BaseMemoryManager
-from .shared_memory.tree import SharedTree, NodeBase, TreeFull, SharedTreeFactory
+from .search.shared_tree import SharedTree, NodeBase, TreeFull, SharedTreeFactory
 
 import logging
 logger = logging.getLogger(__name__)

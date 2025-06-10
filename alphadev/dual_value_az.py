@@ -7,7 +7,7 @@ from scipy import special
 
 from .distribution import DistributionSupport
 from .acting import MCTSActor
-from .search import mcts, DvNode, visit_count_policy
+from .search.base import mcts, DvNode, visit_count_policy
 from .learning import AZLearner
 from .service.service import RPCClient
 from .service.variable_service import VariableService
