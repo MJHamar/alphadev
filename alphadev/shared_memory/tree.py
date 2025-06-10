@@ -6,7 +6,7 @@ from .base import BlockLayout, ArrayElement, AtomicCounterElement, BaseMemoryMan
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 class NodeBase(BlockLayout):
     """
@@ -82,8 +82,8 @@ class NodeBase(BlockLayout):
         self.W[action_id] += self.const_vl
         self.N[action_id] += 1
         child_offset = self.children[action_id]
-        if child_offset == 0:
-            logger.debug('%s.select: child offset is 0, returning None.', repr(self))
+        if child_offset == -1:
+            logger.debug('%s.select: child offset is -1, returning None.', repr(self))
             return None
         return self.__class__(self.shm, child_offset)
 
@@ -313,7 +313,7 @@ class SharedTree(BaseMemoryManager):
                 num_retained += 1
                 logger.debug('SharedTree.reset: node %s at offset %s is not available for writing.', repr(node), node.offset)
                 for child_offset in node.children:
-                    if child_offset != 0: # i.e. is initialized
+                    if child_offset != -1: # i.e. is initialized
                         logger.debug('SharedTree.reset: child offset %s is valid, adding to frontier.', child_offset)
                         child = self.get_by_offset(child_offset)
                         frontier.append(child)
@@ -321,21 +321,24 @@ class SharedTree(BaseMemoryManager):
             # make sure to clean child pointers for children no longer in the subtree
             for node in frontier:
                 parent = node.parent
-                logger.debug('SharedTree.reset: clearing children of node %s at offset %s.', repr(parent), node.offset)
-                parent.set_child(node.action_id, 0)  # clear the child pointer
-            
+                parent.set_child(node.action_id, -1)  # clear the child pointer
+            logger.debug('SharedTree.reset: cleared %d child pointers in the subtree.', len(frontier))
         else:
             logger.debug('SharedTree.reset: no last action provided, setting root to a new node at offset 0.')
-            root: NodeBase = self.get_root() # node at offset 0
-            available_mask[self.off2i(root.offset)] = False  # root is never available for writing.
-        # set the root node's header
-        root.set_root()
         logger.debug('SharedTree.reset: available_mask after retaining subtree: %s', [(i,a) for i, a in enumerate(available_mask)])
         # clear all nodes that are available for writing.
         for i in range(self.num_blocks):
             if available_mask[i]:
-                logger.debug('SharedTree.reset: clearing block at index %d (offset %d).', i, self.i2off(i))
-                self._node_cls.clear_block(self._data_shm, self.i2off(i))
+                offset = self.i2off(i)
+                logger.debug('SharedTree.reset: clearing block at index %d (offset %d).', i, offset)
+                self._node_cls.clear_block(self._data_shm, offset)
+                self._node_cls(self._data_shm, offset).children[...] = -1  # mark all children as uninitialized
+        
+        if new_root is None:
+            root: NodeBase = self.get_root() # node at offset 0
+            available_mask[self.off2i(root.offset)] = False  # root is never available for writing.
+        # set the root node's header
+        root.set_root()
         # set the available array in the header
         available_indices = np.arange(self.num_blocks)[available_mask]
         logger.debug('SharedTree.reset: available indices: %s', available_indices)
@@ -404,8 +407,10 @@ class SharedTree(BaseMemoryManager):
         """
         logger.debug('SharedTree.append_child called with parent_offset %s and action %s.', parent, action)
         if self.is_full():
+            logger.debug('SharedTree.append_child: tree is full, cannot append child.')
             raise TreeFull() # signal the caller that no more blocks are available.
-        if parent.children[action] != 0:
+        if parent.children[action] != -1:
+            logger.debug('SharedTree.append_child: parent %s already has a child at action %d, skipping.', repr(parent), action)
             # another process already appended this action.
             self.fail()
             return None
