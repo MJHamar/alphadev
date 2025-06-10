@@ -102,23 +102,21 @@ class AlphaDevInferenceService(IOBuffer):
         if not hasattr(self, '_network'):
             self._network, self._variable_client = self._create_network()
             print(f"AlphaDevInferenceService: created network {self._network}")
+        
         def stack_requests(*requests):
             return tf.stack(requests, axis=0)
-        num_timeouts = 0
+        
         while True:
             poll_start = tf.timestamp()
-            with self.poll_submitted(self.batch_size, localize=False) as tasks:
-                if len(tasks) == 0:
-                    num_timeouts += 1
-                    if num_timeouts > 100000:
-                        # print(f"AlphaDevInferenceService: No tasks submitted for the last {num_timeouts} iterations, going to sleep for a bit.")
-                        num_timeouts = 0
-                        sleep(0.001) # TODO: adjust this to a config parameter.
-                    continue
+            with self.read_submited(self.batch_size, localize=False) as tasks:
+                if len(tasks) == 0: continue
                 logger.debug(f"AlphaDevInferenceService: processing {len(tasks)} tasks")
                 task_process_start = tf.timestamp()
-                node_offset = [t.node_offset for t in tasks] # list of node offsets to update
-                inputs = [t.observation for t in tasks] # list of observations to evaluate
+                node_offsets = []
+                inputs = []
+                for task in tasks:
+                    node_offsets.append(task.node_offset)
+                    inputs.append(task.observation)
                 inputs = tree.map_structure(stack_requests, *inputs)
                 # release the context as soon as the tensors are created.
             # update the variables
@@ -129,12 +127,12 @@ class AlphaDevInferenceService(IOBuffer):
             ready_start = tf.timestamp()
             logger.debug(f"AlphaDevInferenceService: prior type={type(prior)} values{values}")
             value = values[0] # ugly hack but there are versions of the network where >2 values are returned.
-            logger.debug(f"obtained shapes from network: offsets={node_offset}, prior={prior.shape}, value={value.shape}")
+            logger.debug(f"obtained shapes from network: offsets={node_offsets}, prior={prior.shape}, value={value.shape}")
             self.ready([dict(
                 node_offset=off,
                 prior=p,
                 value=v
-            ) for off, p, v in zip(node_offset, prior, value)])
+            ) for off, p, v in zip(node_offsets, prior, value)])
             ready_end = tf.timestamp()
             logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
 
