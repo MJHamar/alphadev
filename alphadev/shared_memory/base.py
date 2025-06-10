@@ -68,14 +68,13 @@ class AtomicContext:
     Wrapper for atomics.atomicview with a peek() method that avoids having to initialize 
     the atomic view context for read-only operations.
     """
-    def __init__(self, buffer, offset, dtype=np.int32):
+    def __init__(self, buffer, offset, dtype=np.uint64):
         self._buffer = buffer
         self._offset = offset
         self._dtype = dtype
         self._size = np.dtype(self._dtype).itemsize
-        assert np.dtype(self._dtype) == np.dtype(np.int32), "AtomicContext only supports int32 dtype."
-        self._atype = atomics.INT
-    
+        assert np.dtype(self._dtype) == np.dtype(np.uint64), "AtomicContext only supports uint64 dtype."
+        self._atype = atomics.UINT
     def __call__(self):
         """return an atomicview context manager"""
         return atomics.atomicview(
@@ -99,10 +98,10 @@ class AtomicContext:
 
 class AtomicCounterElement(NamedTuple):
     def size(self, *args, **kwargs):
-        return np.dtype(np.int32).itemsize
+        return np.dtype(np.uint64).itemsize
     def create(self, shm, offset, *args, **kwargs):
         return AtomicContext(
-            shm.buf, offset, dtype=np.int32)  # create an atomic context for the shared memory buffer
+            shm.buf, offset, dtype=np.uint64)  # create an atomic context for the shared memory buffer
 
 
 class BlockLayout:

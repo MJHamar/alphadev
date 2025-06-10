@@ -13,14 +13,16 @@ num_latency_simulations: 1
 emulator_mode: 'i32'
 
 # Self-Play
-num_actors: 3
+num_actors: 2
 max_moves: 100
 num_simulations: 1000
 discount: 1.0
 search_retain_subtree: True
-search_batch_size: 3
-use_apv_mcts: True
-async_search_processes_per_pool: 3
+use_async_search: True
+search_batch_size: 1
+async_search_processes_per_pool: 2
+async_seach_virtual_loss: -1.0
+async_search_buffer_size: 'auto' # same as number of actors
 
 # UCB formula
 pb_c_base: 19652

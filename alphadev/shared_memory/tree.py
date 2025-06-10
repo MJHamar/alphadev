@@ -6,7 +6,7 @@ from .base import BlockLayout, ArrayElement, AtomicCounterElement, BaseMemoryMan
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class NodeBase(BlockLayout):
     """
