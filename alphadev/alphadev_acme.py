@@ -47,7 +47,7 @@ def make_agent(config: AlphaDevConfig):
     
     if config.use_async_search:
         inference_factory = InferenceFactory(
-            num_blocks=config.num_simulations,
+            num_blocks=config.async_search_buffer_size,
             input_spec=env_spec.observations,
             output_spec=config.task_spec.num_actions, # TODO: obtain output spec from the network.
             batch_size=config.search_batch_size,

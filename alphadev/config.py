@@ -66,9 +66,6 @@ class AlphaDevConfig(object):
     value_max: float = 3.0  # These two parameters are task / reward-
     value_num_bins: int = 301  # dependent and need to be adjusted.
     categorical_value_loss: bool = True # wheether to treat the value functions as a distribution
-    use_apv_mcts: bool = False # whether to use APV MCTS or single-threaded MCTS
-    apv_processes_per_pool: Union[int, str] = 'auto' # number of processes per pool, 'auto' will distribute all available cores evenly
-    
 
     ### Training
     training_steps: int = 1000 #int(1000e3)
@@ -103,6 +100,7 @@ class AlphaDevConfig(object):
     async_search_processes_per_pool: Union[int, str] = 'auto' # number of processes per pool, 'auto' will distribute all available cores evently
     search_batch_size: int = 1
     async_seach_virtual_loss: float = -1.0 
+    async_search_buffer_size: int = 'auto'
     # device config
     device_config_path: Optional[str] = 'device_config.yaml'
     
@@ -185,10 +183,12 @@ class AlphaDevConfig(object):
         if self.use_async_search:
             if isinstance(self.async_search_processes_per_pool, str) and self.async_search_processes_per_pool == 'auto':
                 self.async_search_processes_per_pool = os.cpu_count() // self.async_search_num_pools
-            elif isinstance(self.async_search_processes_per_pool, int):
-                pass
-            else:
+            elif not isinstance(self.async_search_processes_per_pool, int):
                 raise ValueError("async_search_processes_per_pool must be 'auto' or an integer.")
+            if isinstance(self.async_search_buffer_size, str) and self.async_search_buffer_size == 'auto':
+                self.async_search_buffer_size = self.async_search_processes_per_pool
+            elif not (self.async_search_processes_per_pool, int):
+                raise ValueError("async_search_buffer_size must be 'auto' or an integer.")
         
         if self.replay_server_port is None:
             self.replay_server_port = portpicker.pick_unused_port()
