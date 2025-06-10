@@ -15,7 +15,7 @@ from ..device_config import apply_device_config
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class InferenceTaskBase(BlockLayout):
@@ -122,7 +122,10 @@ class AlphaDevInferenceService(IOBuffer):
             # update the variables
             if self._variable_client is not None:
                 self._variable_client.update(wait=False)
+            start = tf.timestamp()
             prior, *values = self._network(inputs)
+            end = tf.timestamp()
+            logger.debug(f"AlphaDevInferenceService: network inference took {end - start} seconds")
             logger.debug(f"AlphaDevInferenceService: prior type={type(prior)} values{values}")
             value = values[0] # ugly hack but there are versions of the network where >2 values are returned.
             logger.debug(f"obtained shapes from network: offsets={node_offset}, prior={prior.shape}, value={value.shape}")

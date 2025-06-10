@@ -18,7 +18,7 @@ max_moves: 100
 num_simulations: 1000
 discount: 1.0
 search_retain_subtree: True
-search_batch_size: 1
+search_batch_size: 16
 use_apv_mcts: True
 async_search_processes_per_pool: 3
 

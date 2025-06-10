@@ -23,7 +23,7 @@ logging.basicConfig(
     format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
 )
 
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # Shared memory has a fixed size. for each MCTS, we do not need to re-allocate it
 # but we do need to re-initialize it.

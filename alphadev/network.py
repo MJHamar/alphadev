@@ -19,13 +19,13 @@ from .distribution import DistributionSupport
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 import numpy as np
 
 def positional_encoding(length, depth):
     """Adapted from https://www.tensorflow.org/text/tutorials/transformer"""
-    logger.debug("[re]computing positional encoding for length %d and depth %d", length, depth)
+    logger.warning("[re]computing positional encoding for length %d and depth %d", length, depth)
     depth = depth/2
 
     positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
@@ -713,7 +713,7 @@ class AlphaDevNetwork(snn.Module):
     
     def inference(self, inputs: CPUState) -> Tuple[tf.Tensor, tf.Tensor]:
         """Computes and returns the policy and value logits for the AZLearner."""
-        logger.debug("AlphaDevNetwork [retracing]: inputs %s", str({k:v.shape for k,v in inputs.items()}))
+        logger.warning("AlphaDevNetwork [retracing]: inputs %s", str({k:v.shape for k,v in inputs.items()}))
         # inputs is the observation dict
         embedding: tf.Tensor = self._representation_net(inputs)
         # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
