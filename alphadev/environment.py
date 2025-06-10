@@ -519,7 +519,7 @@ class AssemblyGame(Environment):
             # too many components in acme hard-code the structure of TimeStep, and not
             # everything supports reward to be a dictionary, so we concatenate
             # the reward components into a single tensor
-            reward=reward if not self._observe_reward_components else 
+            reward=np.array(reward, dtype=np.float32) if not self._observe_reward_components else 
                 np.asarray([reward, correctness, latency], dtype=np.float32),
             discount=np.asarray(1.0, dtype=np.float32), # NOTE: not sure what discount here means.
             observation=observation,

@@ -15,7 +15,7 @@ from ..device_config import apply_device_config
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class InferenceTaskBase(BlockLayout):
@@ -51,7 +51,7 @@ class AlphaDevInferenceService(IOBuffer):
             num_blocks:int,
             network_factory: Callable[[], snn.Module],
             input_spec:dict,
-            num_actions:int,
+            output_spec:int, # TODO: num actions for now. in the future, we want this to be a description of the network output.
             batch_size:int = 1,
             variable_service: Optional[VariableService] = None,
             variable_update_period:int = 100,
@@ -62,7 +62,7 @@ class AlphaDevInferenceService(IOBuffer):
         # define the input and output elements
         self._input_spec = input_spec
         self.input_element = InferenceTaskBase.define(input_spec)
-        self.output_element = InferenceResultBase.define(num_actions)
+        self.output_element = InferenceResultBase.define(output_spec)
         super().__init__(
             num_blocks=num_blocks,
             input_element=self.input_element,
@@ -80,8 +80,8 @@ class AlphaDevInferenceService(IOBuffer):
     
     def _create_network(self):
         network = self._network_factory(*self._factory_args, **self._factory_kwargs)
-        logger.debug(f"AlphaDevInferenceService: created network {network}, initializing variables.")
-        tf2_utils.create_variables(network, input_spec=self._input_spec)
+        logger.debug(f"AlphaDevInferenceService: created network {network}, initializing variables. with input_spec={self._input_spec}")
+        tf2_utils.create_variables(network, input_spec=[self._input_spec])
         
         if self._variable_service is None:
             variable_client = None

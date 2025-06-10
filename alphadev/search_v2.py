@@ -23,7 +23,7 @@ logging.basicConfig(
     format='%(asctime)s - %(processName)s - %(levelname)s - %(message)s',
 )
 
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # Shared memory has a fixed size. for each MCTS, we do not need to re-allocate it
 # but we do need to re-initialize it.
@@ -311,6 +311,8 @@ def _phase_1(root: NodeBase, tree: SharedTree, model: AssemblyGameModel,
     # then run the simulation update the node with the results. This delay also enables other processes to write stuff
     timestep = model.step(actions)
     legal_actions = model.legal_actions()
+    # reset the model to the root state
+    model.load_checkpoint()
 
     logger.debug('APV_MCTS[phase 1] Simulation returned with reward %s.', timestep.reward)
     # now we can check for tree consistency (whether any other process has overwritten the node)
@@ -319,17 +321,25 @@ def _phase_1(root: NodeBase, tree: SharedTree, model: AssemblyGameModel,
         for n, a in zip(trajectory, actions):
             n.deselect(a)
         return False # we need to try again, the node was overwritten by another process
-
-    # otherwise, submit a new inference task to the inference service.
-    observation = timestep.observation
-    inference_buffer.submit(
-        node_offset=node.offset,
-        observation=observation
-    )
-    logger.debug('APV_MCTS[phase 1] Submitted inference task for node %s', repr(node))
-    # perform a backward pass with the reward and legal actions
-    reward = timestep.reward[0] # there might be other outputs but they are irrelevant for mcts
+    # check terminal state
     terminal = timestep.last()
+    # otherwise if not terminal, submit a new inference task to the inference service.
+    if not terminal:
+        observation = timestep.observation
+        inference_buffer.submit(
+            node_offset=node.offset,
+            observation=observation
+        )
+        logger.debug('APV_MCTS[phase 1] Submitted inference task for node %s', repr(node))
+    else:
+        # when the timestep is terminal, 'value' is assumed to be 0.
+        # only thing we need to do is backpropagate the reward. and increment the visit counts
+        # using the `update_child` method.
+        logger.debug('APV_MCTS[phase 1] Simulation returned terminal state, no inference task submitted.')
+
+    # perform a backward pass with the reward and legal actions
+    # there might be other reward components but they are irrelevant for mcts
+    reward = (timestep.reward if timestep.reward.ndim == 0 else timestep.reward[0])
 
     node.set_terminal(terminal)
     node.set_legal_actions(legal_actions)
@@ -338,7 +348,9 @@ def _phase_1(root: NodeBase, tree: SharedTree, model: AssemblyGameModel,
     # backpropagate the reward for each t < L and remove the virtual loss.
     for n, a in zip(trajectory, actions):
         reward *= discount
-        n.visit_child(a, reward)
+        n.visit_child(a, reward) # this clears the virtual losses
+        if node.terminal:
+            n.update_child(a, 0)  # this one increments the visit counts (instead of phase 2, which won't be called.)
     logger.debug('APV_MCTS[phase 1] Backpropagated reward %s for actions %s.', reward, actions)
     return True  # we successfully submitted the task for evaluation
 
@@ -433,7 +445,8 @@ def _run_task(args):
         if do_profiling:
             profiler = cProfile.Profile()
             profiler.enable()
-        
+        # save the current state of the model
+        model.save_checkpoint()
         while not should_stop: # iterate indefinitely
             try:
                 # query task

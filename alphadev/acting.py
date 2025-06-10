@@ -172,7 +172,7 @@ class MCTSActor(acmeMCTSActor):
         if self._counter is None:
             training_steps = 0
         else:
-            training_steps = self._counter.get_counts()[self._counter.get_steps_key()]
+            training_steps = self._counter.get_counts().get(self._counter.get_steps_key(), 0)
         temperature = self._temperature_fn(training_steps)
         # get the action mask from the model
         if self._model.needs_reset:

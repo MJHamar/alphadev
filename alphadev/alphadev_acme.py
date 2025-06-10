@@ -45,19 +45,20 @@ def make_agent(config: AlphaDevConfig):
     # -- search policy
     search_policy = PUCTSearchPolicy(config.pb_c_base, config.pb_c_init)
     
+    if config.use_async_search:
+        inference_factory = InferenceFactory(
+            num_blocks=config.num_simulations,
+            input_spec=env_spec.observations,
+            output_spec=config.task_spec.num_actions, # TODO: obtain output spec from the network.
+            batch_size=config.search_batch_size,
+            network_factory=net_factory,
+            variable_update_period=config.variable_update_period,
+            network_factory_args=(make_input_spec(env_spec.observations),),
+        )
+    else:
+        inference_factory = None
+    
     if config.distributed:
-        if config.use_async_search:
-            inference_factory = InferenceFactory(
-                num_blocks=config.num_simulations,
-                input_spec=env_spec.observations,
-                output_spec=config.task_spec.num_actions, # TODO: obtain output spec from the network.
-                batch_size=config.search_batch_size,
-                network_factory=net_factory,
-                variable_update_period=config.variable_update_period,
-                network_factory_args=(make_input_spec(env_spec.observations),),
-            )
-        else:
-            inference_factory = None
         # -- distributed MCTS agent
         return DistributedMCTS(
             # device configuration for the different processes.
@@ -118,6 +119,11 @@ def make_agent(config: AlphaDevConfig):
             dirichlet_alpha=config.root_dirichlet_alpha,
             exploration_fraction=config.root_exploration_fraction,
             search_retain_subtree=config.search_retain_subtree,
+            use_apv_mcts=config.use_async_search,
+            
+            inference_factory=inference_factory,
+            apv_processes_per_pool=config.async_search_processes_per_pool,
+            virtual_loss_const=config.async_seach_virtual_loss,
             
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger=cfg_logger,

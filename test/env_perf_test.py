@@ -101,6 +101,7 @@ def make_apv_actor(config: AlphaDevConfig) -> MCTSActor:
 def actor_env_from_config(path) -> EnvironmentLoop:
     """Load the configuration from a file."""
     config = AlphaDevConfig.from_yaml(path)
+    assert not config.distributed, "This function is meant to be used with a single-threaded configuration."
     agent = make_agent(config)
     environment = EnvironmentFactory(config)()
     env_executor = EnvironmentLoop(

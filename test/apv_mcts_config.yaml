@@ -18,7 +18,7 @@ max_moves: 100
 num_simulations: 1000
 discount: 1.0
 search_retain_subtree: True
-search_batch_size: 16
+search_batch_size: 1
 use_apv_mcts: True
 async_search_processes_per_pool: 3
 
@@ -54,7 +54,7 @@ momentum: 0.9
 episode_accumulation_period: 2
 
 # Distributed training
-distributed: True
+distributed: False
 prefetch_size: 4
 variable_update_period: 50
 target_update_period: 10

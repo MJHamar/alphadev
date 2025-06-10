@@ -76,11 +76,18 @@ class MCTS(agent.Agent):
         dirichlet_alpha: float = 1.0,
         exploration_fraction: float = 0.0,
         search_retain_subtree: bool = True,
+        use_apv_mcts: bool = False,
+        # APV MCTS parameters
+        inference_factory: Optional[NetworkFactory] = None,
+        apv_processes_per_pool: Optional[int] = None,
+        virtual_loss_const: Optional[float] = None,
         # Other parameters
         use_dual_value_network: bool = False,
         logger: loggers.Logger = None,
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
     ):
+        if use_apv_mcts:
+            print('WARNING: APV_MCTS cannot be used in single-threaded mode. Support only for testing purposes.')
 
         extra_spec = {
             'pi':
@@ -131,10 +138,14 @@ class MCTS(agent.Agent):
                 search_retain_subtree=search_retain_subtree,
                 # implementation-specific parameters
                 # NOTE: we do not support APV MCTS in single-threaded agents.
-                use_apv_mcts=False,
+                use_apv_mcts=use_apv_mcts,
                 # single-threaded mode
-                network=network_factory,
+                network=network_factory if not use_apv_mcts else None,
                 variable_client=None, # no need for variable service in single-threaded mode
+                # APV MCTS mode
+                inference_factory=inference_factory,
+                apv_processes_per_pool=apv_processes_per_pool,
+                virtual_loss_const=virtual_loss_const,
                 # other
                 adder=adder,
                 counter=self.counter,
@@ -162,10 +173,14 @@ class MCTS(agent.Agent):
                 search_retain_subtree=search_retain_subtree,
                 # implementation-specific parameters
                 # NOTE: we do not support APV MCTS in single-threaded agents.
-                use_apv_mcts=False,
+                use_apv_mcts=use_apv_mcts,
                 # single-threaded mode
-                network=network_factory,
+                network=network_factory if not use_apv_mcts else None,
                 variable_client=None, # no need for variable service in single-threaded mode
+                # APV MCTS mode
+                inference_factory=inference_factory,
+                apv_processes_per_pool=apv_processes_per_pool,
+                virtual_loss_const=virtual_loss_const,
                 # other
                 adder=adder,
                 counter=self.counter,
@@ -550,7 +565,7 @@ class DistributedMCTS:
         variable_service = VariableService(config)
 
         with program.group('counter'):
-            self.counter: RPCClient = program.add_service(
+            counter: RPCClient = program.add_service(
                 RPCService(
                     conn_config=config.distributed_backend_config,
                     instance_factory=counting.Counter,
