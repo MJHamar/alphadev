@@ -109,7 +109,7 @@ class IOBuffer(BaseMemoryManager):
         with self.header.out_index() as out_index:
             index = out_index.fetch_add(num_blocks)  # increment the out_index atomically
         indices = np.arange(index, index + num_blocks) % self._num_blocks
-        assert not self.header.ready[indices], "Circular output buffer full."
+        assert not self.header.ready[indices].any(), "Circular output buffer full."
         return indices
     
     def submit(self, **payload):
