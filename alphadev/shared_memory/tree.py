@@ -304,18 +304,26 @@ class SharedTree(BaseMemoryManager):
                 f"Expected root offset {new_root.offset}, got {root.offset}."
             
             # set the available indices to Falsse for the subtree of the last root.
-            frontier = [root]
-            while frontier:
+            frontier = [root]; num_retained = 0 # do not retain more than num_nodes nodes.
+            while frontier and num_retained < self.num_nodes:
                 # BFS to traverse the tree
                 node = frontier.pop(0)
                 # the index corresponding to this node is not available
                 available_mask[self.off2i(node.offset)] = False
+                num_retained += 1
                 logger.debug('SharedTree.reset: node %s at offset %s is not available for writing.', repr(node), node.offset)
                 for child_offset in node.children:
                     if child_offset != 0: # i.e. is initialized
                         logger.debug('SharedTree.reset: child offset %s is valid, adding to frontier.', child_offset)
                         child = self.get_by_offset(child_offset)
                         frontier.append(child)
+            logger.debug('SharedTree.reset: retained %d nodes in the subtree.', num_retained)
+            # make sure to clean child pointers for children no longer in the subtree
+            for node in frontier:
+                parent = node.parent
+                logger.debug('SharedTree.reset: clearing children of node %s at offset %s.', repr(parent), node.offset)
+                parent.set_child(node.action_id, 0)  # clear the child pointer
+            
         else:
             logger.debug('SharedTree.reset: no last action provided, setting root to a new node at offset 0.')
             root: NodeBase = self.get_root() # node at offset 0
