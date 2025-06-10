@@ -2,29 +2,34 @@ from .base import (
     ArrayElement, AtomicCounterElement, NestedArrayElement,
     BlockLayout, BaseMemoryManager)
 import multiprocessing as mp
-from typing import Union, Callable, Dict, List, Optional
+from typing import Union, Callable, Dict, List, Optional, Generator
 import numpy as np
 import contextlib
-from time import time
+from time import time, sleep
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class BufferHeaderBase(BlockLayout):
-    _required_attributes = ['in_index', 'out_index', 'submitted', 'ready']
+class BufferInputFull(Exception): pass
+class BufferOutputFull(Exception): pass
+
+class BufferHeader(BlockLayout):
+    _required_attributes = ['in_index_w', 'in_index_f', 'in_index_r', 'in_index_rf', 'out_index_w', 'out_index_f', 'out_index_r']
     _elements = {
-        'in_index': AtomicCounterElement(),  # index of the next block to be used
-        'out_index': AtomicCounterElement(),  # index of the next block to be used
+        # MPSC input buffer with frontiers with the invariant
+        # read_head <= write_frontier <= write head and
+        # 0 <= write_head - read_head < num_blocks.
+        'in_index_w': AtomicCounterElement(),  # write head of the MPSC.
+        'in_index_f': AtomicCounterElement(),  # frontier pointer for the MPSC input buffer.
+        'in_index_r': ArrayElement(dtype=np.int64, shape=()),  # read head of the MPSC input buffer.
+        # SPSC output buffer with the invariant 
+        # 0 <= write_head - read_head < num_blocks.
+        'out_index_w': ArrayElement(dtype=np.int64, shape=()),  # write head for SPSC output buffer
+        'out_index_r': ArrayElement(dtype=np.int64, shape=()),  # read head for the SPSC output buffer.
     }
     @classmethod
-    def define(cls, length: int):
-        class BufferHeader(cls):
-            _elements = cls._elements.copy()
-            _elements.update({
-                'submitted': ArrayElement(np.bool_, (length,)), # boolean mask of submitted blocks
-                'ready': ArrayElement(np.bool_, (length,)),  # boolean mask of ready blocks
-            })
-        return BufferHeader
+    def define(cls):
+        pass
 
 class IOBuffer(BaseMemoryManager):
     """The IOBuffer handles asynchronous communication between processes.
@@ -42,8 +47,8 @@ class IOBuffer(BaseMemoryManager):
     def __init__(
         self, num_blocks, input_element: BlockLayout,
         output_element: BlockLayout, name: str = 'IOBuffer'):
-        self._header_cls = BufferHeaderBase.define(length=num_blocks)
-        self._header_size = self._header_cls.get_block_size(length=num_blocks)
+        self._header_cls = BufferHeader
+        self._header_size = self._header_cls.get_block_size()
         self._header_name = f'{name}_header'
 
         self._input_size = input_element.get_block_size()
@@ -54,13 +59,13 @@ class IOBuffer(BaseMemoryManager):
         
         self._input_element_cls = input_element
         self._output_element_cls = output_element
-        self._num_blocks = num_blocks
+        # round the number of blocks to the nearest power of two.
+        self._num_blocks = 1 << (num_blocks - 1).bit_length()  # round up to the next power of two
+        if num_blocks != self._num_blocks:
+            logger.warning("IOBuffer: num_blocks rounded up to nearest power of two: %s --> %s", num_blocks, self._num_blocks)
+        self._mask = self._num_blocks - 1  # for fast modulo operation
         
         self._is_main = False
-        # maintain LOCAL read pointers for the two buffers.
-        # ideally, only one process should read without localization, otherwise
-        # ther will be race conditions. without localization they are also more severe.
-        self.submitted_read_head = self.ready_read_head = 0
     
     def configure(self):
         """To be called by the parent process to allocate shared memory blocks."""
@@ -77,6 +82,7 @@ class IOBuffer(BaseMemoryManager):
         assert self._is_main, "reset() should only be called in the main process."
         # clear the header and input/output blocks
         self._header_cls.clear_block(self._header_shm, 0, length=self._num_blocks)
+        self.input_index_r = 0
         for i in range(self._num_blocks):
             self._input_element_cls.clear_block(self._input_shm, i * self._input_size)
             self._output_element_cls.clear_block(self._output_shm, i * self._output_size)
@@ -99,82 +105,115 @@ class IOBuffer(BaseMemoryManager):
             self._input_shm.unlink()
             self._output_shm.unlink()
     
-    def _next_in(self, num_blocks: Optional[int] = 1):
-        with self.header.in_index() as in_index:
-            index = in_index.fetch_add(num_blocks)  # increment the in_index atomically
-        indices = np.arange(index, index + num_blocks) % self._num_blocks
-        assert not self.header.submitted[indices].any(), "Circular input buffer full."
+    # The input buffer is implemented as a circular buffer.
+    # following the Multi-producer, single-consumer (MPSC) pattern.
+    # both read and write heads are incremented indefinitely, with the 
+    # invariance that 0 <= write_head - read_head < num_blocks.
+    
+    def _next_in_w(self, increment: Optional[int] = 1):
+        """Reserve `increment` blocks for writing to the input buffer."""
+        # (busy) wait until the write head has enough space to write the requested number of blocks.
+        write_head_ptr = self.header.in_index_w.peek()
+        # encure the distance between the write head and the read frontier doesn't exceed the buffer size.
+        while write_head_ptr + increment - self.header.in_index_r >= self._num_blocks:
+            sleep(0.0001) # just a little, so reading can catch up.
+        with self.header.in_index_w() as in_index_w:
+            # increment the in_index atomically to let the other
+            # producers know that we are reserving space.
+            index = in_index_w.fetch_add(increment)  
+        # now, we are guaranteed to have enough space to write stuff.
+        indices = np.arange(index, index + increment) & self._mask  # use bitwise AND to wrap around the circular buffer.
         return indices
-    def _next_out(self, num_blocks: Optional[int] = 1):
-        with self.header.out_index() as out_index:
-            index = out_index.fetch_add(num_blocks)  # increment the out_index atomically
-        indices = np.arange(index, index + num_blocks) % self._num_blocks
-        assert not self.header.ready[indices].any(), "Circular output buffer full."
+    def _update_in_w_frontier(self, increment: Optional[int] = 1):
+        """Update the write frontier, so that the read head can catch up."""
+        with self.header.in_index_f() as in_index_f:
+            in_index_f.add(increment)
+    def _get_in_read_batch(self, increment: Optional[int] = 1):
+        """
+        Get the next <= increment blocks that are ready to be read from the input buffer,
+        but don't update the read head.
+        """
+        # cap the increment to the number of blocks beetween the read head and the write frontier.
+        increment = min(increment, self.header.in_index_f.peek() - self.header.in_index_r)
+        indices = np.arange(self.header.in_index_r, self.header.in_index_r + increment) & self._mask
         return indices
+    def _set_in_read(self, increment: Optional[int] = 1):
+        """Update the read head of the input buffer to let the producers know we are done reading."""
+        self.header.in_index_r += increment
+    def _get_out_write_batch(self, increment: Optional[int] = 1, strict: bool = True):
+        # (busy) wait until the write head has enough space to write the requested number of blocks.
+        while strict and self.header.out_index_w + increment - self.header.out_index_r >= self._num_blocks:
+            sleep(0.0001)  # just a little, so reading can catch up.
+        if not strict:
+            increment = min(increment, self._num_blocks - (self.header.out_index_w - self.header.out_index_r))
+        indices = np.arange(self.header.out_index_w, self.header.out_index_w + increment) & self._mask
+        return indices
+    def _set_out_written(self, increment: Optional[int] = 1):
+        """Update the write head of the output buffer to let the reader know we are done writing."""
+        self.header.out_index_w += increment
     
     def submit(self, **payload):
+        # get the next available index for writing to the input buffer.
         index = self._next_in()[0]
+        # write the payload to the input block at the given index.
         iblock = self._input_element_cls(self._input_shm, index * self._input_size)
         iblock.write(**payload)
-        self.header.submitted[index] = True
+        # update the write frontier to let the readers know that we have submitted a new block.
+        self._update_in_w_frontier()
         logger.debug("IOBuffer: submit() called, set submitted at index=%d. offset %s", index, iblock.node_offset)
     
     def ready(self, payload_list: List[Dict[str, np.ndarray]]):
-        indices = self._next_out(len(payload_list))
-        for index, payload in zip(indices, payload_list):
-            oblock = self._output_element_cls(self._output_shm, index * self._output_size)
-            oblock.write(**payload)
-            self.header.ready[index] = True
-            logger.debug("IOBuffer: ready() called, set ready at index=%d. offset %s", index, oblock.node_offset)
+        base = 0
+        while len(payload_list) > 0:
+            indices = self._get_out_write_batch(len(payload_list), strict=False) + base
+            for index in indices:
+                oblock = self._output_element_cls(self._output_shm, index * self._output_size)
+                oblock.write(**payload_list.pop(0))
+            self._set_out_written(len(indices))
+            base += len(indices)
     
     @contextlib.contextmanager
-    def poll_submitted(self, max_samples:int, localize:bool=True):
+    def read_submited(self, max_samples:int, localize:bool=True) -> Generator[List[Union[BlockLayout, Dict[str, np.ndarray]]], None, None]:
         """
-        Linear search once through the submitted blocks; picking up where the last read left off.
-        Appends the first `max_samples` blocks that are ready to be processed.
+        Read at most `max_samples` submitted blocks from the input buffer.
+        This is a generator that yields the blocks as a batch.
+        If `localize` is True, the blocks are localized to the current process before yielding.
+        Designed for a single consumer process!
+        If using with localize=False, make sure to read the blocks before exiting the context,
+        otherwise the blocks will be marked as read and will not be available for reading again.
         """
-        # logger.debug("IOBuffer: poll_submitted() called with max_samples=%d, localize=%s", max_samples, localize)
-        inp = []; indices = []
-        
-        start_mod = (self.submitted_read_head % self._num_blocks)
-        start_mod = start_mod - 1 if start_mod != 0 else self._num_blocks-1  # avoid zero mod for circular buffer
-        while (self.submitted_read_head % self._num_blocks) != start_mod and len(inp) < max_samples:
-            if self.header.submitted[self.submitted_read_head]:
-                # read the output block and localize its contents. 
-                iblock = self._input_element_cls(self._input_shm, self.submitted_read_head * self._input_size)
-                if localize:
-                    inp.append(iblock.read())
-                else:
-                    inp.append(iblock)
-                indices.append(self.submitted_read_head)  # keep the index for later use
-            # increment the index
-            self.submitted_read_head = (self.submitted_read_head + 1) % self._num_blocks
-        if len(inp) > 0:
-            logger.debug("IOBuffer: poll_submitted() inputs %s", [str(i)[:20] + '...' for i in inp])
-        yield inp
-        # clear the submitted flag after the context is exited
-        self.header.submitted[indices] = False
-
+        indices = self._get_in_read_batch(max_samples)
+        ret = []
+        for index in indices:
+            iblock = self._input_element_cls(self._input_shm, index * self._input_size)
+            if localize:
+                iblock = iblock.read()
+                self._set_in_read(1)  # mark the block as read
+            ret.append(iblock)
+        yield ret
+        if not localize: self._set_in_read(len(indices))
+    
     @contextlib.contextmanager
-    def poll_ready(self, localize:bool=True, timeout=None):
-        # logger.debug("IOBuffer: poll_ready() called with localize=%s, timeout=%s", localize, timeout)
-        start = time()
-        while timeout is None or time() - start < timeout:
-            if self.header.ready[self.ready_read_head]:
-                logger.debug("IOBuffer: poll_ready() found ready block at index %d.", self.ready_read_head)
-                break
-            self.ready_read_head = (self.ready_read_head + 1) % self._num_blocks
-        else:
-            yield None # timeout reached.
-            return
-        # read the output block and localize its contents.
-        oblock = self._output_element_cls(self._output_shm, self.ready_read_head * self._output_size)
-        if localize:
-            oblock = oblock.read()
-        yield oblock
-        # clear the rady flag only after the context is exited
-        self.header.ready[self.ready_read_head] = False
-
+    def read_ready(self, max_samples:int=1, localize:bool=True):
+        """
+        Read at most `max_samples` ready blocks from the output buffer.
+        This is a generator that yields the blocks as a batch.
+        If `localize` is True, the blocks are localized to the current process before yielding.
+        Designed for a single consumer process!
+        If using with localize=False, make sure to read the blocks before exiting the context,
+        otherwise the blocks will be marked as read and will not be available for reading again.
+        """
+        indices = self._get_out_write_batch(max_samples, strict=False)
+        ret = []
+        for index in indices:
+            oblock = self._output_element_cls(self._output_shm, index * self._output_size)
+            if localize:
+                oblock = oblock.read()
+                self._set_out_written(1)
+            ret.append(oblock)
+        yield ret
+        if not localize: self._set_out_written(len(indices))
+    
     def is_idle(self):
-        header = self.header
-        return not header.submitted.any() and not header.ready.any()
+        return (self.header.in_index_w.peek() == self.header.in_index_r and
+                self.header.out_index_w == self.header.out_index_r)
