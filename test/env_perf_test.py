@@ -7,6 +7,8 @@ import subprocess
 from tqdm import tqdm
 
 import tensorflow as tf
+for device in tf.config.list_physical_devices('GPU'):
+    tf.config.experimental.set_memory_growth(device, True)
 import sonnet as snn
 import numpy as np
 

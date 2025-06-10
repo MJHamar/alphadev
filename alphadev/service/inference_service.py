@@ -106,6 +106,7 @@ class AlphaDevInferenceService(IOBuffer):
             return tf.stack(requests, axis=0)
         num_timeouts = 0
         while True:
+            poll_start = tf.timestamp()
             with self.poll_submitted(self.batch_size, localize=False) as tasks:
                 if len(tasks) == 0:
                     num_timeouts += 1
@@ -115,6 +116,7 @@ class AlphaDevInferenceService(IOBuffer):
                         sleep(0.001) # TODO: adjust this to a config parameter.
                     continue
                 logger.debug(f"AlphaDevInferenceService: processing {len(tasks)} tasks")
+                task_process_start = tf.timestamp()
                 node_offset = [t.node_offset for t in tasks] # list of node offsets to update
                 inputs = [t.observation for t in tasks] # list of observations to evaluate
                 inputs = tree.map_structure(stack_requests, *inputs)
@@ -122,10 +124,9 @@ class AlphaDevInferenceService(IOBuffer):
             # update the variables
             if self._variable_client is not None:
                 self._variable_client.update(wait=False)
-            start = tf.timestamp()
+            inference_start = tf.timestamp()
             prior, *values = self._network(inputs)
-            end = tf.timestamp()
-            logger.debug(f"AlphaDevInferenceService: network inference took {end - start} seconds")
+            ready_start = tf.timestamp()
             logger.debug(f"AlphaDevInferenceService: prior type={type(prior)} values{values}")
             value = values[0] # ugly hack but there are versions of the network where >2 values are returned.
             logger.debug(f"obtained shapes from network: offsets={node_offset}, prior={prior.shape}, value={value.shape}")
@@ -134,6 +135,8 @@ class AlphaDevInferenceService(IOBuffer):
                 prior=p,
                 value=v
             ) for off, p, v in zip(node_offset, prior, value)])
+            ready_end = tf.timestamp()
+            logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
 
 class InferenceFactory:
     """
