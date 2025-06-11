@@ -1,7 +1,8 @@
 """
 Extension of `acme.agents.tf.mcts.search`
 """
-from typing import Dict, Optional, List, Generator
+from typing import Dict, Optional, List, Tuple, Sequence
+from collections import defaultdict
 
 from acme.agents.tf.mcts.search import SearchPolicy
 from acme.agents.tf.mcts import types
@@ -12,133 +13,173 @@ import numpy as np
 
 from tqdm import tqdm
 
-@dataclasses.dataclass
-class Node:
-    """A MCTS node."""
-
-    prior: float = 1.
-    terminal: bool = False
-    _reward: float = 0.
-    _visit_count: int = 0
-    _total_value: float = 0.
-    _value: types.Value = 0.  # Q(s, a)
-    children: Dict[types.Action, 'Node'] = dataclasses.field(default_factory=dict)
-    _children_priors: List[float] = None
-    action_mask: Optional[np.ndarray] = None
-    container_cls: Optional[type] = None
+class NodeBase:
+    """Locally stored MCTS node. uses lazy evaluation."""
+    __annotations__ = {
+        'parent': Optional['NodeBase'],
+        'action': Optional[types.Action],
+        'expanded': bool,
+        'terminal': bool,
+        'visit_count': int,
+        'prior': np.ndarray,
+        'W': np.ndarray,  # total value of the children.
+        'Nw': np.ndarray,  # visit count of the children.
+        'R': np.ndarray,  # reward of the children.
+        'Nr': np.ndarray,  # visit count of the children.
+        'mask': np.ndarray,  # boolean mask of legal actions.
+        'children': Sequence['NodeBase'], # a list of pointers by default.
+    }
+    @classmethod
+    def define(cls, width, lambda_: float=0.5) -> 'NodeBase':
+        assert lambda_ >= 0 and lambda_ <= 1, "lambda must be in [0, 1]"
+        class Node(cls):
+            _width = width
+            _lam = lambda_
+        return Node
     
-    def expand(self, prior: np.ndarray, action_mask: Optional[np.ndarray] = None):
-        """Expands this node, adding child nodes."""
-        assert prior.ndim == 1  # Prior should be a flat vector.
-        self.action_mask = action_mask if action_mask is not None else np.ones_like(prior, dtype=bool)
-        self._children_priors = prior
-        self.children = self._make_children(prior.shape[0])
+    def __init__(self,
+        parent: Optional['NodeBase'] = None,
+        action: Optional[types.Action] = None,
+    ):
+        self._parent = parent
+        self._action = action
+        self._expanded = False
+        self._terminal = False
+        self._children = defaultdict(lambda: None)  # lazy evaluation of children.
+        self._prior = None
+        self._W = None
+        self._Nw = None
+        self._R = None
+        self._Nr = None
+        self._mask = None
+        
     
-    def _make_children(self, num_kids:int) -> Dict[types.Action, 'Node']:
-        return NodeContainer(num_kids)
-
+    def expand(self, prior: np.ndarray):
+        self._expanded = True
+        self._prior = prior
+    
+    def backup_value(self, action:types.Action, value: float, discount: float = 1.0, trajectory: Optional[List['NodeBase']] = []):
+        """Update the visit count and total value of this node."""
+        if len(trajectory) == 0:
+            parent = self.parent
+        else:
+            parent = trajectory.pop()
+        # Update the visit count and total value.
+        self.W[action] += value
+        self.Nw[action] += 1
+        if parent is not None:
+            # Recursively backup the value to the parent node.
+            parent.backup_value(self.action, value * discount, discount, trajectory)
+    
+    def backup_reward(self, action:types.Action, reward: bool, discount: float, trajectory: Optional[List['NodeBase']] = []):
+        """
+        Recursively set the reward for this node and its parents.
+        trajectory can be provided to avoid having to re-create the path.
+        """
+        if len(trajectory) == 0:
+            parent = self.parent
+        else:
+            parent = trajectory.pop()
+        self.R[action] += reward
+        self.Nr[action] += 1
+        if parent is not None:
+            parent.backup_reward(reward*discount, discount, self.action, trajectory)
+    
+    @property
+    def zeros(self):
+        if not hasattr(self, '_zeros'):
+            self._zeros = np.zeros(self._width, dtype=np.float32)
+        return self._zeros
+    
+    @property
+    def children_values(self) -> np.ndarray:
+        """
+        Return array of values of visited children.
+        Q(s, a) = (1-lam) * R(s, a) / Nr(s, a) + lam * W(s, a) / Nw(s, a)
+        via Silver et al. 2016.
+        where lam is a hyperparameter that controls the balance between
+        the reward and the value.
+        """
+        values_r = np.divide(self.R, self.Nr, out=self.zeros, where=self.Nr != 0)
+        values_w = np.divide(self.W, self.Nw, out=self.zeros, where=self.Nw != 0)
+        return (1-self._lam)*values_r + self._lam*values_w
     @property
     def children_visits(self) -> np.ndarray:
         """Return array of visit counts of visited children."""
-        return self.children.visits()
-
-    @property
-    def children_values(self) -> np.ndarray:
-        """Return array of values of visited children."""
-        return self.children.values()
+        return self.Nr
     
     @property
-    def children_priors(self) -> np.ndarray:
-        return self._children_priors
-
-    def visit(self, value: float):
-        """Visit this node andd update its value by computing the new average
-        based on the previous value and the new value. also increment the visit count."""
-        # update the node container with the latest values and visit counts of its children
-        self.children.update()
-        # Update the visit count and value.
-        self._visit_count += 1
-        self._total_value += value
-        self._value = self._total_value / self._visit_count
-
+    def parent(self):      return self._parent
     @property
-    def visit_count(self) -> int:
-        """Return the visit count of this node."""
-        return self._visit_count
-
+    def action(self):      return self._action
     @property
-    def value(self) -> types.Value:  # Q(s, a)
-        return self._value
-    
+    def expanded(self):    return self._expanded
+    @property
+    def terminal(self):    return self._terminal
+    @property
+    def visit_count(self):
+        if self.is_root(): return np.sum(self._Nr)
+        return self.parent.get_visit_count(self._action)
     @property
     def reward(self) -> float:
-        return self._reward
-    @reward.setter
-    def reward(self, value: float):
-        self._reward = value
+        if self.is_root(): return 0.0
+        return self.parent.get_reward(self._action)
+    @property
+    def prior(self):
+        if self._prior is None: self._prior = np.zeros(self._width, dtype=np.float32)
+        return self._prior
+    @property
+    def W(self):
+        if self._W is None: self._W = np.zeros(self._width, dtype=np.float32)
+        return self._W
+    @property
+    def Nw(self):
+        if self._Nw is None: self._Nw = np.zeros(self._width, dtype=np.int32)
+        return self._Nw
+    @property
+    def R(self):
+        if self._R is None: self._R = np.zeros(self._width, dtype=np.float32)
+        return self._R
+    @property
+    def Nr(self):
+        if self._Nr is None: self._Nr = np.zeros(self._width, dtype=np.int32)
+        return self._Nr
+    @property
+    def mask(self):
+        if self._mask is None: self._mask = np.zeros(self._width, dtype=np.bool_)
+        return self._mask
+    
+    def is_root(self) -> bool:
+        """Check if this node is the root node."""
+        return self._parent is None
+    
+    def get_child(self, action: types.Action) -> Optional['NodeBase']:
+        return self._children[action]
+    def set_child(self, action: types.Action, child: 'NodeBase'):
+        """Set a child node for the given action."""
+        self._children[action] = child
+    
+    def set_root(self):
+        """Set this node as the root node."""
+        self._parent = None
+        self._action = None
+    
+    def set_parent(self, parent: 'NodeBase', action: Optional[types.Action] = None):
+        """Set the parent node and action for this node."""
+        self._parent = parent
+        self._action = action
+    
+    def set_legal_actions(self, legal_actions: np.ndarray):
+        self.mask[...] = legal_actions
+    
+    def set_terminal(self, terminal: bool):
+        self._terminal = terminal
+    
+    def get_visit_count(self, action: types.Action) -> int:
+        return self.Nr[action]
+    def get_reward(self, action: types.Action) -> float:
+        return self.R[action] / self.Nr[action] if self.Nr[action] > 0 else 0.0
 
-class NodeContainer():
-    """
-    Node container that caches node values and visit counts, so that we don't have to keep re-initializing ndarrays.
-    An important assumption is that this class is only used during MCTS, where
-    update() is called during the backup phase and __getitem__() is called exactly once per node, per rollout.
-    """
-    default_node = Node()
-
-    def __init__(self, num_nodes: int):
-        self.num_nodes = num_nodes
-        self.nodes = {a: self.__class__.default_node for a in range(num_nodes)}
-        self._node_values = None
-        self._node_visits = None
-        self._needs_update = None
-    
-    def __getitem__(self, key: int) -> Node:
-        assert self._needs_update is None,\
-            "Cannot call __getitem__ while _needs_update is not None."\
-            "This means two subsequent calls to __getitem__ without an update (via values() or visits())."
-        if id(self.nodes[key]) == id(self.__class__.default_node):
-            # If the node is the default node, create a new one.
-            self.nodes[key] = self.__class__.default_node.__class__()
-        self._needs_update = key
-        return self.nodes[key]
-    
-    def update(self):
-        if self._needs_update is not None:
-            key = self._needs_update; self._needs_update = None
-            if self._node_values is not None:
-                self._node_values[key] = self.nodes[key].value
-            if self._node_visits is not None:
-                self._node_visits[key] = self.nodes[key].visit_count
-    
-    def values(self) -> np.ndarray:
-        if self._node_values is not None:
-            return self._node_values
-        self._node_values = np.asarray(
-            [node.value for node in self.nodes.values()],
-            dtype=np.float32
-        )
-        return self._node_values
-    
-    def visits(self) -> np.ndarray:
-        if self._node_visits is not None:
-            return self._node_visits
-        self._node_visits = np.asarray(
-            [node.visit_count for node in self.nodes.values()],
-            dtype=np.int32
-        )
-        return self._node_visits
-    
-    def elements(self) -> Generator[Node, None, None]:
-        return self.nodes.values()
-    
-    def __len__(self) -> int:
-        """Return the number of nodes in this container."""
-        return self.num_nodes
-    
-    def __iter__(self) -> Generator[Node, None, None]:
-        """Iterate over the nodes in this container."""
-        raise NotImplementedError(
-            "NodeContainer is not iterable. Use `nodes()` to be explicit about iterating over the nodes.")
 
 class MCTSBase:
     """Base class for MCTS algorithms."""
@@ -160,98 +201,146 @@ class MCTSBase:
         self.discount = discount
         self.dirichlet_alpha = dirichlet_alpha
         self.exploration_fraction = exploration_fraction
+        # Define the node class with the number of actions.
+        self.node_cls = NodeBase.define(num_actions)
+        self._root = self._make_node()
     
-    def __call__(self, observation: types.Observation) -> Node:
-        raise NotImplementedError(
-            "MCTSBase is an abstract class and cannot be called directly. "
-            "Please use a subclass that implements the __call__ method."
-        )
-    
-    def init_tree(self, observation: types.Observation) -> Node:
+    def search(self, observation: types.Observation, last_action: Optional[types.Action] = None) -> NodeBase:
+        """Single-threaded Monte-Carlo Tree Search."""
+        # 0. make a copy of the model's state.
+        self.model.save_checkpoint()
+        # 1. initialize the tree with the current observation.
+        root = self.init_tree(observation, last_action)
+        # 2. run the search policy for a number of simulations.
+        for _ in tqdm(range(self.num_simulations), desc="MCTS Search", leave=False):
+            trajectory, actions = self.in_tree(root)
+            # 3. simulate the trajectory.
+            node, timestep = self.simulate(root, trajectory, actions)
+            # 4. evaluate (and expand) the node.
+            _, value = self.evaluate(node, timestep)
+            # 5. backup the value to the trajectory.
+            self.backup(node, value)
+            # 6. reset the model to the saved state.
+            self.model.load_checkpoint()
+        # 7. return the root node.
+        return root
+
+    def init_tree(self,
+        observation: types.Observation,
+        last_action: Optional[types.Action] = None,
+    ):
+        # 1. get root node.
+        if last_action is not None:
+            # 1.1 find the new root node, if last action is given.
+            old_root = self.get_root()
+            new_root = self.get_child(old_root, last_action)
+            # make all other branches of the tree unreachable
+            self.set_root(new_root)
+        else:
+            # 1.2 otherwise, create a new root node.
+            # delete the tree.
+            self.reset_tree()
+            new_root = self.get_root()
+        # 2. get prior policy for the root node.
+        if not new_root.expanded:
+            # 2.1 if the root node is not expanded, we need a prior policy.
+            # Evaluate the prior policy for this state.
+            prior, _ = self.evaluation(observation)
+            assert prior.shape == (self.num_actions,), f"Expected prior shape {(self.num_actions,)}, got {prior.shape}."
+        else:
+            # 2.2 if the root node is already expanded, we can use its prior.
+            prior = new_root.prior
         
+        # 3. Add exploration noise to the prior.
+        noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
+        prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
+        new_root.expand(prior) # it's fine to re-expand.
+        
+        # 4. Set legal actions if not already set.
+        if not new_root.legal_actions.any():
+            # 4.1 if the legal actions are not set, we need to get them from the model.
+            legal_actions = self.model.legal_actions()
+            new_root.set_legal_actions(legal_actions)
+        
+        # 5. return the root node.
+        return new_root
 
-def mcts(
-    observation: types.Observation,
-    model: models.Model,
-    search_policy: SearchPolicy,
-    evaluation: types.EvaluationFn,
-    num_simulations: int,
-    num_actions: int,
-    discount: float = 1.,
-    dirichlet_alpha: float = 1,
-    exploration_fraction: float = 0.,
-    node_class: Optional[Node] = Node,
-) -> Node:
-    """Does Monte Carlo tree search (MCTS), AlphaZero style."""
-
-    # Evaluate the prior policy for this state.
-    prior, value = evaluation(observation)
-    assert prior.shape == (num_actions,), f"Expected prior shape {(num_actions,)}, got {prior.shape}."
-    assert isinstance(value, float), f"Expected value to be a float, got {type(value)}."
-
-    # Add exploration noise to the prior.
-    noise = np.random.dirichlet(alpha=[dirichlet_alpha] * num_actions)
-    prior = prior * (1 - exploration_fraction) + noise * exploration_fraction
-    # Create a fresh tree search.
-    root = node_class()
-    legal_actions = model.legal_actions()
-    root.expand(prior, legal_actions)
-
-    # Save the model state so that we can reset it for each simulation.
-    model.save_checkpoint()
-    for _ in range(num_simulations):
+    def in_tree(self, node: NodeBase) -> Tuple[List[NodeBase], List[types.Action]]:
+        """Run the in-tree phase of MCTS and return the trajectory and actions."""
         # Start a new simulation from the top.
-        trajectory = [root]
-        node = root
-
-        # Generate a trajectory.
-        timestep = None
+        trajectory = [node]
         actions = []
-        while node.children:
-            # Select an action according to the search policy.
-            action = search_policy(node)
-
-            # Point the node at the corresponding child.
-            node = node.children[action]
+        while node.expanded:
+            action = self.search_policy(node)
+            # use `select_child` instead of `get_child` in case we need to do extra processing.
+            node = self.select_child(node, action)
             trajectory.append(node)
             actions.append(action)
+        # Return the trajectory and actions.
+        return trajectory, actions
 
+    def simulate(self, node: NodeBase, actions: List[types.Action])-> Tuple[NodeBase, types.Observation]:
         # Replay the simulator until the current node and expand it.
-        timestep = model.step(actions)
-        node.reward = timestep.reward if timestep.reward is not None else 0.
-        node.terminal = timestep.last()
-
+        timestep = self.model.step(actions)
+        # depending on the model the reward might contain additional dimensions
+        reward = timestep.reward if timestep.reward.ndim == 0 else timestep.reward[0]
+        terminal = timestep.last()
+        if not terminal:
+            legal_actions = self.model.legal_actions()
+            node.set_legal_actions(legal_actions)
+        node.set_terminal(terminal)
+        # backup nr.1: backup the observed reward
+        node.parent.backup_reward(actions[-1], reward, self.discount, trajectory=actions[:-1])
+        return node, timestep.observation
+    
+    def evaluate(self, node: NodeBase, observation: types.Observation) -> Tuple[np.ndarray, float]:
         # Calculate the bootstrap for leaf nodes.
         if node.terminal:
             # If terminal, there is no bootstrap value.
             value = 0.
         else:
             # Otherwise, bootstrap from this node with our value function.
-            prior, value = evaluation(timestep.observation)
-            legal_actions = model.legal_actions()
-
+            prior, value = self.evaluation(observation)
             # We also want to expand this node for next time.
-            node.expand(prior, legal_actions)
-
-        # Load the saved model state.
-        model.load_checkpoint()
-
+            node.expand(prior)
+        return prior, value
+    
+    def backup(self, node: NodeBase, value: float, trajectory: Optional[List[NodeBase]] = []):
         # Monte Carlo back-up with bootstrap from value function.
-        ret = value
-        while trajectory:
-            # Pop off the latest node in the trajectory.
-            node = trajectory.pop()
-            # Accumulate the discounted return
-            ret *= discount
-            ret += node.reward
-
-            # Update the node.
-            node.visit(ret)
-
-    return root
+        node.parent.backup_value(node.action, value, self.discount, trajectory=trajectory)
+        # done.
+    
+    def get_root(self) -> NodeBase:
+        return self._root
+    def set_root(self, node: NodeBase):
+        """Set the root node of the MCTS tree."""
+        node.set_root()  # Ensure the node has no parent.
+        self._root = node
+    
+    def reset_tree(self):
+        """Reset the MCTS tree."""
+        self._root = self._make_node()
+    
+    def get_child(self, node: NodeBase, action: types.Action) -> NodeBase:
+        assert node.expanded, "NodeBase must be expanded to get a child."
+        maybe_child = node.get_child(action)
+        if maybe_child is None:
+            child = self.node_cls(parent=node, action=action)
+            node.set_child(action, child)
+            return child
+        return maybe_child
+    
+    def select_child(self, node: NodeBase, action: types.Action) -> NodeBase:
+        """Select a child node based on the action."""
+        # This method can be overridden to implement custom selection logic.
+        return self.get_child(node, action)
+    
+    def _make_node(self, parent: Optional[NodeBase] = None, action: Optional[types.Action] = None) -> NodeBase:
+        """Create a new node and add it to the tree."""
+        return self.node_cls(parent=parent, action=action)
 
 def dyn_puct(
-    node: Node,
+    node: NodeBase,
     c_puct_base: float = 19652,
     c_puct_init: float = 1.25,
 ) -> int:
@@ -267,17 +356,18 @@ def dyn_puct(
     # Make a call to the PUCT function with constant scaling.
     return puct(node, c_puct)
 
-def puct(node: Node, ucb_scaling: float = 1.) -> types.Action:
+def puct(node: NodeBase, ucb_scaling: float = 1.) -> types.Action:
     """PUCT search policy, i.e. UCT with 'prior' policy."""
-    # Action values Q(s,a).
+    # Action values Q(s,a) = R(s,a) / Nr(s,a) + W(s,a) / Nw(s,a).
     value_scores = node.children_values
     # check_numerics(value_scores)
 
     # Policy prior P(s,a).
-    priors = node.children_priors
+    priors = node.P
     # check_numerics(priors)
 
     # Visit ratios.
+    # sqrt(Nr(s))/1+Nr(s,a) according to Silver et al. 2016.
     nominator = np.sqrt(node.visit_count)
     visit_ratios = nominator / (node.children_visits + 1)
     # check_numerics(visit_ratios)
@@ -306,10 +396,10 @@ class PUCTSearchPolicy(SearchPolicy):
         self.c_puct_base = c_puct_base
         self.c_puct_init = c_puct_init
 
-    def __call__(self, node: Node) -> int:
+    def __call__(self, node: NodeBase) -> int:
         return dyn_puct(node, self.c_puct_base, self.c_puct_init)
 
-def visit_count_policy(root: Node, temperature: float = 1.0, mask: np.ndarray = None) -> int:
+def visit_count_policy(root: NodeBase, temperature: float = 1.0, mask: np.ndarray = None) -> int:
     visits = root.children_visits
     if mask is not None:
         visits = visits * mask # multiply by the mask to keep the shape, but make invalid actions impossible to choose    
