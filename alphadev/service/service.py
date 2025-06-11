@@ -2,7 +2,7 @@
 Lightweight implementation of Service objects that wrap different components
 of the distributed training pipeline.
 """
-from typing import Dict
+from typing import Dict, Union
 import os
 import sys
 import abc
@@ -11,6 +11,7 @@ import redis
 import pickle
 import threading
 import contextlib
+import signal
 from time import sleep
 from uuid import uuid4 as uuid
 import subprocess
@@ -42,6 +43,8 @@ class _ClientBackend:
     def rpc(self, payload, timeout=5): pass
 
 class _ServiceBackend:
+    @abc.abstractmethod
+    def configure(self): pass
     @abc.abstractmethod
     @contextlib.contextmanager
     def connection(self): pass
@@ -118,6 +121,9 @@ class _RedisRPCService(_ServiceBackend, MaybeLogger):
         self._close_key = f'{label}_close'
         with self.connection() as client:
             client.set(self._close_key, 0)
+    
+    def configure(self):
+        pass # redis should already be configured.
     
     @contextlib.contextmanager
     def connection(self):
@@ -196,7 +202,7 @@ def make_client_backend(conn_config, label, logger=None) -> _ClientBackend:
 
 class RPCClient(MaybeLogger):
     """
-    Exposes a handle for each public method of registered at the corresponding service.
+    Exposes a handle for each public method registered at the corresponding service.
 
     The handle is a callable that takes the same arguments as the
     corresponding method and returns the result of calling that method on the
@@ -247,7 +253,35 @@ class RPCClient(MaybeLogger):
             # Create a callable attribute for each method
             setattr(self, method, self._Handler(method, self._client))
 
-class RPCService(MaybeLogger):
+class Service(MaybeLogger):
+    """
+    Base class for services that can be run in a separate thread.
+    
+    This class is used to create a service that can be run in a separate thread
+    and can be stopped by calling the stop method.
+    """
+    def __init__(self, logger=None):
+        MaybeLogger.__init__(self, logger)
+        # register signal handlers for SIGINT and SIGTERM
+        signal.signal(signal.SIGINT, self.handle_signal)
+        signal.signal(signal.SIGTERM, self.handle_signal)
+    
+    def handle_signal(self, signum, frame):
+        """
+        Signal handler to stop the service.
+        """
+        self.logger.info('Received signal %s, stopping service', signum)
+        if signum in (signal.SIGINT, signal.SIGTERM):
+            self.stop()
+    
+    @abc.abstractmethod
+    def run(self, *args, **kwargs): pass
+    @abc.abstractmethod
+    def stop(self): pass
+    @abc.abstractmethod
+    def create_handle(self): pass
+
+class RPCService(Service):
     """
     Each service object exposes a handle for each public method of the underlying 
     component. 
@@ -272,7 +306,7 @@ class RPCService(MaybeLogger):
                  fork_worker:bool=True,
                  worker_polling_interval:float=1.0,
                  logger=None):
-        MaybeLogger.__init__(self, logger)
+        super().__init__(self, logger)
         self._conn_config = conn_config
         self._fork_worker = fork_worker
         self._worker_polling_interval = worker_polling_interval
@@ -282,6 +316,7 @@ class RPCService(MaybeLogger):
         self._service = make_service_backend(
             conn_config=conn_config,
             label=instance_cls.__name__ + '.' + uuid().hex[:4],
+            instance_cls=instance_cls,
             logger=logger
         )
         self._should_run = self._registered_methods.pop('run', None) is not None
@@ -363,7 +398,7 @@ class RPCService(MaybeLogger):
                 raise ValueError('__CALL__ is a reserved method name.')
         return methods
 
-class ReverbService(MaybeLogger):
+class ReverbService(Service):
     """
     Reverb service that is given a reverb table constructor and creates a reverb server
     
@@ -416,35 +451,6 @@ class ReverbService(MaybeLogger):
     def create_handle(self):
         return reverb.Client(f'localhost:{self._port}')
 
-class SubprocessService(MaybeLogger):
-    """
-    Subprocess service that runs a command in a separate process.
-    
-    The command is run in a separate process and the output is logged to the
-    logger.
-    """
-    def __init__(self, command_builder, args, logger=None):
-        MaybeLogger.__init__(self, logger)
-        self._args, self._handle, self._tempfile = command_builder(*args)
-        self._label = f'subproc.{command_builder.__name__}'
-        self._process = None
-    
-    def run(self):
-        """
-        Run the command in a separate process.
-        """
-        self._process = subprocess.Popen(self._args)
-        self.logger.info('Subprocess %s started', self._label)
-        self._process.wait()
-        os.remove(self._tempfile)
-        self.logger.info('Subprocess %s stopped', self._label)
-
-    def create_handle(self):
-        """
-        Create a handle for the subprocess.
-        """
-        return self._handle
-
 class Program(object):
     """
     Program class that manages the services and returns their handles.
@@ -455,7 +461,7 @@ class Program(object):
         self._current_group = None
         self._group_members = 0
     
-    def add_service(self, service: RPCService, label: str = "", device_config:Dict[str, str] = None):
+    def add_service(self, service: Service, label: str = "", device_config:Dict[str, str] = None):
         """
         Add a service to the program.
         """
@@ -518,8 +524,10 @@ class Program(object):
         for name, proc in self._service_processes:
             proc: subprocess.Popen = proc
             base_logger.info('Stopping service %s', name)
-            proc.terminate()
-            proc.wait()
+            proc.send_signal(signal.SIGINT)
+        while any(proc.poll() is None for _, proc in self._service_processes):
+            base_logger.info('Waiting for all services to stop...')
+            sleep(1)
         
         base_logger.info('All services stopped')
         self._services.clear()

@@ -12,6 +12,7 @@ from ..shared_memory.buffer import IOBuffer
 from .variable_service import VariableService
 from ..network import NetworkFactory
 from ..device_config import apply_device_config
+from .service import Service
 
 import logging
 logger = logging.getLogger(__name__)
@@ -65,8 +66,8 @@ class AlphaDevInferenceClient(IOBuffer):
             name=name
         )
 
-class AlphaDevInferenceService(IOBuffer):
-    def __init__(self, 
+class AlphaDevInferenceService(Service, IOBuffer):
+    def __init__(self,
             num_blocks:int,
             network_factory: Callable[[], snn.Module],
             input_spec:dict,
@@ -78,28 +79,35 @@ class AlphaDevInferenceService(IOBuffer):
             factory_kwargs:dict = {},
             name:str = 'AlphaDevInferenceService'
             ):
+        super().__init__(logger=None)
         # define the input and output elements
         self._input_spec = input_spec
         self.input_element = InferenceTaskBase.define(input_spec)
         self.output_element = InferenceResultBase.define(output_spec)
-        super().__init__(
+        IOBuffer.__init__(self,
             num_blocks=num_blocks,
             input_element=self.input_element,
             output_element=self.output_element,
-            name=name)
-        self.batch_size = max(batch_size, 1)
+            name=name
+        )
+        self.batch_size = batch_size
         self._network_factory = network_factory # to be initialized in the 
         self._factory_args = factory_args or ()
         self._factory_kwargs = factory_kwargs or {}
         self._variable_service = variable_service
         self._variable_update_period = variable_update_period
+        # set stopping flag
+        self._stop_requested = False
+        # stuff to allocate when run is called
+        self._network = None  # to be initialized in run()
+        self._configured = False  # shared memory, to be initialized in run()
     
     # not overriding configure() or reset().
     # not overriding __del__() or attach() either
     
     def _create_network(self):
         network = self._network_factory(*self._factory_args, **self._factory_kwargs)
-        logger.debug(f"AlphaDevInferenceService: created network {network}, initializing variables. with input_spec={self._input_spec}")
+        self.logger.debug(f"AlphaDevInferenceService: created network {network}, initializing variables. with input_spec={self._input_spec}")
         tf2_utils.create_variables(network, input_spec=[self._input_spec])
         
         if self._variable_service is None:
@@ -118,18 +126,22 @@ class AlphaDevInferenceService(IOBuffer):
         Note that  IOBuffer onlly uses a lock for writing, reading is lock free. consequently,
         running the inference service on multiple processes can be quite redundant but not incorrect.
         """
-        if not hasattr(self, '_network'):
+        if not self._configured:
+            self.configure()
+            self._configured = True
+        
+        if self._network is None:
             self._network, self._variable_client = self._create_network()
             print(f"AlphaDevInferenceService: created network {self._network}")
         
         def stack_requests(*requests):
             return tf.stack(requests, axis=0)
         
-        while True:
+        while not self._stop_requested:
             poll_start = tf.timestamp()
             with self.read_submited(self.batch_size, localize=False) as tasks:
                 if len(tasks) == 0: continue
-                logger.debug(f"AlphaDevInferenceService: processing {len(tasks)} tasks")
+                self.logger.debug(f"AlphaDevInferenceService: processing {len(tasks)} tasks")
                 task_process_start = tf.timestamp()
                 node_offsets = []
                 inputs = []
@@ -144,18 +156,23 @@ class AlphaDevInferenceService(IOBuffer):
             inference_start = tf.timestamp()
             prior, *values = self._network(inputs)
             ready_start = tf.timestamp()
-            logger.debug(f"AlphaDevInferenceService: prior type={type(prior)} values{values}")
+            self.logger.debug(f"AlphaDevInferenceService: prior type={type(prior)} values {values}")
             value = values[0] # ugly hack but there are versions of the network where >2 values are returned.
-            logger.debug(f"obtained shapes from network: offsets={node_offsets}, prior={prior.shape}, value={value.shape}")
+            self.logger.debug(f"obtained shapes from network: offsets={node_offsets}, prior={prior.shape}, value={value.shape}")
             self.ready([dict(
                 node_offset=off,
                 prior=p,
                 value=v
             ) for off, p, v in zip(node_offsets, prior, value)])
             ready_end = tf.timestamp()
-            logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
+            self.logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
 
-    def get_client(self) -> 'AlphaDevInferenceClient':
+    def stop(self):
+        """Stop the inference service."""
+        self.logger.info("AlphaDevInferenceService: stopping.")
+        self._stop_requested = True
+
+    def create_handle(self) -> 'AlphaDevInferenceClient':
         """
         Create a client for the inference service.
         The client can be used to submit inference tasks and read results.
@@ -206,7 +223,7 @@ class InferenceFactory:
         return self
     
     def __call__(
-        self, variable_service: Optional[VariableService] = None, name:str = None) -> AlphaDevInferenceService:
+        self, variable_service: Optional[VariableService] = None, label:str = None) -> AlphaDevInferenceService:
         """
         Create an instance of the inference service.
         """
@@ -220,24 +237,5 @@ class InferenceFactory:
             variable_update_period=self._variable_update_period,
             factory_args=self._network_factory_args,
             factory_kwargs=self._network_factory_kwargs,
-            name=name or self._name
+            name=label or self._name
         )
-
-def run_inference(
-    inference_factory: InferenceFactory,
-    device_config: Optional[Dict] = None
-    ):
-    """
-    Insertion point for the inference service.
-    Instantiates the network and runs the inference service.
-    To be called from a subprocess
-    """
-    if device_config is not None:
-        logger.debug("APV_MCTS[inference process] Applying device configuration")
-        apply_device_config(device_config)
-    # initialize the inference service
-    logger.debug("APV_MCTS[inference process] Initializing inference service.")
-    inference_buffer = inference_factory()
-    inference_buffer.attach()
-    # run indefinitely
-    inference_buffer.run()

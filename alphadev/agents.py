@@ -49,8 +49,8 @@ from .network import NetworkFactory, make_input_spec
 from .acting import MCTSActor
 from .search.base import PUCTSearchPolicy
 from .observers import MCTSObserver
-from .service.service import Program, ReverbService, RPCService, RPCClient, SubprocessService
-from .service.inference_service import InferenceFactory
+from .service.service import Program, ReverbService, RPCService, RPCClient
+from .service.inference_service import InferenceFactory, AlphaDevInferenceClient
 from .config import AlphaDevConfig
 from .device_config import DeviceAllocationConfig
 from .service.variable_service import VariableService
@@ -78,7 +78,7 @@ class MCTS(agent.Agent):
         search_retain_subtree: bool = True,
         use_apv_mcts: bool = False,
         # APV MCTS parameters
-        inference_factory: Optional[NetworkFactory] = None,
+        inference_factory: Optional[InferenceFactory] = None,
         apv_processes_per_pool: Optional[int] = None,
         virtual_loss_const: Optional[float] = None,
         # Other parameters
@@ -239,11 +239,13 @@ class DistributedMCTS:
         importance_sampling_exponent: float = 0.2,
         priority_exponent: float = 0.6,
         n_step: int = 5,
-        learning_rate: float = 1e-3,        
+        learning_rate: float = 1e-3,
         # APV MCTS parameters
-        inference_factory: Optional[NetworkFactory] = None,
         apv_processes_per_pool: Optional[int] = None,
         virtual_loss_const: Optional[float] = None,
+        # inference server 
+        use_inference_server: bool = False,
+        inference_factory: Optional[InferenceFactory] = None,
         # Other parameters
         use_dual_value_network: bool = False,
         logger_factory: Callable[[], loggers.Logger] = None,
@@ -273,6 +275,7 @@ class DistributedMCTS:
         self._exploration_fraction = exploration_fraction
         self._search_retain_subtree = search_retain_subtree
         self._use_apv_mcts = use_apv_mcts
+        self._use_inference_server = use_inference_server
         
         # Training parameters
         self._batch_size = batch_size
@@ -287,10 +290,8 @@ class DistributedMCTS:
         self._learning_rate = learning_rate
         # If using APV MCTS, we need to provide the inference factory and related parameters.
         if use_apv_mcts:
-            assert inference_factory is not None, 'Inference factory must be provided for APV MCTS.'
             assert apv_processes_per_pool is not None, 'Number of processes per pool must be provided for APV MCTS.'
             assert virtual_loss_const is not None, 'Virtual loss constant must be provided for APV MCTS.'
-            self._inference_factory = inference_factory
             self._search_num_actors = apv_processes_per_pool
             self._search_virual_loss_const = virtual_loss_const
         else:
@@ -298,6 +299,10 @@ class DistributedMCTS:
             self._inference_factory = inference_factory
             self._search_num_actors = apv_processes_per_pool
             self._search_virual_loss_const = virtual_loss_const
+        # If using inference server, we need to provide the inference factory.
+        if use_inference_server:
+            assert inference_factory is not None, 'Inference factory must be provided when using inference server.'
+            self._inference_factory = inference_factory
         
         self._use_dual_value_network = use_dual_value_network
         # set up logging
@@ -380,7 +385,8 @@ class DistributedMCTS:
         replay: reverb.Client,
         counter: counting.Counter,
         logger: loggers.Logger,
-        variable_service: VariableService = None,
+        variable_service: Optional[VariableService] = None,
+        inference_service: Optional[AlphaDevInferenceClient] = None,
     ) -> acme.EnvironmentLoop:
         """The actor process."""
 
@@ -390,9 +396,9 @@ class DistributedMCTS:
 
         mcts_observers = self._mcts_observers(logger)
         
-        if self._use_apv_mcts:
-            network = variable_client = None
-            self._inference_factory.set_variable_service(variable_service)
+        if self._use_inference_server:
+            assert inference_service is not None, 'Inference service must be provided when using inference server.'
+            network = None
         else:
             network = self._network_factory(make_input_spec(self._env_spec.observations))
             variable_client = tf2_variable_utils.VariableClient(
@@ -400,7 +406,7 @@ class DistributedMCTS:
                 variables={'network': network.trainable_variables},
                 update_period=self._variable_update_period,
             )
-
+        
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
             client=replay,
@@ -425,7 +431,7 @@ class DistributedMCTS:
                 network=network,
                 variable_client=variable_client,
                 # APV MCTS mode
-                inference_factory=self._inference_factory,
+                inference_service=inference_service,
                 apv_processes_per_pool=self._search_num_actors,
                 virtual_loss_const=self._search_virual_loss_const,
                 # other
@@ -452,7 +458,7 @@ class DistributedMCTS:
                 network=network,
                 variable_client=variable_client,
                 # APV MCTS mode
-                inference_factory=self._inference_factory,
+                inference_service=self._inference_service,
                 apv_processes_per_pool=self._search_num_actors,
                 virtual_loss_const=self._search_virual_loss_const,
                 # other
@@ -615,6 +621,22 @@ class DistributedMCTS:
 
         with program.group('actor'):
             for idx in range(self._num_actors):
+                if self._use_inference_server:
+                    inference_device_config = self._device_config.get(
+                        DeviceAllocationConfig.make_process_key(
+                            DeviceAllocationConfig.INFERENCE_PROCESS, idx
+                        ), None
+                    )
+                    # Create the inference service for this actor.
+                    inference = self._inference_factory(variable_service=variable_service, label=f'inference/{idx}')
+                    program.add_service(
+                        inference,
+                        device_config=inference_device_config,
+                    )
+                    variable_service = None # don't pass it to the actor, it will use the inference service instead
+                else:
+                    inference = None
+                
                 actor_device_config = self._device_config.get(
                     DeviceAllocationConfig.make_process_key(
                         DeviceAllocationConfig.ACTOR_PROCESS, idx
@@ -626,7 +648,7 @@ class DistributedMCTS:
                         instance_factory=self.actor,
                         instance_cls=acme.EnvironmentLoop,
                         args=(
-                            idx, replay, counter, logger, variable_service
+                            idx, replay, counter, logger, variable_service, inference
                         ),),
                     device_config=actor_device_config, # NOTE: only used when using single-threaded actors
                     )
