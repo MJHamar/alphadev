@@ -2,13 +2,20 @@ from typing import Union, Callable, Dict, List, Optional
 import multiprocessing.shared_memory as mp_shm
 import numpy as np
 
+from acme.agents.tf.mcts import types
+
 from ..shared_memory.base import BlockLayout, ArrayElement, AtomicCounterElement, BaseMemoryManager
+from .base import MCTSBase, NodeBase
 
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-class SharedNodeBase(BlockLayout):
+# Process-local variables to be instantiated from the worker processes.
+_local_id = None
+
+
+class SharedNodeBase(NodeBase, BlockLayout):
     """
     Node in the search tree, residing directly in the shared memory.
     Each node corresponds to a game state and contains edges to its successor states,
@@ -41,167 +48,147 @@ class SharedNodeBase(BlockLayout):
     Completely lock-free.
     """
     _required_attributes = [
-        'header', 'prior', 'R', 'W', 'N', 'mask', 'children', 'const_vl']
+        'visitors', # keep track of the current number of visitors to this node.
+        'header', 'mask', 'children', 'const_vl',
+        'prior', 'R', 'Nr', 'W', 'Nw']
     hdr_parent = 0; hdr_action = 1; hdr_expanded = 2; hdr_terminal = 3
     _elements = {
         'header':   ArrayElement(np.int32,   (4,)), # parent_offset, action_id, terminal, expanded
         # other elements need to be defined in the subclass.
     }
-
+    
     @classmethod
-    def define(cls, width: int, vl_constant: float = 1.0):
+    def define(cls, width: int, num_workers:int, lambda_ = 0.5, vl_constant: float= -1.0) -> 'SharedNodeBase':
         """
         Specify the elements of the node class.
         This method should be called in the subclass to define the node's attributes.
         """
-        class Node(cls):
+        node_cls = super().define(width=width, lambda_=lambda_)
+        class SharedNode(node_cls):
             _elements = cls._elements.copy()
             _elements.update({
-                'prior':    ArrayElement(np.float32, (width,)),  # prior probabilities of actions
-                'R':        ArrayElement(np.float32, (width,)),  # rewards for each action
-                'W':        ArrayElement(np.float32, (width,)),  # total value for each action
-                'N':        ArrayElement(np.int32,   (width,)),  # visit count for each action
-                'mask':     ArrayElement(np.bool_,   (width,)),  # mask of valid actions
-                'children': ArrayElement(np.int32,   (width,)),  # offsets of child nodes in the shared memory
+                'visitors': ArrayElement(np.bool_,   (width, num_workers,)),  # number of visitors to this node
+                'prior':    ArrayElement(np.float32, (width,      )),  # prior probabilities of actions
+                'R':        ArrayElement(np.float32, (width,      )),  # rewards for each action
+                'W':        ArrayElement(np.float32, (width,      )),  # total value for each action
+                'N':        ArrayElement(np.int32,   (width,      )),  # visit count for each action
+                'mask':     ArrayElement(np.bool_,   (width,      )),  # mask of valid actions
+                'children': ArrayElement(np.int32,   (width,      )),  # offsets of child nodes in the shared memory
             })
             const_vl = vl_constant  # constant virtual loss to apply during rollouts
+        
+        return SharedNode
 
-        return Node
-
-    def __init__(self, shm, offset):
-        super().__init__(shm, offset)
+    def __init__(self, shm, offset, parent=None, action=None):
+        BlockLayout.__init__(self, shm, offset)
+        if parent is not None and action is not None:
+            self.set_parent(parent, action)
         self._parent = None
-
-    def expand(self, prior):
-        self.prior = prior
-        self.header[self.__class__.hdr_expanded] = True
-
-    def select(self, action_id):
-        """Increment W by const_vl and N by 1 for the given action_id."""
-        logger.debug('%s.select called with action_id %s.', repr(self), action_id)
-        self.W[action_id] += self.const_vl
-        self.N[action_id] += 1
+    
+    # ---------------------
+    # SHM-specific methods
+    # ---------------------
+    def select(self, action_id:int) -> int:
+        """Set the visitor flag for the current process and return the child offset."""
+        logger.debug('%s.select called with action_id %s. from proc. %d', repr(self), action_id, _local_id)
+        assert _local_id is not None, "select() can only be called from a worker process. make sure to set _local_id before calling this method."
+        
+        self.visitors[action_id, _local_id] = True
+        
         child_offset = self.children[action_id]
-        if child_offset == -1:
-            logger.debug('%s.select: child offset is -1, returning None.', repr(self))
-            return None
-        return self.__class__(self.shm, child_offset)
+        return child_offset
 
-    def deselect(self, action_id, reward=0.0):
+    def deselect(self, action_id:int, recursive:bool=False) -> int:
         """Inverse operation of select."""
-        logger.debug('%s.deselect called with action_id %s and reward %s.', repr(self), action_id, reward)
-        self.W[action_id] += -self.const_vl + reward
-        self.N[action_id] -= 1
-    def visit_child(self, action_id, value):
-        """W = W - const_vl + value; N = N - 1 + 1 for the given action_id."""
-        logger.debug('%s.visit_child called with action_id %s and value %s.', repr(self), action_id, value)
-        self.W[action_id] += -self.const_vl + value
-        # N = N - 1 + 1 -> N = N, so this is a no-op
-    def update_child(self, action_id, value):
-        """Update the child without touching the virtual loss."""
-        logger.debug('%s.update_child called with action_id %s and value %s.', repr(self), action_id, value)
-        self.W[action_id] += value
-        self.N[action_id] += 1
-
+        logger.debug('%s.deselect called with action_id %s.', repr(self), action_id)
+        self.visitors[action_id, _local_id] = False
+        if recursive and not self.is_root():
+            self.parent.deselect(self.action_id, recursive=True)
+        return self.parent_offset
+    
     def is_consistent(self):
         logger.debug('%s.is_consistent called.', repr(self))
         if self.is_root:
             return True
         return self.parent.children[self.action_id] == self.offset
-
-    @property
-    def children_values(self):
-        """To be called during search for selecting children. considers the virtual loss."""
-        logger.debug('%s.children_values called.', repr(self))
-        return np.where(
-            self.mask & (self.N != 0),
-            np.divide(self.W, self.N),
-            0.0
-        )
-
-    @property
-    def children_visits(self):
-        """To be called during search for selecting children. considers the virtual loss."""
-        logger.debug('%s.children_visits called.', repr(self))
-        return self.N
-
-    @property
-    def children_priors(self):
-        """To be called during search for selecting children. considers the virtual loss."""
-        logger.debug('%s.children_priors called.', repr(self))
-        return self.prior
-
-    @property
-    def action_mask(self):
-        """To be called during search for selecting children. considers the virtual loss."""
-        logger.debug('%s.action_mask called.', repr(self))
-        return self.mask
-
-    @property
-    def value(self):
-        """To be called during backprop, ignores the virtual loss."""
-        assert False, '%s.value called.' % (repr(self),)
-        parent = self.parent # instantiate once
-        return (
-            parent.W[self.action_id] / parent.N[self.action_id]
-            ) if parent.N[self.action_id] > 0 else 0.0
-    @property
-    def visit_count(self):
-        """To be called during backprop, ignores the virtual loss."""
-        logger.debug('%s.visit_count called', repr(self))
-        if self.is_root:
-            return np.sum(self.N)
-        return self.parent.N[self.action_id]
+    
     @property
     def parent_offset(self): return self.header[self.__class__.hdr_parent]
     @property
     def action_id(self):     return self.header[self.__class__.hdr_action]
-    @property
-    def expanded(self):      return self.header[self.__class__.hdr_expanded] != 0
-    @property
-    def terminal(self):      return self.header[self.__class__.hdr_terminal] != 0
-    def set_terminal(self, terminal): self.header[self.__class__.hdr_terminal] = terminal
-    @property
-    def is_root(self):       return self.header[self.__class__.hdr_parent] == -1
 
+    # -----------------------------
+    # NodeBase interface overrides
+    # -----------------------------
+    
+    def expand(self, prior):
+        self.prior[...] = prior
+        self.header[self.__class__.hdr_expanded] = True
+    
+    # NOTE: we don't deselect the action in backup_value.
+    # it is expected that backup_reward is called first.
+    
+    def backup_reward(self, action: types.Action, reward: float, discount: float, trajectory: Optional[List['NodeBase']] = []):
+        """Backup reward and also deselect."""
+        self.deselect(action)
+        return super().backup_reward(action, reward, discount, trajectory)
+    
+    @property
+    def children_values(self) -> np.ndarray:
+        vl_counts = self.visitors.sum(axis=1)
+        Nr_vl = self.Nr + vl_counts
+        values_r = np.divide(self.R + self.const_vl * vl_counts, Nr_vl, self.zeros, where=Nr_vl != 0)
+        values_w = np.divide(self.W, self.Nw, self.zeros, where=self.Nw != 0)
+        return (1 - self._lam) * values_r + self._lam * values_w
+    
+    @property
+    def children_visits(self) -> np.ndarray:
+        return self.Nr + self.visitors.sum(axis=1)
+    
+    @property
+    def parent(self) -> 'SharedNodeBase':
+        if self.is_root(): return None
+        if self._parent is None:  # lazy load the parent node
+            self._parent = self.__class__(self.shm, self.parent_offset)
+        return self._get_parent()
+    @property
+    def action(self) -> types.Action:
+        if self.is_root(): return None
+        return self.header[self.__class__.hdr_action]
+    @property
+    def expanded(self) -> bool: return self.header[self.__class__.hdr_expanded] != 0
+    @property
+    def terminal(self) -> bool: return self.header[self.__class__.hdr_terminal] != 0
+    
+    def is_root(self) -> bool:
+        """Check if this node is the root node."""
+        return self.header[self.__class__.hdr_parent] == -1
+    
+    def set_child(self, action: types.Action, child: 'SharedNodeBase'):
+        self.children[action] = child.offset
+    
     def set_root(self):
         """Set this node as the root node."""
         self.header[self.__class__.hdr_parent] = -1
         self.header[self.__class__.hdr_action] = -1
-        self._parent = None # make sure parent is not incorrectly set.
-
-    def _get_parent(self):
-        if self.is_root:
-            return None
-        if self._parent is None: self._parent = self.__class__(self.shm, self.parent_offset)
-        return self._parent
-
-    def set_parent(self, parent_offset, action):
-        self.header[self.__class__.hdr_parent] = parent_offset
+        self._parent = None
+    
+    def set_parent(self, parent:'SharedNodeBase', action: types.Action):
+        self.header[self.__class__.hdr_parent] = parent.offset
         self.header[self.__class__.hdr_action] = action
-        self._parent = None # make sure parent is not incorrectly set.
-        logger.debug('%s.set_parent parent_offset %s action %s.', repr(self), parent_offset, action)
+        self._parent = parent
+    
+    def set_terminal(self, terminal): self.header[self.__class__.hdr_terminal] = terminal
 
-    @property
-    def parent(self) -> 'NodeBase':
-        assert not self.is_root, "Root has no parent."
-        return self._get_parent()
-
-    def set_child(self, action_id, child_offset):
-        """Set the child offset for the given action_id."""
-        logger.debug('%s.set_child action_id %s child_offset %s. current child offset: %s', repr(self), action_id, child_offset, self.children[action_id])
-        self.children[action_id] = child_offset
-
-    def set_legal_actions(self, legal_actions):
-        self.mask[:] = legal_actions
-
-    def set_prior(self, prior):
-        self.prior[:] = prior
-
-    def set_reward(self, reward):
-        logger.debug('%s.set_reward called with reward %s.', repr(self), reward)
-        self.parent.R[self.action_id] = reward
-
+    def get_visit_count(self, action: Optional[types.Action]=None) -> int:
+        if action is None: self.Nr.sum() + self.visitors.sum()
+        return self.Nr[action] + self.visitors[action].sum()
+    def get_reward(self, action: types.Action) -> float:
+        if self.is_root(): return 0.0
+        Nr_vl = self.Nr[action] + self.visitors[action].sum()
+        if Nr_vl == 0: return 0.0
+        return self.R[action] + self.const_vl * self.visitors[action].sum() / Nr_vl
+    
     def __repr__(self):
         return f'{self.__class__.__name__}(offset={self.offset}, action_id={self.action_id})'
 
@@ -223,7 +210,7 @@ class SharedTreeHeaderBase(BlockLayout):
 
 class TreeFull(Exception): pass
 
-class SharedTree(TreeBase, BaseMemoryManager):
+class APV_MCTS(MCTSBase, BaseMemoryManager):
     """
     Shared Memory which stores a tree structure.
 
@@ -242,7 +229,7 @@ class SharedTree(TreeBase, BaseMemoryManager):
         self.num_nodes = num_nodes
         self.num_blocks = self.num_nodes * 2 # double the size so we can also retain the tree from earlier searches.
         self._header_cls = SharedTreeHeaderBase.define(length=self.num_blocks)
-        self._node_cls = NodeBase.define(
+        self._node_cls = SharedNodeBase.define(
             width=node_width,  # number of actions in the environment
             vl_constant=vl_constant  # constant virtual loss to apply during rollouts
         )
@@ -335,7 +322,7 @@ class SharedTree(TreeBase, BaseMemoryManager):
                 self._node_cls(self._data_shm, offset).children[...] = -1  # mark all children as uninitialized
         
         if new_root is None:
-            root: NodeBase = self.get_root() # node at offset 0
+            root: SharedNodeBase = self.get_root() # node at offset 0
             available_mask[self.off2i(root.offset)] = False  # root is never available for writing.
         # set the root node's header
         root.set_root()
@@ -391,7 +378,7 @@ class SharedTree(TreeBase, BaseMemoryManager):
         """We successfully wrote to the block, we can find the next block."""
         self._local_write_head = self._update_index()
 
-    def append_child(self, parent: NodeBase, action: int) -> Optional[NodeBase]:
+    def append_child(self, parent: SharedNodeBase, action: int) -> Optional[SharedNodeBase]:
         """
         Attempt to append a child node to the parent node by
         first writing the offset corresponding to the
@@ -425,7 +412,7 @@ class SharedTree(TreeBase, BaseMemoryManager):
         parent.set_child(action, child_offset)
         logger.debug('SharedTree.append_child: parent %s children[%d] set to %d.', repr(parent), action, child_offset)
         # now write the parent offset and action id to the child node's header
-        child: NodeBase = self._node_cls(self._data_shm, child_offset)
+        child: SharedNodeBase = self._node_cls(self._data_shm, child_offset)
         child.set_parent(parent.offset, action)
         # now check if the write was successful
         if parent.children[action] == child_offset:
@@ -446,7 +433,7 @@ class SharedTree(TreeBase, BaseMemoryManager):
             raise ValueError(f"Offset {offset} is not a multiple of node size {self._node_size}.")
         return offset // self._node_size
 
-    def get_node(self, index) -> NodeBase:
+    def get_node(self, index) -> SharedNodeBase:
         """Return the root node, at offset 0."""
         if index == 0:
             return self.get_root()
@@ -455,7 +442,7 @@ class SharedTree(TreeBase, BaseMemoryManager):
     def get_root(self):
         return self._node_cls(self._data_shm, self.header.root_offset.item())
 
-    def get_by_offset(self, offset: int) -> NodeBase:
+    def get_by_offset(self, offset: int) -> SharedNodeBase:
         return self._node_cls(self._data_shm, offset)
 
     def is_full(self) -> bool:
@@ -465,28 +452,4 @@ class SharedTree(TreeBase, BaseMemoryManager):
         """
         return self.header.index.peek() >= self.num_nodes
 
-class SharedTreeFactory:
-    """
-    Factory pattern for creating SharedTree instances.
-    """
-    def __init__(self,
-        num_nodes,
-        width,
-        vl_const,
-        name,
-    ):
-        self._num_nodes = num_nodes
-        self._width = width
-        self._vl_const = vl_const
-        self._name = name
-    def __call__(self) -> SharedTree:
-        """
-        Create an instance of the shared tree.
-        """
-        return SharedTree(
-            num_nodes=self._num_nodes,
-            node_width=self._width,
-            vl_constant=self._vl_const,
-            name=self._name
-        )
 
