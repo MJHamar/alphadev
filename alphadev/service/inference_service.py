@@ -239,3 +239,38 @@ class InferenceFactory:
             factory_kwargs=self._network_factory_kwargs,
             name=label or self._name
         )
+
+class InferenceNetworkFactory:
+    """Callable which creates a network, its variables, and connects to a variable service.
+    Calling this method will return a callable which updates the variables in the network and 
+    runs inference on the network.
+    """
+    def __init__(self, network_factory: NetworkFactory, input_spec, variable_service: VariableService, variable_update_period: int = 100):
+        self._network_factory = network_factory
+        self._input_spec = input_spec
+        self._variable_service = variable_service
+        self._variable_update_period = variable_update_period
+    
+    def __call__(self, *args, **kwargs) -> Callable:
+        """Create a network and return a callable which updates the variables and runs inference."""
+        network = self._network_factory(*args, **kwargs)
+        tf2_utils.create_variables(network, [self._input_spec]) 
+        if self._variable_service is None:
+            variable_client = None
+        else:
+            variable_client = tf2_variable_utils.VariableClient(
+                client=self._variable_service,
+                variables={'network': network.trainable_variables},
+                update_period=100,
+            )
+        compiled_network = tf.function(network)
+        
+        def inference(observation):
+            if variable_client is not None:
+                # update the variables in the network
+                variable_client.update(wait=False)
+            # ensure batch dimension
+            observation = tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation)
+            return compiled_network(observation)
+        
+        return inference

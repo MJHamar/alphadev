@@ -484,6 +484,41 @@ def deploy_service(executable: callable, device_config:Dict[str, str] = None, la
         handles.append((new_label, proc, fl))
     return handles
 
+def terminate_services(handles) -> int:
+    base_logger.info('Start monitoring services for termination...')
+    while True:
+        for name, proc, _ in handles:
+            proc: subprocess.Popen = proc
+            rc = proc.poll()
+            if rc is None:
+                # base_logger.info('Service %s is still running', name)
+                continue
+            else:
+                base_logger.info('Service %s has stopped with exit code %s', name, rc)
+                proc.wait()
+                break
+        else:
+            sleep(1)
+            continue
+        break
+    base_logger.info('A service has stopped, stopping all services')
+    for name, proc, _ in handles:
+        proc: subprocess.Popen = proc
+        base_logger.info('Stopping service %s', name)
+        proc.send_signal(signal.SIGINT)
+    while any(proc.poll() is None for _, proc, _ in handles):
+        base_logger.info('Waiting for all services to stop...')
+        sleep(1)
+    
+    # also remove the binaries
+    for _, _, fl in handles:
+        fl: NamedTemporaryFile = fl
+        if os.path.exists(fl.name):
+            base_logger.info('Removing temporary process binary %s', fl.name)
+            fl.close()
+            fl.unlink()
+    return len(handles)
+
 class Program(object):
     """
     Program class that manages the services and returns their handles.
@@ -524,40 +559,8 @@ class Program(object):
         """
         Stop all the services in the program.
         """
-        base_logger.info('Start monitoring services for termination...')
-        while True:
-            for name, proc, _ in self._service_processes:
-                proc: subprocess.Popen = proc
-                rc = proc.poll()
-                if rc is None:
-                    # base_logger.info('Service %s is still running', name)
-                    continue
-                else:
-                    base_logger.info('Service %s has stopped with exit code %s', name, rc)
-                    proc.wait()
-                    break
-            else:
-                sleep(1)
-                continue
-            break
-        base_logger.info('A service has stopped, stopping all services')
-        for name, proc, _ in self._service_processes:
-            proc: subprocess.Popen = proc
-            base_logger.info('Stopping service %s', name)
-            proc.send_signal(signal.SIGINT)
-        while any(proc.poll() is None for _, proc, _ in self._service_processes):
-            base_logger.info('Waiting for all services to stop...')
-            sleep(1)
-        
-        # also remove the binaries
-        for _, _, fl in self._service_processes:
-            fl: NamedTemporaryFile = fl
-            if os.path.exists(fl.name):
-                base_logger.info('Removing temporary process binary %s', fl.name)
-                fl.close()
-                fl.unlink()
-        
-        base_logger.info('All services stopped')
+        num_closed = terminate_services(self._service_processes)
+        base_logger.info('Stopped %d services', num_closed)
         self._services.clear()
     
     @contextlib.contextmanager
