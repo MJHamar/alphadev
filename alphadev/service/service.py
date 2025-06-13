@@ -451,6 +451,39 @@ class ReverbService(Service):
     def create_handle(self):
         return reverb.Client(f'localhost:{self._port}')
 
+def deploy_service(executable: callable, device_config:Dict[str, str] = None, label: str = "", num_instances: int = 1):
+    """
+    Deploy a service by spawning a new process that runs the executable.
+    Done using the subprocess module and the `process_entry.py` script as the entry point.
+    
+    Args:
+        executable: The callable to run in the new process.
+        device_config: A dictionary containing the device configuration for the service.
+            It should contain 'gpu' and 'memory' keys.
+        label: A label for the service, used to identify it in logs.
+        num_instances: The number of instances of the service to run.
+    Returns:
+        A list of handles for the deployed services and corresponding temporary files.
+    """
+    handles = []
+    for i in range(num_instances):
+        new_label = f'{label}_{i}' if label else f'service_{i}'
+        fl = NamedTemporaryFile(prefix=f'service_{new_label}_', suffix='.pkl', delete=False)
+        cloudpickle.dump(executable, fl)
+        fl.flush()
+        args = ['--label', new_label]
+        if device_config is not None:
+            args += ['--device_name', device_config['gpu'], '--allocation_size', str(device_config['memory'])]
+        base_logger.info('Launching service: %s', new_label)
+        proc = subprocess.Popen([
+            sys.executable,
+            '-m', 'alphadev.service.process_entry',
+            fl.name,
+            *args
+        ])
+        handles.append((new_label, proc, fl))
+    return handles
+
 class Program(object):
     """
     Program class that manages the services and returns their handles.
@@ -482,22 +515,9 @@ class Program(object):
         self._service_processes = []
         for name, service, device_config in self._services:
             base_logger.info('Configuring service %s', name)
-            with NamedTemporaryFile(prefix=f'service_{name}_', suffix='.pkl', delete=False) as fl:
-                cloudpickle.dump(service.run, fl)
-                args = ['--label', name]
-                if device_config is not None:
-                    args += ['--device_name', device_config['gpu'], '--allocation_size', str(device_config['memory'])]
-                fl.flush()
-                base_logger.info('Launching service: %s', name)
-                proc = subprocess.Popen([
-                    sys.executable,
-                    '-m', 'alphadev.service.process_entry',
-                    fl.name,
-                    *args
-                ])
-                # wait a second to ensure the file is not deleted prematurely
-                self._service_processes.append((name, proc))
-                sleep(1)
+            handles = deploy_service(service.run, device_config=device_config, label=name)
+            self._service_processes.extend(handles)
+            base_logger.info('Service %s launched with PID %s', name, handles[0][1].pid)
         base_logger.info('All services launched.')
     
     def stop(self):
@@ -506,7 +526,7 @@ class Program(object):
         """
         base_logger.info('Start monitoring services for termination...')
         while True:
-            for name, proc in self._service_processes:
+            for name, proc, _ in self._service_processes:
                 proc: subprocess.Popen = proc
                 rc = proc.poll()
                 if rc is None:
@@ -521,13 +541,21 @@ class Program(object):
                 continue
             break
         base_logger.info('A service has stopped, stopping all services')
-        for name, proc in self._service_processes:
+        for name, proc, _ in self._service_processes:
             proc: subprocess.Popen = proc
             base_logger.info('Stopping service %s', name)
             proc.send_signal(signal.SIGINT)
-        while any(proc.poll() is None for _, proc in self._service_processes):
+        while any(proc.poll() is None for _, proc, _ in self._service_processes):
             base_logger.info('Waiting for all services to stop...')
             sleep(1)
+        
+        # also remove the binaries
+        for _, _, fl in self._service_processes:
+            fl: NamedTemporaryFile = fl
+            if os.path.exists(fl.name):
+                base_logger.info('Removing temporary process binary %s', fl.name)
+                fl.close()
+                fl.unlink()
         
         base_logger.info('All services stopped')
         self._services.clear()
