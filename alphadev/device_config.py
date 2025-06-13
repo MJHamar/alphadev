@@ -26,6 +26,7 @@ class DeviceAllocationConfig:
     """
     ACTOR_PROCESS = 'actor'
     LEARNER_PROCESS = 'learner'
+    APV_WORKER_PROCESS = 'apv_worker'
     
     def __init__(self, config: AlphaDevConfig):
         self.config = config
@@ -34,7 +35,7 @@ class DeviceAllocationConfig:
         self.gpus = tf.config.list_physical_devices('GPU')
         # determine the network size in a new process so that we don't interfere with the main process
         self.device_allocations = self.compute_device_allocations()
-        
+    
     @staticmethod
     def make_process_key(process_type: str, index: int = 0) -> str:
         return f"{process_type}_{index}"
