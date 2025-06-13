@@ -51,7 +51,6 @@ logger.setLevel(logging.DEBUG)
 
 class MCTSActor(acmeMCTSActor):
     """Executes a policy- and value-network guided MCTS search."""
-    _st_node = Node # node implementation for single-threaded MCTS.
     def __init__(
         self,
         environment_spec: specs.EnvironmentSpec,

@@ -271,6 +271,8 @@ class InferenceNetworkFactory:
                 variable_client.update(wait=False)
             # ensure batch dimension
             observation = tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation)
-            return compiled_network(observation)
+            outputs = compiled_network(observation)
+            # outputs is assumed to be a tuple of (prior, value, [other outputs])
+            return outputs[0], outputs[1]  # return prior and value
         
         return inference
