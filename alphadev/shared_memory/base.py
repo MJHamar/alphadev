@@ -120,11 +120,15 @@ class BlockLayout:
         self.shm = shm
         self.offset = offset
         self._create_elements(*args, **kwargs)
-        assert all(
-            hasattr(self, name) for name in self.__class__._required_attributes
-        ), f"BlockLayout {self.__class__.__name__} is missing required elements: {self.__class__._required_attributes}"
+        is_fine = True
+        for attr in self._required_attributes:
+            if not hasattr(self, attr):
+                logger.error(f"BlockLayout {self.__class__.__name__} is missing required attribute: {attr}")
+                is_fine = False
+        if not is_fine:
+            raise ValueError(f"BlockLayout {self.__class__.__name__} is not properly defined. Missing required attributes: {self._required_attributes}")
     
-    class jit_element:
+    class _lazy_element:
         """
         Construct the element just in time and cache it.
         Function, so it needs to be called.
@@ -134,7 +138,7 @@ class BlockLayout:
             self.shm = shm; self.offset = offset
             self.args = args; self.kwargs = kwargs
             self._data = None
-        def __call__(self):
+        def get(self):
             if self._data is None:
                 self._data = self.element_spec.create(self.shm, self.offset, *self.args, **self.kwargs)
             return self._data
@@ -142,7 +146,8 @@ class BlockLayout:
     def _create_elements(self, *args, **kwargs):
         crnt_offset = self.offset or 0
         for name, element_spec in self.__class__._elements.items():
-            self.jit_element(name, element_spec, self.shm, crnt_offset, *args, **kwargs)
+            lazy_element = self._lazy_element(name, element_spec, self.shm, crnt_offset, *args, **kwargs)
+            setattr(self, name, property(lazy_element.get))
             crnt_offset += element_spec.size(*args, **kwargs)
     
     def write(self, **kwargs):
