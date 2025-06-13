@@ -13,6 +13,11 @@ import numpy as np
 
 from tqdm import tqdm
 
+import logging
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
 class NodeBase:
     """Locally stored MCTS node. uses lazy evaluation."""
     __annotations__ = {
@@ -43,8 +48,8 @@ class NodeBase:
     ):
         self._parent = parent
         self._action = action
-        self._expanded = False
-        self._terminal = False
+        self._expanded = np.array(False, dtype=np.bool_)
+        self._terminal = np.array(False, dtype=np.bool_)
         self._children = defaultdict(lambda: None)  # lazy evaluation of children.
         self._prior = None
         self._W = None
@@ -54,7 +59,7 @@ class NodeBase:
         self._mask = None
     
     def expand(self, prior: np.ndarray):
-        self._expanded = True
+        self._expanded[...] = True
         self._prior = prior
     
     def backup_value(self, action:types.Action, value: float, discount: float = 1.0, trajectory: Optional[List['NodeBase']] = []):
@@ -75,14 +80,16 @@ class NodeBase:
         Recursively set the reward for this node and its parents.
         trajectory can be provided to avoid having to re-create the path.
         """
+        logger.debug(f"Backing up reward {reward} for action {action} in node {self}.")
         if len(trajectory) == 0:
             parent = self.parent
         else:
             parent = trajectory.pop()
+        logger.debug(f"action: {action}, type: {type(action)}")
         self.R[action] += reward
         self.Nr[action] += 1
         if parent is not None:
-            parent.backup_reward(reward*discount, discount, self.action, trajectory)
+            parent.backup_reward(self.action, reward*discount, discount, trajectory)
     
     @property
     def zeros(self):
@@ -115,7 +122,7 @@ class NodeBase:
     def terminal(self):    return self._terminal
     @property
     def visit_count(self):
-        # parent's action is None.
+        if self.parent is None: return np.sum(self.Nr)
         return self.parent.get_visit_count(self._action)
     @property
     def reward(self) -> float:
@@ -178,13 +185,14 @@ class NodeBase:
         self.terminal[...] = terminal
     
     def get_visit_count(self, action: Optional[types.Action]=None) -> int:
-        if action is None: 
-            return np.sum(self.Nr)
+        logger.debug(f"Getting visit count for action: {action} in node: {self}.")
         return self.Nr[action]
     def get_reward(self, action: Optional[types.Action]=None) -> float:
         if self.is_root(): return 0.0
         return self.R[action] / self.Nr[action] if self.Nr[action] > 0 else 0.0
 
+    def __repr__(self):
+        return f"{'Root' if self.is_root() else 'Node'}(action={self.action}, ex={self.expanded}, term={self.terminal})"
 
 class MCTSBase:
     """Base class for MCTS algorithms."""
@@ -260,12 +268,13 @@ class MCTSBase:
             new_root.set_legal_actions(legal_actions)
         
         # 5. return the root node.
+        logger.debug(f"Initialized MCTS tree with root node: {new_root}.")
         return new_root
     
     def rollout(self, root:NodeBase) -> None:
         trajectory, actions = self.in_tree(root)
         # 3. simulate the trajectory.
-        node, timestep = self.simulate(root, trajectory, actions)
+        node, timestep = self.simulate(trajectory[-1], trajectory[:-2], actions)
         # 4. evaluate (and expand) the node.
         _, value = self.evaluate(node, timestep)
         # 5. backup the value to the trajectory.
@@ -276,6 +285,7 @@ class MCTSBase:
     def in_tree(self, node: NodeBase) -> Tuple[List[NodeBase], List[types.Action]]:
         """Run the in-tree phase of MCTS and return the trajectory and actions."""
         # Start a new simulation from the top.
+        logger.debug(f"Starting in-tree search from node: {node}.")
         trajectory = [node]
         actions = []
         while node.expanded:
@@ -284,10 +294,11 @@ class MCTSBase:
             node = self.select_child(node, action)
             trajectory.append(node)
             actions.append(action)
+        logger.debug(f"Selected actions: {actions} with trajectory: {trajectory}.")
         # Return the trajectory and actions.
         return trajectory, actions
 
-    def simulate(self, node: NodeBase, actions: List[types.Action])-> Tuple[NodeBase, types.Observation]:
+    def simulate(self, node: NodeBase, ancestors: List[NodeBase], actions: List[types.Action])-> Tuple[NodeBase, types.Observation]:
         # Replay the simulator until the current node and expand it.
         timestep = self.model.step(actions)
         # depending on the model the reward might contain additional dimensions
@@ -298,7 +309,7 @@ class MCTSBase:
             node.set_legal_actions(legal_actions)
         node.set_terminal(terminal)
         # backup nr.1: backup the observed reward
-        node.parent.backup_reward(actions[-1], reward, self.discount, trajectory=actions[:-1])
+        node.parent.backup_reward(node.action, reward, self.discount, trajectory=ancestors)
         return node, timestep.observation
     
     def evaluate(self, node: NodeBase, observation: types.Observation) -> Tuple[np.ndarray, float]:
