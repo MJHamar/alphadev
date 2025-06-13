@@ -38,10 +38,11 @@ import tensorflow as tf
 import tree
 
 from .observers import MCTSObserver
-from .search.base import visit_count_policy, mcts, Node
-from .search_v2 import APV_MCTS
+from .search.mcts import MCTSBase, visit_count_policy, NodeBase as Node
+from .search.apv_mcts import APV_MCTS
 from .network import NetworkFactory, make_input_spec
 from .service.variable_service import VariableService
+from .service.inference_service import AlphaDevInferenceClient, InferenceNetworkFactory
 
 import logging
 logger = logging.getLogger(__name__)
@@ -65,10 +66,11 @@ class MCTSActor(acmeMCTSActor):
         # implementation-specific parameters
         use_apv_mcts: bool = False, # whether to use APV MCTS or single-threaded MCTS
         # single-threaded mode
-        network: Optional[snt.Module] = None,
-        variable_client: Optional[Callable] = None,
+        network_factory: Optional[NetworkFactory] = None,
+        variable_service: Optional[VariableService] = None,
+        variable_update_period: int = 100,
         # APV MCTS mode
-        inference_factory: Optional[NetworkFactory] = None,
+        inference_service: Optional[AlphaDevInferenceClient] = None,
         apv_processes_per_pool: Optional[int] = None,
         virtual_loss_const: Optional[float] = None,
         # other
@@ -77,27 +79,29 @@ class MCTSActor(acmeMCTSActor):
         observers: Optional[Sequence[MCTSObserver]] = [],
         name: str = 'mcts_actor',
     ):
-        # check parameters
-        _required_params = (
-            [inference_factory, apv_processes_per_pool, virtual_loss_const]
-            if use_apv_mcts else
-            [network]
-        )
-        assert all(param is not None for param in _required_params), \
-            "If use_apv_mcts is True, inference_factory, apv_processes_per_pool and virtual_loss_const must be provided. " \
-            "If use_apv_mcts is False, network_factory and variable_service must be provided."
+        """
+        Initializes the MCTS actor. The actor performs MCTS search using a policy-value network each time select_action is called.
         
-        # make sure we don't pass the network to the parent class if apv is used.
-        if use_apv_mcts: network = None; variable_client = None
-        
+        There are three supported modes of searching:
+        1. Single-threaded MCTS: Uses a single-threaded MCTS implementation with a network that is passed as an argument.
+            - inference_service is ignored in this case.
+        2. Asynchronous Policy-Value MCTS (APV_MCTS): Performs MCTS rollouts using N=`apv_processes_per_pool` worker processes.
+            there are two modes:
+            - 2.1. 'streamlined' mode: each worker uses its own copy of the network and performs all 4 phases of a rollout.
+            - 2.2. 'alphago' mode: (described in Silver et al. 2016) N-1 workers perform tree search and simulation; a separate inference service 
+                performs the policy and value evaluation. Finally, the N-th worker performs expansion and backup.
+        If use_apv_mcts is False, we use the single-threaded MCTS implementation (mode 1). In this case, `network_factory` and `variable_service` are required and `inference_service` is ignored.
+        Otherwise, if inference_service is not provided, we assume 'streamlined' mode (mode 2.1).
+        finally, if inference_service is provided, we assume 'alphago' mode (mode 2.2). In this case, `network_factory` and `variable_service` is ignored.
+        """
         super().__init__(
             environment_spec=environment_spec,
             model=model,
-            network=network, # NOTE: unused when use_apv_mcts is True
+            network=None, # do not pass the network, we have our own logic.
             discount=discount,
             num_simulations=num_simulations,
             adder=adder,
-            variable_client=variable_client,
+            variable_client=None,
         )
         self.name = name
         
@@ -112,61 +116,145 @@ class MCTSActor(acmeMCTSActor):
         
         self._use_apv_mcts = use_apv_mcts
         
-        if self._use_apv_mcts:
-            print(f"Using APV_MCTS with {apv_processes_per_pool} processes per pool.")
-            self.mcts = APV_MCTS(
-                model=self._model,
-                search_policy=self._search_policy,
-                num_simulations=self._num_simulations,
-                num_actions=self._num_actions,
-                num_actors=apv_processes_per_pool,
-                inference_factory=inference_factory,
-                discount=self._discount,
-                dirichlet_alpha=self._dirichlet_alpha,
-                exploration_fraction=self._exploration_fraction,
-                const_vl=virtual_loss_const,
-                retain_subtree=self._retain_subtree,
-                do_profiling=False,
-                observers=[], # TODO: implement
-                name=f'{self.name}_search',
+        
+        self.last_action = None  # Last action selected by the actor.
+        
+        if not self._use_apv_mcts:
+            self._init_mode1(
+                environment_spec=environment_spec,
+                network_factory=network_factory,
+                variable_service=variable_service,
+                variable_update_period=variable_update_period,
             )
         else:
-            # unify the APIs of the two MCTS implementations.
-            self.mcts = namedtuple('single_threaded_mcts', ['search'])(search=functools.partial(
-                mcts,
-                model=self._model,
-                search_policy=self._search_policy,
-                evaluation=self._forward,
-                num_simulations=self._num_simulations,
-                num_actions=self._num_actions,
-                discount=self._discount,
-                dirichlet_alpha=self._dirichlet_alpha,
-                exploration_fraction=self._exploration_fraction,
-                node_class=self.__class__._st_node,
-            ))
-        self.last_action = None  # Last action selected by the actor.
+            if inference_service is None:
+                # Use APV_MCTS in 'streamlined' mode.
+                self._init_mode2_1(
+                    environment_spec=environment_spec,
+                    network_factory=network_factory,
+                    variable_service=variable_service,
+                    variable_update_period=variable_update_period,
+                    apv_processes_per_pool=apv_processes_per_pool,
+                    virtual_loss_const=virtual_loss_const,
+                )
+            else:
+                # Use APV_MCTS in 'alphago' mode.
+                self._init_mode2_2(
+                    inference_service=inference_service,
+                    apv_processes_per_pool=apv_processes_per_pool,
+                    virtual_loss_const=virtual_loss_const,
+                )
+    
+    def _make_eval_factory(self, network_factory, evnronment_spec, 
+                           variable_service, variable_update_period):
+        return InferenceNetworkFactory(
+            network_factory=network_factory,
+            input_spec=make_input_spec(evnronment_spec.observations),
+            variable_service=variable_service,
+            variable_update_period=variable_update_period,
+        )
+    
+    def _init_mode1(
+        self,
+        environment_spec: specs.EnvironmentSpec,
+        network_factory: NetworkFactory,
+        variable_service: Optional[VariableService] = None,
+        variable_update_period: int = 100,
+    ):
+        # make an evaluation factory, which will instantiate the network, 
+        # initialize its parameters and connect to the variable service.
+        eval_factory = self._make_eval_factory(
+            network_factory=network_factory,
+            evnronment_spec=environment_spec,
+            variable_service=variable_service,
+            variable_update_period=variable_update_period,
+        )
+        # set the model's evaluation function to the evaluation factory.
+        evaluation = eval_factory()
+        # create the MCTS search object.
+        self.mcts = MCTSBase(
+            num_simulations=self._num_simulations,
+            num_actions=self._num_actions,
+            model=self._model,
+            search_policy=self._search_policy,
+            evaluation=evaluation,
+            discount=self._discount,
+            dirichlet_alpha=self._dirichlet_alpha,
+            exploration_fraction=self._exploration_fraction,
+        )
+
+    def _init_mode2_1(self,
+            environment_spec: specs.EnvironmentSpec,
+            network_factory: NetworkFactory,
+            variable_service: Optional[VariableService] = None,
+            variable_update_period: int = 100,
+            apv_processes_per_pool: Optional[int] = None,
+            virtual_loss_const: Optional[float] = None,
+    ):
+        """Initializes the actor in 'streamlined' APV_MCTS mode."""
+        # make an evaluation factory, which will instantiate the network, 
+        # initialize its parameters and connect to the variable service.
+        eval_factory = self._make_eval_factory(
+            network_factory=network_factory,
+            evnronment_spec=environment_spec,
+            variable_service=variable_service,
+            variable_update_period=variable_update_period,
+        )
+        self.mcts = APV_MCTS(
+            num_simulations=self._num_simulations,
+            num_actions=self._num_actions,
+            model=self._model,
+            search_policy=self._search_policy,
+            num_workers= apv_processes_per_pool,
+            inference_server=None,  # no inference server in this mode
+            evaluation_factory=eval_factory,
+            discount=self._discount,
+            dirichlet_alpha=self._dirichlet_alpha,
+            exploration_fraction=self._exploration_fraction,
+            vl_constant=virtual_loss_const,
+            # TODO pass lambda_ to give different weights to reward and value averages
+            name=f'{self.name}_mcts'
+            )
+    
+    def _init_mode2_2(
+        self,
+        inference_service: AlphaDevInferenceClient,
+        apv_processes_per_pool: Optional[int] = None,
+        virtual_loss_const: Optional[float] = None,
+    ):
+        """Initializes the actor in 'alphago' APV_MCTS mode."""
+        # In this mode, we use the inference service to perform policy and value evaluation.
+        # The inference service is expected to be an instance of AlphaDevInferenceClient.
+        if not isinstance(inference_service, AlphaDevInferenceClient):
+            raise ValueError(f"Inference service must be an instance of AlphaDevInferenceClient not {type(inference_service)}.")
+        
+        self.mcts = APV_MCTS(
+            num_simulations=self._num_simulations,
+            num_actions=self._num_actions,
+            model=self._model,
+            search_policy=self._search_policy,
+            num_workers=apv_processes_per_pool,
+            inference_server=inference_service,  # use the inference service for evaluation
+            evaluation_factory=None,  # no evaluation factory in this mode
+            discount=self._discount,
+            dirichlet_alpha=self._dirichlet_alpha,
+            exploration_fraction=self._exploration_fraction,
+            vl_constant=virtual_loss_const,
+            # TODO pass lambda_ to give different weights to reward and value averages
+            name=f'{self.name}_mcts'
+        )
 
     def _forward(
         self, observation: types.Observation) -> Tuple[types.Probs, types.Value]:
         """Performs a forward pass of the policy-value network."""
-        assert not self._use_apv_mcts, "Use APV_MCTS instead of _forward for MCTSActor."
-        # fix over acme implementation: accepts structured observations
-        logits, value = self._network(tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation))
-
-        # Convert to numpy & take softmax.
-        logits = logits.numpy().squeeze(axis=0)
-
-        value = value.numpy().item()
-        probs = special.softmax(logits)
-
-        return probs, value
+        raise RuntimeError("MCTSActor._forward shuld not be called. Use self.evaluation instead.")
 
     def select_action(self, observation: types.Observation) -> types.Action:
         """Computes the agent's policy via MCTS."""
         if self._model.needs_reset:
             self._model.reset(observation)
 
-        root = self.mcts.search(observation=observation, last_action=self.last_action) # TODO: pass last root to keep subtree intact
+        root = self.mcts.search(observation=observation, last_action=self.last_action)
         
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
         if self._counter is None:
@@ -196,5 +284,5 @@ class MCTSActor(acmeMCTSActor):
     
     def update(self, wait: bool = False):
         """Fetches the latest variables from the variable source, if needed."""
-        if self._variable_client and self._variable_client._client.has_variables():
-            self._variable_client.update(wait)
+        # this is a no-op. Either the inference service or the evaluation factory takes care of updating the variables.
+        pass
