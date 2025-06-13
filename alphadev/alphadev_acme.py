@@ -16,7 +16,7 @@ from tinyfive.multi_machine import multi_machine
 from .agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
 
 from .config import AlphaDevConfig
-from .search.base import PUCTSearchPolicy
+from .search.mcts import PUCTSearchPolicy
 from .network import AlphaDevNetwork, NetworkFactory, make_input_spec
 from .environment import AssemblyGame, AssemblyGameModel, EnvironmentFactory, ModelFactory
 from .service.variable_service import VariableService
