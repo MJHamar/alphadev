@@ -144,11 +144,11 @@ class MCTSActor(acmeMCTSActor):
                     virtual_loss_const=virtual_loss_const,
                 )
     
-    def _make_eval_factory(self, network_factory, evnronment_spec, 
+    def _make_eval_factory(self, network_factory, environment_spec, 
                            variable_service, variable_update_period):
         return InferenceNetworkFactory(
             network_factory=network_factory,
-            input_spec=make_input_spec(evnronment_spec.observations),
+            observation_spec=environment_spec.observations,
             variable_service=variable_service,
             variable_update_period=variable_update_period,
         )
@@ -164,7 +164,7 @@ class MCTSActor(acmeMCTSActor):
         # initialize its parameters and connect to the variable service.
         eval_factory = self._make_eval_factory(
             network_factory=network_factory,
-            evnronment_spec=environment_spec,
+            environment_spec=environment_spec,
             variable_service=variable_service,
             variable_update_period=variable_update_period,
         )
@@ -195,7 +195,7 @@ class MCTSActor(acmeMCTSActor):
         # initialize its parameters and connect to the variable service.
         eval_factory = self._make_eval_factory(
             network_factory=network_factory,
-            evnronment_spec=environment_spec,
+            environment_spec=environment_spec,
             variable_service=variable_service,
             variable_update_period=variable_update_period,
         )

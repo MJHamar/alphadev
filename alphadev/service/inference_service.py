@@ -10,7 +10,7 @@ from acme.tf import utils as tf2_utils
 from ..shared_memory.base import BlockLayout, ArrayElement, NestedArrayElement
 from ..shared_memory.buffer import IOBuffer
 from .variable_service import VariableService
-from ..network import NetworkFactory
+from ..network import NetworkFactory, make_input_spec
 from ..device_config import apply_device_config
 from .service import Service
 
@@ -245,16 +245,16 @@ class InferenceNetworkFactory:
     Calling this method will return a callable which updates the variables in the network and 
     runs inference on the network.
     """
-    def __init__(self, network_factory: NetworkFactory, input_spec, variable_service: VariableService, variable_update_period: int = 100):
+    def __init__(self, network_factory: NetworkFactory, observation_spec, variable_service: VariableService, variable_update_period: int = 100):
         self._network_factory = network_factory
-        self._input_spec = input_spec
+        self._observation_spec = observation_spec 
         self._variable_service = variable_service
         self._variable_update_period = variable_update_period
     
     def __call__(self, *args, **kwargs) -> Callable:
         """Create a network and return a callable which updates the variables and runs inference."""
-        network = self._network_factory(*args, **kwargs)
-        tf2_utils.create_variables(network, [self._input_spec]) 
+        network = self._network_factory(make_input_spec(self._observation_spec))
+        tf2_utils.create_variables(network, [self._observation_spec])
         if self._variable_service is None:
             variable_client = None
         else:

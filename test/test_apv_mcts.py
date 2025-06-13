@@ -1,7 +1,8 @@
-from alphadev.search_v2 import APV_MCTS
+from alphadev.search.apv_mcts import APV_MCTS
+from alphadev.service.inference_service import InferenceNetworkFactory
 
 from alphadev.environment import CPUState
-from alphadev.search import PUCTSearchPolicy, visit_count_policy
+from alphadev.search.mcts import PUCTSearchPolicy, visit_count_policy
 from alphadev.config import AlphaDevConfig
 
 from dm_env import TimeStep, StepType
@@ -20,8 +21,8 @@ exploration_fraction = 0.1
 
 def dummy_evaluation_fn(observation):
     """Dummy evaluation function that returns a random prior and value."""
-    prior = np.random.rand(observation['program'].shape[0], ADConfig.task_spec.num_actions)
-    value = np.zeros_like(observation['program_length'], dtype=np.float32)
+    prior = np.random.rand(ADConfig.task_spec.num_actions)
+    value = np.zeros((observation['program_length'].shape[0]), dtype=np.float32)
     return prior, value
 
 def dummy_eval_factory():
@@ -83,19 +84,20 @@ def run_mcts():
         reward=np.zeros((3,), dtype=np.float32),
         discount=1.0
     )
+    
+    # test in streamlined mode.
     mcts = APV_MCTS(
-        model=DummyModel(timestep),
-        search_policy=PUCTSearchPolicy(),
-        network_factory=dummy_eval_factory,
         num_simulations=num_simulations,
         num_actions=ADConfig.task_spec.num_actions,
-        num_actors=ADConfig.num_actors,
+        model=DummyModel(timestep),
+        search_policy=PUCTSearchPolicy(),
+        num_workers=ADConfig.num_actors,
+        inference_server=None,
+        evaluation_factory=dummy_eval_factory,
         discount=1.0,
         dirichlet_alpha=dirichlet_alpha,
         exploration_fraction=exploration_fraction,
-        const_vl=-1.0,
-        retain_subtree=True,
-        batch_size=16,
+        vl_constant=-1.0,
     )
     outer_model = DummyModel(timestep)
     action = None

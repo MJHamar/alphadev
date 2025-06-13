@@ -519,7 +519,6 @@ def terminate_services(handles) -> int:
         if os.path.exists(fl.name):
             base_logger.info('Removing temporary process binary %s', fl.name)
             fl.close()
-            fl.unlink()
     return len(handles)
 
 class Program(object):

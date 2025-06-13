@@ -10,7 +10,7 @@ import atomics
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 class ArrayElement(object):
     def __init__(self, dtype: np.dtype, shape: tuple):
@@ -27,6 +27,9 @@ class ArrayElement(object):
         return self._size
     def create(self, shm=None, offset=None, *args, **kwargs):
         # if shm is None, numpy ignores the offset 
+        self._shm = shm
+        self._offset = offset
+        
         buffer = shm.buf if shm is not None else None
         return np.ndarray(self.shape, dtype=self.dtype, buffer=buffer, offset=offset)
 
@@ -119,36 +122,52 @@ class BlockLayout:
     def __init__(self, shm=None, offset=None, *args, **kwargs):
         self.shm = shm
         self.offset = offset
+        self._lazy_elements = {}
         self._create_elements(*args, **kwargs)
         is_fine = True
         for attr in self._required_attributes:
-            if not hasattr(self, attr):
+            if not hasattr(self, attr) and not attr in self._lazy_elements:
                 logger.error(f"BlockLayout {self.__class__.__name__} is missing required attribute: {attr}")
                 is_fine = False
         if not is_fine:
             raise ValueError(f"BlockLayout {self.__class__.__name__} is not properly defined. Missing required attributes: {self._required_attributes}")
     
-    class _lazy_element:
-        """
-        Construct the element just in time and cache it.
-        Function, so it needs to be called.
-        """
-        def __init__(self, name, element_spec, shm=None, offset=None, *args, **kwargs):
-            self.name = name; self.element_spec = element_spec
-            self.shm = shm; self.offset = offset
-            self.args = args; self.kwargs = kwargs
-            self._data = None
-        def get(self):
-            if self._data is None:
-                self._data = self.element_spec.create(self.shm, self.offset, *self.args, **self.kwargs)
-            return self._data
-    
     def _create_elements(self, *args, **kwargs):
         crnt_offset = self.offset or 0
         for name, element_spec in self.__class__._elements.items():
-            lazy_element = self._lazy_element(name, element_spec, self.shm, crnt_offset, *args, **kwargs)
-            setattr(self, name, property(lazy_element.get))
+            # logger.debug(f"Creating element {name} at offset {crnt_offset} with spec {element_spec}")
+            # Remove existing attribute/property from the instance or its class (including inherited properties)
+            if hasattr(type(self), name):
+                for cls in type(self).mro():
+                    if name in cls.__dict__:
+                        delattr(cls, name)
+                        # logger.debug(f"Removed property {name} from class {cls.__name__}")
+                        break
+            self._lazy_elements[name] = functools.partial(
+                element_spec.create, self.shm, crnt_offset, *args, **kwargs)
+            # logger.debug(f"Set lazy element {name} with spec {element_spec} at offset {crnt_offset}")
             crnt_offset += element_spec.size(*args, **kwargs)
+    
+    def __getattr__(self, name):
+        """
+        Lazy loading of elements. If the element is not found, it will be created.
+        This allows for dynamic creation of elements based on the class definition.
+        """
+        if name in self._lazy_elements:
+            element_spec = self._lazy_elements[name]
+            # logger.debug(f"Accessing element {name} in {self.__class__.__name__}. Element spec: {element_spec}")
+            if isinstance(element_spec, functools.partial):
+                # If the element is an ArrayElement, create it with the current shm and offset
+                created = element_spec()
+                self._lazy_elements[name] = created
+                # logger.debug(f"Created element {name}: {created}")
+                return created
+            return element_spec
+        else:
+            if name in self.__dict__:
+                # If the element is already created, return it
+                return self.__dict__[name]
+            raise AttributeError(f"{self.__class__.__name__} has no element named '{name}'. Available elements: {list(self._lazy_elements.keys())}")
     
     def write(self, **kwargs):
         """

@@ -75,9 +75,10 @@ class SharedNodeBase(NodeBase, BlockLayout):
             _elements.update({
                 'visitors': ArrayElement(np.bool_,   (width, num_workers,)),  # number of visitors to this node
                 'prior':    ArrayElement(np.float32, (width,      )),  # prior probabilities of actions
-                'R':        ArrayElement(np.float32, (width,      )),  # rewards for each action
                 'W':        ArrayElement(np.float32, (width,      )),  # total value for each action
-                'N':        ArrayElement(np.int32,   (width,      )),  # visit count for each action
+                'Nw':       ArrayElement(np.int32,   (width,      )),  # visit count for each action
+                'R':        ArrayElement(np.float32, (width,      )),  # rewards for each action
+                'Nr':       ArrayElement(np.int32,   (width,      )),  # visit count for each action
                 'mask':     ArrayElement(np.bool_,   (width,      )),  # mask of valid actions
                 'children': ArrayElement(np.int32,   (width,      )),  # offsets of child nodes in the shared memory
             })
@@ -392,7 +393,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         assert self._is_main, "reset_tree() should only be called in the main process."
         logger.debug('SharedTree.reset_tree called.')
         # 1. find out which nodes to keep.
-        keep_nodes = np.zeros(self.num_nodes, dtype=np.bool_)
+        keep_nodes = np.zeros(self.num_blocks, dtype=np.bool_)
         if keep_subtree is not None:
             queue = [keep_subtree]; num_kept = 0
             while queue and num_kept < self.num_nodes:
@@ -409,6 +410,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             for node in queue:
                 node.parent.children[node.action_id] = -1
         # 2. clear all other nodes in the shared memory.
+        logger.info('numblocks: %d, num_nodes: %d', self.num_blocks, self.num_nodes)
         for i in range(self.num_blocks):
             if keep_nodes[i]:
                 continue
@@ -423,7 +425,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         available = np.arange(self.num_blocks, dtype=np.int32)[~keep_nodes]
         self.header.available[:] = available
     
-    def run_worker(self, worker_id:int):
+    def run_worker(self, worker_id:int, *args, **kwargs):
         """
         Insertion point for the workers.
         Should be invoked before shared memory objects are created.
@@ -431,6 +433,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         Then, it attaches to the shared memory and
         waits to be signaled to start searching.
         """
+        logger.debug('SharedTree.run_worker: worker %d started. Args: %s, Kwargs: %s', worker_id, args, kwargs)
         # construct the network if needed
         if self.evaluation_factory is not None:
             logger.debug('SharedTree.run_worker: constructing evaluation network for worker %d.', worker_id)
@@ -514,8 +517,9 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         3. wait for the worker processes to finish searching
         4. return the root node of the tree.
         """
-        if not self._is_attached:
-            self.configure() 
+        if self.evaluation is None:
+            # construct the parent process' evaluation network (used for initializing the tree)
+            self.evaluation = self.evaluation_factory()
         # 0. save the current model state
         self.model.save_checkpoint()
         # 1. initialize the tree with the given observation
@@ -530,9 +534,37 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     def rollout(self) -> bool:
         root = self.get_root()
         try:
-            super().rollout(root)
-        except:
+            # 1. search for a leaf node in the tree.
+            # the in_tree phase cannot break otherwise we are doomed.
+            trajectory, actions = self.in_tree(root)
+            # check for race conditions 
+            #  - another process expanded in the meantime or
+            #  - the last node is not consistent with its parent.
+            if trajectory[-1].expanded or not trajectory[-1].is_consistent():
+                self.fail(trajectory=trajectory)
+                return False
+            # 2. simulate the trajectory
+            node, observation = self.simulate(trajectory[-1], actions)
+            if not self.is_consistent(node):
+                self.fail(trajectory=trajectory)
+                return False
+            # 3. evaluate the node
+            _, value = self.evaluate(node, observation)
+            # 4. backup the value and the node
+            self.backup(node, value)
+            self.succeed()
+            return True
+        except TreeFull: # can happen, nothing to do
+            self.fail(trajectory=trajectory)
             return False
+        except Exception as e:
+            logger.exception('SharedTree.phase_1: error during phase 1: %s', e)
+            if len(trajectory) > 0:
+                self.fail(trajectory=trajectory)
+            return False
+        finally:
+            # in either case, reset the model to the root state.
+            self.model.load_checkpoint()
     
     def phase_1(self) -> bool:
         root = self.get_root()
@@ -745,7 +777,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         return self._local_write_head >= self.num_nodes
     
     def allocate_tasks(self):
-        if self.streamlined:
+        if self.inference_server is None:
             # signal all workers to perform rollouts
             self.header.tasks[:] = APV_MCTS._ROLLOUT
         else:
