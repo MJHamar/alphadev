@@ -2,19 +2,24 @@ from typing import Union, Callable, Dict, List, Optional
 import multiprocessing.shared_memory as mp_shm
 from time import time, sleep
 import numpy as np
+import functools
 
 from acme.agents.tf.mcts.search import SearchPolicy
 from acme.agents.tf.mcts import types
 from acme.agents.tf.mcts import models
 
-
-from ..service.inference_service import AlphaDevInferenceClient
+from ..service import service
+from ..service.inference_service import AlphaDevInferenceClient, InferenceNetworkFactory
+from ..device_config import DeviceAllocationConfig, D_CFG
 from ..shared_memory.base import BlockLayout, ArrayElement, AtomicCounterElement, BaseMemoryManager
 from .mcts import MCTSBase, NodeBase
 
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+# process-local variable to keep track of the worker ID
+_local_id = None
 
 class SharedNodeBase(NodeBase, BlockLayout):
     """
@@ -117,7 +122,7 @@ class SharedNodeBase(NodeBase, BlockLayout):
     def parent_offset(self): return self.header[self.__class__.hdr_parent]
     @property
     def action_id(self):     return self.header[self.__class__.hdr_action]
-
+    
     # -----------------------------
     # NodeBase interface overrides
     # -----------------------------
@@ -235,7 +240,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         num_workers: int,
         # inference; is inference_server is provided, evaluation is ignored.
         inference_server: Optional[AlphaDevInferenceClient] = None,
-        evaluation: Optional[types.EvaluationFn] = None,
+        evaluation_factory: Optional[InferenceNetworkFactory] = None, # for constructing a local copy of network
         # MCTSBase optional parameters
         discount: float = 1.,
         dirichlet_alpha: float = 1,
@@ -261,14 +266,17 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self.vl_constant = vl_constant
         self.name = name
         
-        assert inference_server is not None or evaluation is not None, \
-            "Either inference_server or evaluation must be provided."
+        assert inference_server is not None or evaluation_factory is not None, \
+            "Either inference_server or evaluation factory must be provided."
         
-        self.inference_server = inference_server
         if inference_server is not None:
+            self.inference_server = inference_server
             self.evaluation = self._eval_await
+            self.evaluation_factory = None
         else:
-            self.evaluation = evaluation
+            self.inference_server = None
+            self.evaluation_factory = evaluation_factory
+            self.evaluation = None
         
         # declare the shared memory but don't allocate it yet.
         self.num_workers = num_workers
@@ -298,61 +306,27 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self._is_main = False
         self._local_write_head = None
         self._write_head_increment = None
-        
-        # TODO: declare workers and run them.
-        
-        if hasattr(self, '_root'):
-            # we cannot guarantee that the root node is kept up
-            # to date in all worker processes so we load it on-demand.
-            del self._root
-        
+        self._is_attached = False
+        # shared memory objects
+        self._header_shm = None
+        self._data_shm = None
+        # declare workers and run them.
+        global D_CFG
+        self.worker_handles = []
+        worker_device_config = D_CFG.get(
+                DeviceAllocationConfig.make_process_key(DeviceAllocationConfig.APV_WORKER_PROCESS)),
+        worker_calls = [functools.partial(self.run_worker, i) for i in range(self.num_workers)]
+        for call in worker_calls:
+            handle = service.deploy_service(
+                executable=call,
+                device_config=worker_device_config,
+                label=f'{self.name}_worker',
+                num_instances=1,  # each worker is a separate process
+            )
+            self.worker_handles.extend(handle)
+        # initialize the shared memory
+        self.configure()
         logger.debug('SharedTree initialized with %d blocks, node size %d, header size %d, data size %d.', self.num_blocks, self._node_size, self._header_size, self._data_size)
-    
-    def _eval_await(self, observation: types.Observation, node: Optional[SharedNodeBase]=None):
-        """Used only when an inference server is used.
-        Submit a task and wait for the result.
-        Can only be run from the main process
-        """
-        assert self._is_main, "This method can only be called from the main process."
-        offset = node.offset if node is not None else -1
-        self.inference_server.submit(**{
-            'node_offset': offset, 'observation': observation})
-        # wait for the result to be ready
-        with self.inference_server.read_ready() as ready:
-            assert ready.node_offset == offset, "The node offset in the ready object does not match the requested node. The inference server had leftovers."
-            prior = ready.prior
-            value = ready.value.item()
-        return prior, value
-    
-    def configure(self):
-        """To be called by the parent process to allocate shared memory blocks."""
-        self._is_main = True
-        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
-        self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
-
-        self.header = self._header_cls(self._header_shm, 0)
-        with self.header.index() as index_counter:
-            self._local_write_head = index_counter.load() # get the current write head
-
-        self.reset()  # clear the header and input/output blocks
-    
-    def reset(self):
-        """
-        Reset all shared memory blocks to their initial state.
-        Set the children arrays to -1, indicating that they are uninitialized.
-        Same with the root_offset and action in the header.
-        """
-        assert self._is_main, "reset() should only be called in the main process."
-        logger.debug('SharedTree.reset called.')
-        # 1. reset the header's counter and available array.
-        self._header_cls.clear_block(self._header_shm, 0)
-        # 2. clear all nodes that are available for writing.
-        for i in range(self.num_blocks):
-            offset = self.i2off(i)
-            self._node_cls.clear_block(self._data_shm, offset)
-            node = self._node_cls(self._data_shm, offset)
-            node.set_root()  # set the node as the root (mimic the behavior of the superclass)
-            node.children[...] = -1
     
     def init_tree(self, observation: types.Observation, last_action: Optional[int] = None):
         """
@@ -446,14 +420,6 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         available = np.arange(self.num_blocks, dtype=np.int32)[~keep_nodes]
         self.header.available[:] = available
     
-    def attach(self):
-        logger.debug('SharedTree.attach')
-        self._is_main = False; self._is_attached = True
-        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
-        self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)
-
-        self.header = self._header_cls(self._header_shm, 0)
-    
     def run_worker(self, worker_id:int):
         """
         Insertion point for the workers.
@@ -462,6 +428,13 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         Then, it attaches to the shared memory and
         waits to be signaled to start searching.
         """
+        # construct the network if needed
+        if self.evaluation_factory is not None:
+            logger.debug('SharedTree.run_worker: constructing evaluation network for worker %d.', worker_id)
+            self.evaluation = self.evaluation_factory()
+        # set the process-local worker ID
+        global _local_id
+        _local_id = worker_id
         # try to attach to the shared memory
         attached = False
         while not attached:
@@ -587,6 +560,9 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             if len(trajectory) > 0:
                 self.fail(trajectory=trajectory)
             return False
+        finally:
+            # in either case, reset the model to the root state.
+            self.model.load_checkpoint()
     
     def phase_2(self) -> bool:
         # poll for results
@@ -643,16 +619,79 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     # SHM-specific methods
     # ----------------------
     
+    def _eval_await(self, observation: types.Observation, node: Optional[SharedNodeBase]=None):
+        """Used only when an inference server is used.
+        Submit a task and wait for the result.
+        Can only be run from the main process
+        """
+        assert self._is_main, "This method can only be called from the main process."
+        offset = node.offset if node is not None else -1
+        self.inference_server.submit(**{
+            'node_offset': offset, 'observation': observation})
+        # wait for the result to be ready
+        with self.inference_server.read_ready() as ready:
+            assert ready.node_offset == offset, "The node offset in the ready object does not match the requested node. The inference server had leftovers."
+            prior = ready.prior
+            value = ready.value.item()
+        return prior, value
+    
+    def configure(self):
+        """To be called by the parent process to allocate shared memory blocks."""
+        self._is_main = True
+        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
+        self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
+
+        self.header = self._header_cls(self._header_shm, 0)
+        with self.header.index() as index_counter:
+            self._local_write_head = index_counter.load() # get the current write head
+
+        self.reset()  # clear the header and input/output blocks
+    
+    def reset(self):
+        """
+        Reset all shared memory blocks to their initial state.
+        Set the children arrays to -1, indicating that they are uninitialized.
+        Same with the root_offset and action in the header.
+        """
+        assert self._is_main, "reset() should only be called in the main process."
+        logger.debug('SharedTree.reset called.')
+        # 1. reset the header's counter and available array.
+        self._header_cls.clear_block(self._header_shm, 0)
+        # 2. clear all nodes that are available for writing.
+        for i in range(self.num_blocks):
+            offset = self.i2off(i)
+            self._node_cls.clear_block(self._data_shm, offset)
+            node = self._node_cls(self._data_shm, offset)
+            node.set_root()  # set the node as the root (mimic the behavior of the superclass)
+            node.children[...] = -1
+    
+    def attach(self):
+        logger.debug('SharedTree.attach')
+        self._is_main = False; self._is_attached = True
+        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
+        self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)
+
+        self.header = self._header_cls(self._header_shm, 0)
+    
     def __del__(self):
-        logger.debug('SharedTree.__del__ called. is main: %s', self._is_main)
-        del self.header
-        self._header_shm.close()
-        self._data_shm.close()
-        if self._is_main:
-            # only the main process should delete the shared memory
-            self._header_shm.unlink()
-            self._data_shm.unlink()
-            # TODO: also stop and kill the workers.
+        if not self._is_main and self._is_attached:
+            self._header_shm.close()
+            self._data_shm.close()
+        elif self._is_main:
+            # signal worker to exit gracefully
+            self.header.tasks[:] = APV_MCTS._EXIT
+            # terminate the workers
+            service.terminate_services(self.worker_handles)
+            # only the main process should unlink the shared memory
+            try:
+                self._header_shm.unlink()
+            except FileNotFoundError:
+                logger.warning('SharedTree.__del__: shared memory already unlinked.')
+            try:
+                self._data_shm.unlink()
+            except FileNotFoundError:
+                logger.warning('SharedTree.__del__: shared memory already unlinked.')
+        logger.debug('SharedTree.__del__: %s terminated', self.name)
     
     def _update_index(self):
         # increment the write head by the number of workers.
