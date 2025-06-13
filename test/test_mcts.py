@@ -1,4 +1,4 @@
-from alphadev.search import dv_mcts, dyn_puct
+from alphadev.search.mcts import MCTSBase, PUCTSearchPolicy
 from dm_env import TimeStep, StepType
 import numpy as np
 
@@ -30,19 +30,22 @@ class DummyModel:
             reward=np.zeros((3,), dtype=np.float32),
             discount=1.0
         )
+    def legal_actions(self):
+        """Returns a list of legal actions."""
+        return np.ones(num_actions, dtype=np.int32)
 
 def run_mcts():
-    root_node = dv_mcts(
-        observation=observation,
-        model=model,
-        search_policy=dyn_puct,
-        evaluation=evaluation_fn,
+    mcts = MCTSBase(
         num_simulations=num_simulations,
         num_actions=num_actions,
+        model=DummyModel(),
+        evaluation=dummy_evaluation_fn,
+        search_policy=PUCTSearchPolicy(),
+        discount=1.0,
         dirichlet_alpha=dirichet_alpha,
         exploration_fraction=exploration_fraction
     )
-    
+    root_node = mcts.search(observation)
 
 if __name__ == "__main__":
     # Create a dummy model and evaluation function.
