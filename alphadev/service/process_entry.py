@@ -7,6 +7,8 @@ import sys
 from absl import app
 import argparse
 
+import logging
+
 def parse_args():
     """
     Parse command line arguments.
@@ -33,6 +35,12 @@ def parse_args():
 config = parse_args()
 print('arguments parsed:', config)
 print(f"{config.label} starting with executable {config.executable_path}.")
+logger = logging.getLogger(f'proc_{config.label}')
+
+logging.basicConfig(
+    level=logging.INFO,
+)
+
 # configure GPU runtime
 import tensorflow as tf
 if config.device_name is not None:
@@ -43,9 +51,9 @@ if config.device_name is not None:
         config.device_name,
         [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=config.allocation_size)]
     )
-    print(f"{config.label} configured to use device {config.device_name} with allocation size {config.allocation_size} bytes.")
+    logger.info(f"{config.label} configured to use device {config.device_name} with allocation size {config.allocation_size} bytes.")
 else:
-    print(f"{config.label} running without device configuration.")
+    logger.info(f"{config.label} running without device configuration.")
 
 # load the executable
 import cloudpickle
@@ -58,4 +66,4 @@ sys.argv = sys.argv[:1]
 # run the executable
 app.run(executable)
 
-print(f"{config.label} exited.")
+logger.info(f"{config.label} exited.")

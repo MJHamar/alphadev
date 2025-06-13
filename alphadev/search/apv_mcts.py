@@ -312,9 +312,9 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self._data_shm = None
         # declare workers and run them.
         global D_CFG
-        self.worker_handles = []
+        worker_handles = []
         worker_device_config = D_CFG.get(
-                DeviceAllocationConfig.make_process_key(DeviceAllocationConfig.APV_WORKER_PROCESS)),
+                DeviceAllocationConfig.make_process_key(DeviceAllocationConfig.APV_WORKER_PROCESS))
         worker_calls = [functools.partial(self.run_worker, i) for i in range(self.num_workers)]
         for call in worker_calls:
             handle = service.deploy_service(
@@ -323,7 +323,10 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 label=f'{self.name}_worker',
                 num_instances=1,  # each worker is a separate process
             )
-            self.worker_handles.extend(handle)
+            worker_handles.extend(handle)
+            logger.debug('Worker started with handle %s.', handle)
+        # store the worker handles for later use
+        self.worker_handles = worker_handles
         # initialize the shared memory
         self.configure()
         logger.debug('SharedTree initialized with %d blocks, node size %d, header size %d, data size %d.', self.num_blocks, self._node_size, self._header_size, self._data_size)
@@ -637,14 +640,12 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     
     def configure(self):
         """To be called by the parent process to allocate shared memory blocks."""
+        logger.debug('SharedTree.configure called.')
         self._is_main = True
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
-
         self.header = self._header_cls(self._header_shm, 0)
-        with self.header.index() as index_counter:
-            self._local_write_head = index_counter.load() # get the current write head
-
+        
         self.reset()  # clear the header and input/output blocks
     
     def reset(self):

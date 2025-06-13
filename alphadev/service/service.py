@@ -465,11 +465,14 @@ def deploy_service(executable: callable, device_config:Dict[str, str] = None, la
     Returns:
         A list of handles for the deployed services and corresponding temporary files.
     """
+    base_logger.debug('Deploying service with label: %s, device_config %s', label, device_config)
     handles = []
     for i in range(num_instances):
         new_label = f'{label}_{i}' if label else f'service_{i}'
         fl = NamedTemporaryFile(prefix=f'service_{new_label}_', suffix='.pkl', delete=False)
+        base_logger.debug('Creating temporary file for service executable: %s', fl.name)
         cloudpickle.dump(executable, fl)
+        base_logger.debug('Wrote service executable to temporary file: %s', fl.name)
         fl.flush()
         args = ['--label', new_label]
         if device_config is not None:
