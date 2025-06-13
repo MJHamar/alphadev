@@ -52,7 +52,6 @@ class NodeBase:
         self._R = None
         self._Nr = None
         self._mask = None
-        
     
     def expand(self, prior: np.ndarray):
         self._expanded = True
@@ -87,9 +86,7 @@ class NodeBase:
     
     @property
     def zeros(self):
-        if not hasattr(self, '_zeros'):
-            self._zeros = np.zeros(self._width, dtype=np.float32)
-        return self._zeros
+        return np.zeros(self._width, dtype=np.float32)
     
     @property
     def children_values(self) -> np.ndarray:
@@ -118,11 +115,11 @@ class NodeBase:
     def terminal(self):    return self._terminal
     @property
     def visit_count(self):
-        if self.is_root(): return np.sum(self._Nr)
+        # parent's action is None.
         return self.parent.get_visit_count(self._action)
     @property
     def reward(self) -> float:
-        if self.is_root(): return 0.0
+        # parent's action is None.
         return self.parent.get_reward(self._action)
     @property
     def prior(self):
@@ -149,6 +146,11 @@ class NodeBase:
         if self._mask is None: self._mask = np.zeros(self._width, dtype=np.bool_)
         return self._mask
     
+    @property
+    def legal_actions(self) -> np.ndarray:
+        """Return a boolean mask of legal actions."""
+        return self.mask
+    
     def is_root(self) -> bool:
         """Check if this node is the root node."""
         return self._parent is None
@@ -173,22 +175,25 @@ class NodeBase:
         self.mask[...] = legal_actions
     
     def set_terminal(self, terminal: bool):
-        self._terminal = terminal
+        self.terminal[...] = terminal
     
-    def get_visit_count(self, action: types.Action) -> int:
+    def get_visit_count(self, action: Optional[types.Action]=None) -> int:
+        if action is None: 
+            return np.sum(self.Nr)
         return self.Nr[action]
-    def get_reward(self, action: types.Action) -> float:
+    def get_reward(self, action: Optional[types.Action]=None) -> float:
+        if self.is_root(): return 0.0
         return self.R[action] / self.Nr[action] if self.Nr[action] > 0 else 0.0
 
 
 class MCTSBase:
     """Base class for MCTS algorithms."""
     def __init__(self,
+        num_simulations: int,
+        num_actions: int,
         model: models.Model,
         search_policy: SearchPolicy,
         evaluation: types.EvaluationFn,
-        num_simulations: int,
-        num_actions: int,
         discount: float = 1.,
         dirichlet_alpha: float = 1,
         exploration_fraction: float = 0.,
@@ -213,18 +218,10 @@ class MCTSBase:
         root = self.init_tree(observation, last_action)
         # 2. run the search policy for a number of simulations.
         for _ in tqdm(range(self.num_simulations), desc="MCTS Search", leave=False):
-            trajectory, actions = self.in_tree(root)
-            # 3. simulate the trajectory.
-            node, timestep = self.simulate(root, trajectory, actions)
-            # 4. evaluate (and expand) the node.
-            _, value = self.evaluate(node, timestep)
-            # 5. backup the value to the trajectory.
-            self.backup(node, value)
-            # 6. reset the model to the saved state.
-            self.model.load_checkpoint()
+            self.rollout(root)
         # 7. return the root node.
         return root
-
+    
     def init_tree(self,
         observation: types.Observation,
         last_action: Optional[types.Action] = None,
@@ -264,7 +261,18 @@ class MCTSBase:
         
         # 5. return the root node.
         return new_root
-
+    
+    def rollout(self, root:NodeBase) -> None:
+        trajectory, actions = self.in_tree(root)
+        # 3. simulate the trajectory.
+        node, timestep = self.simulate(root, trajectory, actions)
+        # 4. evaluate (and expand) the node.
+        _, value = self.evaluate(node, timestep)
+        # 5. backup the value to the trajectory.
+        self.backup(node, value)
+        # 6. reset the model to the saved state.
+        self.model.load_checkpoint()
+    
     def in_tree(self, node: NodeBase) -> Tuple[List[NodeBase], List[types.Action]]:
         """Run the in-tree phase of MCTS and return the trajectory and actions."""
         # Start a new simulation from the top.
@@ -325,7 +333,7 @@ class MCTSBase:
         assert node.expanded, "NodeBase must be expanded to get a child."
         maybe_child = node.get_child(action)
         if maybe_child is None:
-            child = self.node_cls(parent=node, action=action)
+            child = self._make_node(parent=node, action=action)
             node.set_child(action, child)
             return child
         return maybe_child
@@ -363,7 +371,7 @@ def puct(node: NodeBase, ucb_scaling: float = 1.) -> types.Action:
     # check_numerics(value_scores)
 
     # Policy prior P(s,a).
-    priors = node.P
+    priors = node.prior
     # check_numerics(priors)
 
     # Visit ratios.
@@ -374,7 +382,7 @@ def puct(node: NodeBase, ucb_scaling: float = 1.) -> types.Action:
 
     # Combine.
     puct_scores = value_scores + ucb_scaling * priors * visit_ratios
-    return argmax(puct_scores, node.action_mask)
+    return argmax(puct_scores, node.legal_actions)
 
 argmax_rng = np.random.default_rng(42)  # Ensure we have a random number generator.
 def argmax(values: np.ndarray, mask: np.ndarray) -> types.Action:
