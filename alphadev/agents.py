@@ -49,8 +49,8 @@ from .network import NetworkFactory, make_input_spec
 from .acting import MCTSActor
 from .search.mcts import PUCTSearchPolicy
 from .observers import MCTSObserver
-from .service.service import Program, ReverbService, RPCService, RPCClient
-from .service.inference_service import InferenceFactory, AlphaDevInferenceClient
+from .service.service import Program, ReverbService, RPCService, RPCClient, deploy_service
+from .service.inference_service import InferenceFactory, AlphaDevInferenceClient, AlphaDevInferenceService
 from .config import AlphaDevConfig
 from .device_config import DeviceAllocationConfig
 from .service.variable_service import VariableService
@@ -78,7 +78,7 @@ class MCTS(agent.Agent):
         search_retain_subtree: bool = True,
         use_apv_mcts: bool = False,
         # APV MCTS parameters
-        inference_factory: Optional[InferenceFactory] = None,
+        use_inference_server: bool = False,
         apv_processes_per_pool: Optional[int] = None,
         virtual_loss_const: Optional[float] = None,
         # Other parameters
@@ -116,15 +116,33 @@ class MCTS(agent.Agent):
         dataset = datasets.make_reverb_dataset(server_address=address)
         dataset = dataset.batch(batch_size, drop_remainder=True)
 
+        if not use_apv_mcts or not use_inference_server:
+            inference_client = None
+            self.inference_handle = None
+        elif use_inference_server:
+            inference_service = AlphaDevInferenceService(
+                num_blocks=apv_processes_per_pool*2, # 2x the number of processes.
+                network_factory=network_factory,
+                input_spec=environment_spec.observations,
+                output_spec=environment_spec.actions.shape[0], # num actions
+                variable_service=None,
+                factory_args=([make_input_spec(environment_spec.observations)],), # for the network factory
+            )
+            # run the service
+            inference_client = inference_service.create_handle()
+            self.inference_handle = deploy_service(inference_service.run, device_config=None, label='inference_service')
+        
+        # initialize the network we are training
         network = network_factory(make_input_spec(environment_spec.observations))
         tf2_utils.create_variables(network, [environment_spec.observations])
-
+        # we don't care about variable service here.
+        
         # Now create the agent components: actor & learner.
         self.counter = counting.Counter(None)
         self.logger = logger
-
+        
         mcts_observers = mcts_observers(logger)
-
+        
         actor = MCTSActor(
             environment_spec=environment_spec,
             model=model,
@@ -139,10 +157,10 @@ class MCTS(agent.Agent):
             # NOTE: we do not support APV MCTS in single-threaded agents.
             use_apv_mcts=use_apv_mcts,
             # single-threaded mode
-            network=network_factory if not use_apv_mcts else None,
-            variable_client=None, # no need for variable service in single-threaded mode
+            network_factory=network_factory,
+            variable_service=None, # no need for variable service in single-threaded mode
             # APV MCTS mode
-            inference_factory=inference_factory,
+            inference_service=inference_client,
             apv_processes_per_pool=apv_processes_per_pool,
             virtual_loss_const=virtual_loss_const,
             # other
@@ -178,6 +196,15 @@ class MCTS(agent.Agent):
             observations_per_step=1,# deterministic and fully observable
         )
 
+    def __del__(self):
+        print('Shutting down MCTS agent...')
+        if self.inference_handle is not None:
+            print('Shutting down inference service...')
+            name, proc, fl = self.inference_handle[0]
+            proc.terminate()
+            proc.join()
+            fl.close()
+            fl.unlink()  # remove the temporary file
 
 class DistributedMCTS:
     """Distributed MCTS agent."""

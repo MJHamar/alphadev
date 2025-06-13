@@ -252,7 +252,7 @@ class MCTSActor(acmeMCTSActor):
         """Computes the agent's policy via MCTS."""
         if self._model.needs_reset:
             self._model.reset(observation)
-
+        
         root = self.mcts.search(observation=observation, last_action=self.last_action)
         
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
@@ -269,17 +269,20 @@ class MCTSActor(acmeMCTSActor):
         probs = visit_count_policy(root, temperature=temperature, mask=action_mask)
         assert probs.shape == (self._num_actions,), f"Expected probs shape {(self._num_actions,)}, got {probs.shape}."
         # sample an action from the masked visit count policy
-        self.last_action = np.int32(np.random.choice(self._actions, p=probs))
-
+        action = np.int32(np.random.choice(self._actions, p=probs))
+        
         # Save the policy probs so that we can add them to replay in `observe()`.
         self._probs = probs.astype(np.float32)
-
+        
         for observer in self._observers:
             observer.on_action_selection(
-                node=root, probs=probs, action=self.last_action,
+                node=root, probs=probs, action=action,
                 training_steps=training_steps, temperature=temperature)
-
-        return self.last_action
+        
+        if self._retain_subtree:
+            self.last_action = action
+        
+        return action
     
     def update(self, wait: bool = False):
         """Fetches the latest variables from the variable source, if needed."""
