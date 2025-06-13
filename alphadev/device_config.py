@@ -36,6 +36,23 @@ class DeviceAllocationConfig:
         # determine the network size in a new process so that we don't interfere with the main process
         self.device_allocations = self.compute_device_allocations()
     
+    def get(self, process_type: str, index: int = 0) -> dict:
+        key = self.make_process_key(process_type, index)
+        return self.device_allocations[key] if key in self.device_allocations else None
+    
+    @classmethod
+    def load_empty(cls):
+        cfg = cls.__new__(cls)
+        cfg.device_allocations = {}
+        return cfg
+    
+    @classmethod
+    def load(cls, config_path: str):
+        raise NotImplementedError(
+            "Loading from a file is not implemented yet. "
+            "Please use the constructor to create a new instance."
+        )
+    
     @staticmethod
     def make_process_key(process_type: str, index: int = 0) -> str:
         return f"{process_type}_{index}"
@@ -174,6 +191,8 @@ def apply_device_config(device_allocation: dict):
         device_allocation['gpu'],
         [tf.config.LogicalDeviceConfiguration(memory_limit=device_allocation['memory'])]
     )
+
+D_CFG = DeviceAllocationConfig.load_empty()
 
 def main():
     """
