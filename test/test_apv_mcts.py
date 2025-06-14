@@ -91,7 +91,7 @@ def run_mcts():
         num_actions=ADConfig.task_spec.num_actions,
         model=DummyModel(timestep),
         search_policy=PUCTSearchPolicy(),
-        num_workers=ADConfig.num_actors,
+        num_workers=1,
         inference_server=None,
         evaluation_factory=dummy_eval_factory,
         discount=1.0,

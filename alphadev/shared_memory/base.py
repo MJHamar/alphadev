@@ -163,11 +163,8 @@ class BlockLayout:
                 # logger.debug(f"Created element {name}: {created}")
                 return created
             return element_spec
-        else:
-            if name in self.__dict__:
-                # If the element is already created, return it
-                return self.__dict__[name]
-            raise AttributeError(f"{self.__class__.__name__} has no element named '{name}'. Available elements: {list(self._lazy_elements.keys())}")
+        # If we get here, the attribute doesn't exist anywhere
+        raise AttributeError(f"{self.__class__.__name__} has no element named '{name}'. Available elements: {list(self._lazy_elements.keys())}")
     
     def write(self, **kwargs):
         """

@@ -88,8 +88,11 @@ class NodeBase:
         logger.debug(f"action: {action}, type: {type(action)}")
         self.R[action] += reward
         self.Nr[action] += 1
+        logger.debug(f"Backup; trajectory: {trajectory}, parent: {parent}, node: {self}")
+        # input("stop here to debug")
         if parent is not None:
             parent.backup_reward(self.action, reward*discount, discount, trajectory)
+        
     
     @property
     def zeros(self):
@@ -316,6 +319,7 @@ class MCTSBase:
         # Calculate the bootstrap for leaf nodes.
         if node.terminal:
             # If terminal, there is no bootstrap value.
+            prior = None
             value = 0.
         else:
             # Otherwise, bootstrap from this node with our value function.

@@ -14,12 +14,15 @@ from ..device_config import DeviceAllocationConfig, D_CFG
 from ..shared_memory.base import BlockLayout, ArrayElement, AtomicCounterElement, BaseMemoryManager
 from .mcts import MCTSBase, NodeBase
 
+_local_id = 'main'
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
+logging.basicConfig(
+    format=f'process {_local_id}: %(levelname)s: %(message)s',
+)
 
 # process-local variable to keep track of the worker ID
-_local_id = None
 
 class SharedNodeBase(NodeBase, BlockLayout):
     """
@@ -69,8 +72,11 @@ class SharedNodeBase(NodeBase, BlockLayout):
         Specify the elements of the node class.
         This method should be called in the subclass to define the node's attributes.
         """
-        node_cls = super().define(width=width, lambda_=lambda_)
-        class SharedNode(node_cls):
+        
+        class SharedNode(cls):
+            # NOTE: python's mro kind of breaks here so we can't use super().define() for width and lam
+            _width = width
+            _lam = lambda_
             _elements = cls._elements.copy()
             _elements.update({
                 'visitors': ArrayElement(np.bool_,   (width, num_workers,)),  # number of visitors to this node
@@ -97,7 +103,7 @@ class SharedNodeBase(NodeBase, BlockLayout):
     # ---------------------
     def select(self, action_id:int) -> int:
         """Set the visitor flag for the current process and return the child offset."""
-        logger.debug('%s.select called with action_id %s. from proc. %d', repr(self), action_id, _local_id)
+        # logger.debug('%s.select called with action_id %s. from proc. %d', repr(self), action_id, _local_id)
         assert _local_id is not None, "select() can only be called from a worker process. make sure to set _local_id before calling this method."
         
         self.visitors[action_id, _local_id] = True
@@ -107,14 +113,14 @@ class SharedNodeBase(NodeBase, BlockLayout):
 
     def deselect(self, action_id:int, recursive:bool=False) -> int:
         """Inverse operation of select."""
-        logger.debug('%s.deselect called with action_id %s.', repr(self), action_id)
+        # logger.debug('%s.deselect called with action_id %s.', repr(self), action_id)
         self.visitors[action_id, _local_id] = False
         if recursive and not self.is_root():
             self.parent.deselect(self.action_id, recursive=True)
         return self.parent_offset
     
     def is_consistent(self):
-        logger.debug('%s.is_consistent called.', repr(self))
+        # logger.debug('%s.is_consistent called.', repr(self))
         if self.is_root:
             return True
         return self.parent.children[self.action_id] == self.offset
@@ -154,10 +160,11 @@ class SharedNodeBase(NodeBase, BlockLayout):
     
     @property
     def parent(self) -> 'SharedNodeBase':
+        # logger.debug('%s.parent called.', repr(self))
         if self.is_root(): return None
         if self._parent is None:  # lazy load the parent node
             self._parent = self.__class__(self.shm, self.parent_offset)
-        return self._get_parent()
+        return self._parent
     @property
     def action(self) -> types.Action:
         if self.is_root(): return None
@@ -183,13 +190,20 @@ class SharedNodeBase(NodeBase, BlockLayout):
     def set_parent(self, parent:'SharedNodeBase', action: types.Action):
         self.header[self.__class__.hdr_parent] = parent.offset
         self.header[self.__class__.hdr_action] = action
-        self._parent = parent
     
     def set_terminal(self, terminal): self.header[self.__class__.hdr_terminal] = terminal
 
     def get_visit_count(self, action: Optional[types.Action]=None) -> int:
-        if action is None: self.Nr.sum() + self.visitors.sum()
+        if action is None: return self.Nr.sum() + self.visitors.sum()
         return self.Nr[action] + self.visitors[action].sum()
+    
+    @property
+    def visit_count(self):
+        """Return the visit count of this node."""
+        if self.is_root(): 
+            return np.sum(self.Nr) + np.sum(self.visitors)
+        return self.parent.get_visit_count(self.action_id)
+    
     def get_reward(self, action: types.Action) -> float:
         if self.is_root(): return 0.0
         Nr_vl = self.Nr[action] + self.visitors[action].sum()
@@ -198,6 +212,13 @@ class SharedNodeBase(NodeBase, BlockLayout):
     
     def __repr__(self):
         return f'{self.__class__.__name__}(offset={self.offset}, action_id={self.action_id})'
+    
+    def get_child(self, action: types.Action) -> 'SharedNodeBase':
+        """
+        Get the child node corresponding to the given action.
+        If the child node does not exist, create a new node and return it.
+        """
+        return self.children[action]
 
 class SharedTreeHeaderBase(BlockLayout):
     _required_attributes = ['root_offset', 'available', 'tasks']
@@ -349,19 +370,19 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 new_root = self.get_by_offset(child_offset)
         else: # no last action no tree to keep
             new_root = None
-        logger.debug('SharedTree.init_tree: new root node %s.', repr(new_root))
+        # logger.debug('SharedTree.init_tree: new root node %s.', repr(new_root))
         # 2. reset the tree and its header, optionally keeping the subtree
         self.reset_tree(keep_subtree=new_root)
         logger.debug('SharedTree.init_tree: tree reset, keeping subtree %s.', repr(new_root))
         # 3. create a new root node
         if new_root is None:
             new_root = self._make_node()
-            logger.debug('SharedTree.init_tree: no root node to keep, created %s.', repr(new_root))
+            # logger.debug('SharedTree.init_tree: no root node to keep, created %s.', repr(new_root))
         
         self.set_root(new_root)  # set the new root node
         # 4. initialize the root node with the observation if not done already
         if not new_root.expanded:
-            logger.debug('SharedTree.init_tree: root node %s is not expanded, invoking network')
+            # logger.debug('SharedTree.init_tree: root node %s is not expanded, invoking network')
             prior, _ = self.evaluation(observation)
             assert prior.shape == (self.num_actions,), \
                 f"Expected prior shape ({self.num_actions},) but got {prior.shape}."
@@ -376,7 +397,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         
         # 4. Set legal actions if not already set.
         if not new_root.legal_actions.any():
-            logger.debug('SharedTree.init_tree: root node %s has no legal actions set, getting them from the model.', repr(new_root))
+            # logger.debug('SharedTree.init_tree: root node %s has no legal actions set, getting them from the model.', repr(new_root))
             # 4.1 if the legal actions are not set, we need to get them from the model.
             legal_actions = self.model.legal_actions()
             new_root.set_legal_actions(legal_actions)
@@ -391,7 +412,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         Up to num_nodes nodes are kept in the shared memory.
         """
         assert self._is_main, "reset_tree() should only be called in the main process."
-        logger.debug('SharedTree.reset_tree called.')
+        # logger.debug('SharedTree.reset_tree called.')
         # 1. find out which nodes to keep.
         keep_nodes = np.zeros(self.num_blocks, dtype=np.bool_)
         if keep_subtree is not None:
@@ -405,12 +426,12 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                         child_node = self._node_cls(self._data_shm, child_offset)
                         queue.append(child_node)
                 num_kept += 1
-            logger.debug('SharedTree.reset_tree: keeping %d nodes in the shared memory.', num_kept)
+            # logger.debug('SharedTree.reset_tree: keeping %d nodes in the shared memory.', num_kept)
             # clear the children pointers of the nodes at the end of the retained tree.
             for node in queue:
                 node.parent.children[node.action_id] = -1
         # 2. clear all other nodes in the shared memory.
-        logger.info('numblocks: %d, num_nodes: %d', self.num_blocks, self.num_nodes)
+        # logger.debug('numblocks: %d, num_nodes: %d', self.num_blocks, self.num_nodes)
         for i in range(self.num_blocks):
             if keep_nodes[i]:
                 continue
@@ -419,11 +440,14 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             node = self._node_cls(self._data_shm, offset)
             node.set_root()  # set the node as the root (mimic the behavior of the superclass)
             node.children[...] = -1
-        # 3. reset the header's counter and available array.
+        # 3. always keep the root node.
+        root = self.get_root()
+        keep_nodes[self.off2i(root.offset)] = True
+        # 4. reset the header's counter and available array.
         self._header_cls.clear_block(self._header_shm, 0)
         self.header = self._header_cls(self._header_shm, 0)
         available = np.arange(self.num_blocks, dtype=np.int32)[~keep_nodes]
-        self.header.available[:] = available
+        self.header.available[:available.shape[0]] = available
     
     def run_worker(self, worker_id:int, *args, **kwargs):
         """
@@ -486,7 +510,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             passes = sum([1 for result, _ in stats if result])
             fails = len(stats) - passes
             pass_times = [t for result, t in stats if result]
-            logger.debug('SharedTree._worker_init: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
+            logger.info('SharedTree._worker_init: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
                 worker_id, task_id, passes, fails,
                 np.mean(pass_times) if pass_times else 0.0,
                 np.min(pass_times) if pass_times else 0.0,
@@ -509,6 +533,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             self._local_write_head = worker_id
         else:
             self._local_write_head = None
+        logger.debug('SharedTree.worker_ready: worker %d is ready with write head %s, increment %s.',
+            worker_id, self._local_write_head, self._write_head_increment)
     
     def search(self, observation: types.Observation, last_action: Optional[int] = None):
         """
@@ -533,35 +559,43 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     
     def rollout(self) -> bool:
         root = self.get_root()
+        trajectory = []  
         try:
             # 1. search for a leaf node in the tree.
             # the in_tree phase cannot break otherwise we are doomed.
+            # logger.debug('SharedTree.rollout: --- in_tree call')
             trajectory, actions = self.in_tree(root)
             # check for race conditions 
             #  - another process expanded in the meantime or
             #  - the last node is not consistent with its parent.
             if trajectory[-1].expanded or not trajectory[-1].is_consistent():
+                # logger.debug('SharedTree.rollout: fail after in_tree exp: %s, consistent: %s', trajectory[-1].expanded, trajectory[-1].is_consistent())
                 self.fail(trajectory=trajectory)
                 return False
             # 2. simulate the trajectory
-            node, observation = self.simulate(trajectory[-1], actions)
-            if not self.is_consistent(node):
+            # logger.debug('SharedTree.rollout: --- simulate call')
+            node, observation = self.simulate(node=trajectory[-1], ancestors=trajectory[:-2], actions=actions)
+            if not node.is_consistent():
+                # logger.debug('SharedTree.rollout: fail after simulate: node %s is not consistent with its parent %s.', repr(node), repr(node.parent))
                 self.fail(trajectory=trajectory)
                 return False
             # 3. evaluate the node
+            # logger.debug('SharedTree.rollout: --- evaluate call')
             _, value = self.evaluate(node, observation)
             # 4. backup the value and the node
+            # logger.debug('SharedTree.rollout: --- backup call')
             self.backup(node, value)
             self.succeed()
+            # logger.debug('SharedTree.rollout: --- success.')
             return True
         except TreeFull: # can happen, nothing to do
             self.fail(trajectory=trajectory)
             return False
         except Exception as e:
-            logger.exception('SharedTree.phase_1: error during phase 1: %s', e)
+            # logger.exception('SharedTree.rollout: error during rollout: %s', e)
             if len(trajectory) > 0:
                 self.fail(trajectory=trajectory)
-            return False
+            raise e
         finally:
             # in either case, reset the model to the root state.
             self.model.load_checkpoint()
@@ -578,7 +612,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 self.fail(trajectory=trajectory)
                 return False
             node, observation = self.simulate(trajectory[-1], actions)
-            if not self.is_consistent(node):
+            if not node.is_consistent():
                 self.fail(trajectory=trajectory)
                 return False
             if not node.terminal:
@@ -608,7 +642,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         node = self.get_by_offset(node_offset)
         # check consistency for the final time
         if not node.is_consistent():
-            logger.debug('SharedTree.phase_2: node %s is not consistent with its parent %s.', repr(node), repr(node.parent))
+            # logger.debug('SharedTree.phase_2: node %s is not consistent with its parent %s.', repr(node), repr(node.parent))
             self.fail(node=node)
             return False
         # do the expansion
@@ -630,6 +664,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     
     def select_child(self, node, action):
         assert node.expanded, "Node must be expanded to select a child."
+        # logger.debug('%s.select_child called with action %s.', repr(node), action)
         child_offset = node.select(action)
         if child_offset == -1:
             # make a new node and ignore race conditions
@@ -643,10 +678,11 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         if self._local_write_head is None:
             assert not self._is_main, "_make_node should only be called from a worker process."
             raise TreeFull()
-        
-        node = self.get_node(self._local_write_head)
+        # logger.debug('SharedTree._make_node called with parent %s, action %s.', repr(parent), action)
+        # logger.debug('SharedTree._make_node: local write head %s. available %s', self._local_write_head,self.header.available[self._local_write_head])
+        node = self.get_node(self.header.available[self._local_write_head])
         # override the parent's child pointer regardless of race conditions
-        node.set_parent(parent.offset, action)
+        node.set_parent(parent, action)
         parent.set_child(action, node)  # set the child pointer in the parent node
         return node
     
@@ -672,7 +708,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     
     def configure(self):
         """To be called by the parent process to allocate shared memory blocks."""
-        logger.debug('SharedTree.configure called.')
+        # logger.debug('SharedTree.configure called.')
         self._is_main = True
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
@@ -754,10 +790,10 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self._local_write_head = self._update_index()
     
     def i2off(self, index: int) -> int:
-        logger.debug('SharedTree.i2off called with index %d node size %d.', index, self._node_size)
+        # logger.debug('SharedTree.i2off called with index %d node size %d.', index, self._node_size)
         return index * self._node_size
     def off2i(self, offset: int) -> int:
-        logger.debug('SharedTree.off2i called with offset %d node size %d.', offset, self._node_size)
+        # logger.debug('SharedTree.off2i called with offset %d node size %d.', offset, self._node_size)
         if offset % self._node_size != 0:
             raise ValueError(f"Offset {offset} is not a multiple of node size {self._node_size}.")
         return offset // self._node_size
@@ -774,7 +810,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         Check if the tree is full.
         The tree is full if the index is equal to the number of blocks.
         """
-        return self._local_write_head >= self.num_nodes
+        return self._local_write_head is None or self._local_write_head >= self.num_nodes
     
     def allocate_tasks(self):
         if self.inference_server is None:
