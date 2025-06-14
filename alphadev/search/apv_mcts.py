@@ -3,6 +3,7 @@ import multiprocessing.shared_memory as mp_shm
 from time import time, sleep
 import numpy as np
 import functools
+import pickle
 
 from acme.agents.tf.mcts.search import SearchPolicy
 from acme.agents.tf.mcts import types
@@ -11,7 +12,8 @@ from acme.agents.tf.mcts import models
 from ..service import service
 from ..service.inference_service import AlphaDevInferenceClient, InferenceNetworkFactory
 from ..device_config import DeviceAllocationConfig, D_CFG
-from ..shared_memory.base import BlockLayout, ArrayElement, AtomicCounterElement, BaseMemoryManager
+from ..shared_memory.base import BlockLayout, ArrayElement, BinaryArrayElement, BaseMemoryManager
+from ..environment import AssemblyGame, AssemblyGameModel
 from .mcts import MCTSBase, NodeBase
 
 _local_id = 'main'
@@ -243,6 +245,27 @@ class SharedTreeHeaderBase(BlockLayout):
             _elements['tasks'] = ArrayElement(np.int32, (num_workers,))
         return SharedTreeHeader
 
+class SharedCheckpointBase(BlockLayout):
+    """
+    Shared memory block for communicating the model's checkpoint
+    to worker processes.
+    has a size and a data field
+    """
+    _required_attributes = ['size', 'data']
+    _elements = {
+        'size': ArrayElement(np.int32, ()),  # size of the checkpoint data
+    }
+    @classmethod
+    def define(cls, size: int):
+        class SharedCheckpoint(cls):
+            _elements = cls._elements.copy()
+            # defined as a data element but in reality it is a byte array.
+            # it is recommended to set the size to 2x the measured model checkpoint
+            # FIXME: this should be resolved by making the environment immutable
+            # and sharing a model state instead of a pickled checkpoint.
+            _elements['data'] = BinaryArrayElement(size)
+        return SharedCheckpoint
+
 class TreeFull(Exception): pass
 
 class APV_MCTS(MCTSBase, BaseMemoryManager):
@@ -262,7 +285,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         # MCTSBase required parameters
         num_simulations: int,
         num_actions: int,
-        model: models.Model,
+        model: AssemblyGameModel,
         search_policy: SearchPolicy,
         # number of parallel search actors.
         num_workers: int,
@@ -314,22 +337,29 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         # declare the header
         self._header_cls = SharedTreeHeaderBase.define(
             length=self.num_blocks, num_workers=self.num_workers)
+        # declare the node class
         self._node_cls = SharedNodeBase.define(
             width=self.num_actions,        # number of actions in the environment
             num_workers=self.num_workers,  # number of parallel workers
             lambda_=lambda_,               # lambda for the value backup
             vl_constant=vl_constant        # constant virtual loss to apply during rollouts
         )
+        # declare the checkpoint class
+        ckpt = model.make_checkpoint()
+        ckpt_bin = pickle.dumps(ckpt)
+        self._checkpoint_cls = SharedCheckpointBase.define(size=len(ckpt_bin)*2)
         # declare shared memory regions
         # the header for storing tree-specific information
         self._header_size = self._header_cls.get_block_size()
         self._header_name = f'{name}_header'
         # the data block for representing the tree structure in shared memory
         self._node_size = self._node_cls.get_block_size()
-
         self._data_size = self.num_blocks * self._node_size
         self._data_name = f'{name}_data'
-
+        # the checkpoint block for storing the model's state
+        self._checkpoint_size = self._checkpoint_cls.get_block_size()
+        self._checkpoint_name = f'{name}_checkpoint'
+        
         # process-local
         self._is_main = False
         self._local_write_head = None
@@ -337,6 +367,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         # shared memory objects
         self._header_shm = None
         self._data_shm = None
+        self._checkpoint_shm = None
         # declare workers and run them.
         global D_CFG
         worker_handles = []
@@ -539,6 +570,10 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         # count how many there are
         if self.header.tasks[worker_id] in (APV_MCTS._ROLLOUT, APV_MCTS._SEARCH):
             self._local_write_head = worker_id
+            # also load the model's checkpoint.
+            ckpt = self.worker_load_checkpoint()
+            self.model.set_checkpoint(ckpt)  # override the model's internal checkpoint
+            self.model.load_checkpoint()  # load the model's state
         else:
             self._local_write_head = None
         logger.debug('SharedTree.worker_ready: worker %d is ready with write head %s, increment %s.',
@@ -555,7 +590,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             # construct the parent process' evaluation network (used for initializing the tree)
             self.evaluation = self.evaluation_factory()
         # 0. save the current model state
-        self.model.save_checkpoint()
+        cktp = self.model.make_checkpoint() # see `alphadev.environment.AssemblyGameModel.get_checkpoint()`
+        self.broadcast_checkpoint(cktp)  # broadcast the checkpoint to all workers
         # 1. initialize the tree with the given observation
         root = self.init_tree(observation, last_action)
         # 2. signal the worker processes to start searching
@@ -724,7 +760,10 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self._is_main = True
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
+        self._checkpoint_shm = mp_shm.SharedMemory(name=self._checkpoint_name, create=True, size=self._checkpoint_size)
+
         self.header = self._header_cls(self._header_shm, 0)
+        self.checkpoint = self._checkpoint_cls(self._checkpoint_shm, 0)
         
         self.reset()  # clear the header and input/output blocks
     
@@ -745,19 +784,24 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             node = self._node_cls(self._data_shm, offset)
             node.set_root()  # set the node as the root (mimic the behavior of the superclass)
             node.children[...] = -1
+        # 3. reset the checkpoint block
+        self._checkpoint_cls.clear_block(self._checkpoint_shm, 0)
     
     def attach(self):
         logger.debug('SharedTree.attach')
         self._is_main = False; self._is_attached = True
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)
-
+        self._checkpoint_shm = mp_shm.SharedMemory(name=self._checkpoint_name, create=False, size=self._checkpoint_size)
+        
         self.header = self._header_cls(self._header_shm, 0)
+        self.checkpoint = self._checkpoint_cls(self._checkpoint_shm, 0)
     
     def __del__(self):
         if not self._is_main and self._is_attached:
             self._header_shm.close()
             self._data_shm.close()
+            self._checkpoint_shm.close()
         elif self._is_main:
             # signal worker to exit gracefully
             self.header.tasks[:] = APV_MCTS._EXIT
@@ -770,6 +814,10 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 logger.warning('SharedTree.__del__: shared memory already unlinked.')
             try:
                 self._data_shm.unlink()
+            except FileNotFoundError:
+                logger.warning('SharedTree.__del__: shared memory already unlinked.')
+            try:
+                self._checkpoint_shm.unlink()
             except FileNotFoundError:
                 logger.warning('SharedTree.__del__: shared memory already unlinked.')
         # logger.debug('SharedTree.__del__: %s terminated', self.name)
@@ -852,6 +900,20 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             # wait for the main process to set the write head
             sleep(0.001)
         return increment
+    
+    def broadcast_checkpoint(self, checkpoint: AssemblyGame):
+        # FIXME: env should be immutable and checkpoint np-serializable.
+        assert self._is_main, "broadcast_checkpoint() should only be called in the main process."
+        ckpt_bin = pickle.dumps(checkpoint)
+        self.checkpoint.data[:len(ckpt_bin)] = ckpt_bin
+        self.checkpoint.size[...] = len(ckpt_bin)
+    
+    def worker_load_checkpoint(self) -> AssemblyGame:
+        assert not self._is_main, "worker_get_checkpoint() should only be called in worker processes."
+        if self.checkpoint.size == 0:
+            raise ValueError("Checkpoint is not set. The main process should call broadcast_checkpoint() first.")
+        ckpt_bin = self.checkpoint.data[:self.checkpoint.size.item()]
+        return pickle.loads(ckpt_bin)
     
     def clear_tasks(self):
         """Clear the tasks in the header."""

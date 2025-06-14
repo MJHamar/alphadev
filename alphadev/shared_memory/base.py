@@ -69,6 +69,24 @@ class NestedArrayElement(ArrayElement):
         elif isinstance(self.model, NamedTuple):
             return self.model._make(**elements)
 
+class BinaryArrayElement(ArrayElement):
+    """
+    A binary array element that can be used to store binary data in shared memory.
+    (e.g. pickled objects)
+    """
+    def __init__(self, size):
+        super().__init__(np.uint8, None)
+        self._size = size  # size in bytes, not elements
+    
+    def size(self, *args, **kwargs):
+        """Return the size in bytes."""
+        return self._size
+    def create(self, shm=None, offset=None, *args, **kwargs):
+        """Create a binary array in the shared memory buffer."""
+        assert shm is not None, "Shared memory must be provided to create a BinaryArrayElement."
+        assert offset is not None, "Offset must be provided to create a BinaryArrayElement."
+        return shm.buf[offset:offset+self._size] # return a slice of the shared memory buffer with the specified size
+
 # Actomics should only be used in a multiprocessing context.
 class AtomicContext:
     """
@@ -204,6 +222,9 @@ class BlockLayout:
                 # handle atomic counters
                 with element() as atomic_counter:
                     atomic_counter.store(0)
+            elif isinstance(element_spec, BinaryArrayElement):
+                for i in range(len(element)):
+                    element[i] = 0 # fill with zeros
             else:
                 tree.map_structure(lambda x: (x.fill(0) if hasattr(x,'fill') else x), element)
             off += element_spec.size(*args, **kwargs)

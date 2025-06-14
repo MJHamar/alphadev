@@ -667,6 +667,7 @@ class AssemblyGameModel(models.Model):
         )
         self._task_spec = task_spec
         self._needs_reset = False
+        self._ckpt = None
     
     def load_checkpoint(self):
         """Loads a saved model state, if it exists."""
@@ -675,8 +676,16 @@ class AssemblyGameModel(models.Model):
 
     def save_checkpoint(self):
         """Saves the model state so that we can reset it after a rollout."""
-        self._ckpt = self._environment.copy() # TODO: implement
-
+        self._ckpt = self._environment.copy()
+    
+    def make_checkpoint(self) -> AssemblyGame:
+        """Returns the current checkpoint of the model."""
+        self.save_checkpoint() # update the checkpoint.
+        return self._ckpt
+    
+    def set_checkpoint(self, ckpt: AssemblyGame):
+        self._ckpt = ckpt
+    
     def update(
         self,
         timestep: TimeStep, # prior to executing the action
