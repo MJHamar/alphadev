@@ -9,7 +9,7 @@ import contextlib
 from time import time, sleep
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class BufferInputFull(Exception): pass
 class BufferOutputFull(Exception): pass
@@ -21,12 +21,13 @@ class BufferHeader(BlockLayout):
         # read_head <= write_frontier <= write head and
         # 0 <= write_head - read_head < num_blocks.
         'in_index_w': AtomicCounterElement(),  # write head of the MPSC.
-        'in_index_f': AtomicCounterElement(),  # frontier pointer for the MPSC input buffer.
-        'in_index_r': ArrayElement(dtype=np.int64, shape=()),  # read head of the MPSC input buffer.
+        'in_index_f': ArrayElement(dtype=np.uint64, shape=()),  # frontier pointer for the MPSC input buffer.
+        'in_index_r': ArrayElement(dtype=np.uint64, shape=()),  # read head of the MPSC input buffer.
         # SPSC output buffer with the invariant 
         # 0 <= write_head - read_head < num_blocks.
-        'out_index_w': ArrayElement(dtype=np.int64, shape=()),  # write head for SPSC output buffer
-        'out_index_r': ArrayElement(dtype=np.int64, shape=()),  # read head for the SPSC output buffer.
+        'out_index_w': ArrayElement(dtype=np.uint64, shape=()),  # write head for SPSC output buffer
+        'out_index_f': ArrayElement(dtype=np.uint64, shape=()),  # frontier pointer for the SPSC output buffer.
+        'out_index_r': ArrayElement(dtype=np.uint64, shape=()),  # read head for the SPSC output buffer.
     }
     @classmethod
     def define(cls):
@@ -66,7 +67,7 @@ class IOBuffer(BaseMemoryManager):
         self._num_blocks = 1 << (num_blocks - 1).bit_length()  # round up to the next power of two
         if num_blocks != self._num_blocks:
             logger.warning("IOBuffer: num_blocks rounded up to nearest power of two: %s --> %s", num_blocks, self._num_blocks)
-        self._mask = self._num_blocks - 1  # for fast modulo operation
+        self._mask = np.array(self._num_blocks - 1, dtype=np.uint64)  # for fast modulo operation
         
         self._is_main = False
         self._is_attached = False
@@ -117,97 +118,134 @@ class IOBuffer(BaseMemoryManager):
     
     # The input buffer is implemented as a circular buffer.
     # following the Multi-producer, single-consumer (MPSC) pattern.
-    # both read and write heads are incremented indefinitely, with the 
-    # invariance that 0 <= write_head - read_head < num_blocks.
+    # since reading and writing to the input buffer is not atomic,
+    # we maintain a write frontier to ensure that the read head only reads well-defined blocks.
+    # Producer processes can pre-allocate space in the input buffer and receive a list of indices 
+    # that are guaranteed to be available for writing.
+    # Once producers are done writing they increment the write frontier, while maintaining the order of indices.
+    # i.e. reader can increment the frontier only if its smallest index is equals current fontier + 1.
+    # The consumer process reads the buffer, maintaining the invariant that the read head is always less than or equal to the write frontier.
     
     def _next_in_w(self, increment: Optional[int] = 1):
         """Reserve `increment` blocks for writing to the input buffer."""
-        logger.debug("IOBuffer: _next_in_w() called, increment=%d", increment)
+        # logger.debug("IOBuffer: _next_in_w() called, increment=%d", increment)
         # (busy) wait until the write head has enough space to write the requested number of blocks.
         write_head_ptr = self.header.in_index_w.peek()
         # ensure the distance between the write head and the read frontier doesn't exceed the buffer size.
         while write_head_ptr + increment - self.header.in_index_r >= self._num_blocks:
             sleep(0.0001) # just a little, so reading can catch up.
-        logger.debug("IOBuffer: _next_in_w() w %d, rf at %d r at %d", write_head_ptr, self.header.in_index_f.peek(), self.header.in_index_r)
+        logger.debug("IOBuffer: _next_in_w() w %d, rf at %d r at %d", write_head_ptr, self.header.in_index_f, self.header.in_index_r)
         with self.header.in_index_w() as in_index_w:
             # increment the in_index atomically to let the other
             # producers know that we are reserving space.
             index = in_index_w.fetch_add(increment)  
         # now, we are guaranteed to have enough space to write stuff.
-        indices = np.arange(index, index + increment) & self._mask  # use bitwise AND to wrap around the circular buffer.
-        logger.debug("IOBuffer: _next_in_w() returning indices %s", indices)
+        indices = np.arange(index, index + increment, dtype=np.uint64) & self._mask  # use bitwise AND to wrap around the circular buffer.
+        logger.debug("IOBuffer: _next_in_w() returning indices %s dtype %s", indices, indices.dtype)
         return indices
-    def _update_in_w_frontier(self, increment: Optional[int] = 1):
-        """Update the write frontier, so that the read head can catch up."""
-        logger.debug("IOBuffer: _update_in_w_frontier() called, increment=%d", increment)
-        with self.header.in_index_f() as in_index_f:
-            in_index_f.add(increment)
+    def _update_in_w_frontier(self, start_mod:int, increment:int):
+        """Update the write frontier, so that the read head can catch up.
+        start_mod is the modulo of of the first index in producer's write batch.
+        This method will wait until the write frontier's modulus is equal to start_mod - 1.
+        """
+        logger.debug("IOBuffer: _update_in_w_frontier() called, start_mod %d, increment %d", start_mod, increment)
+        frontier_ptr = self.header.in_index_f
+        # busy wait until the write frontier is at the expected value.
+        target = np.uint64(start_mod)
+        logger.debug("IOBuffer: _update_in_w_frontier() waiting for frontier %d to be %d", frontier_ptr & self._mask, target & self._mask)
+        while frontier_ptr & self._mask != target & self._mask:
+            sleep(0.0001)  # just a little, so other producers can write their stuff.
+        # now we can update the write frontier. no need to be atomic here.
+        frontier_ptr += np.uint64(increment)
+        logger.debug("IOBuffer: _update_in_w_frontier() f %d; w %d; r %d", frontier_ptr, self.header.in_index_w.peek(), self.header.in_index_r)
     def _get_in_read_batch(self, increment: Optional[int] = 1):
         """
         Get the next <= increment blocks that are ready to be read from the input buffer,
         but don't update the read head.
         """
         # cap the increment to the number of blocks beetween the read head and the write frontier.
-        # logger.debug("IOBuffer: _get_in_read_batch() called, increment=%d; in_r %d, in_f %d, in_w %s", increment, self.header.in_index_r, self.header.in_index_f.peek(), self.header.in_index_w.peek())
-        increment = min(increment, self.header.in_index_f.peek() - self.header.in_index_r)
-        indices = np.arange(self.header.in_index_r, self.header.in_index_r + increment, dtype=np.int32) & self._mask
+        # logger.debug("IOBuffer: _get_in_read_batch() called, increment=%d; in_r %d, in_f %d, in_w %s", increment, self.header.in_index_r, self.header.in_index_f, self.header.in_index_w.peek())
+        increment = min(increment, self.header.in_index_f - self.header.in_index_r)
+        indices = np.arange(self.header.in_index_r, self.header.in_index_r + increment, dtype=np.uint64) & self._mask
         # logger.debug("IOBuffer: _get_in_read_batch() returning indices %s", indices)
         return indices
     def _set_in_read(self, increment: Optional[int] = 1):
         """Update the read head of the input buffer to let the producers know we are done reading."""
-        # logger.debug("IOBuffer: _set_in_read() called, increment=%d", increment)
-        self.header.in_index_r += increment
-    def _get_out_write_batch(self, increment: Optional[int] = 1, strict: bool = True):
+        logger.debug("IOBuffer: _set_in_read() called, increment=%d", increment)
+        self.header.in_index_r += np.uint64(increment)
+    
+    # The output buffer is implemented as a single-producer, single-consumer (SPSC) buffer.
+    # the producer (same process as the input consumer) 
+    # pre-allocates space in the output buffer by incrementing the write head.
+    # (so that the consumers know the producer is busy)
+    # and increments the write frontier after writing the output.
+    # the reader reads the output buffer and increments the read head after reading the output.
+    # the invariant is the same, the read head can never exceed the write frontier.
+    def _inc_out_w(self, increment: Optional[int] = 1):
+        """Increment the write head regardless of the available space."""
+        self.header.out_index_w += np.uint64(increment)
+    def _next_out_w(self, increment: Optional[int] = 1, strict: bool = True):
+        """
+        Get the next <= `increment` blocks that are ready to be written to the output buffer.
+        That is, take the next `increment` indices from between the write head and the write frontier.
+        Since we assume that the output producer is the same process as the input consumer,
+        we are guaranteed to have enough distance between the write head and the frontier.
+        The write head, however, might be violating the circular buffer invariant
+        so we can only take at most min(increment, num_blocks - (frontier - read_head)) indices.
+        """
         # logger.debug("IOBuffer: _get_out_write_batch() called, increment=%d, strict=%s", increment, strict)
         # (busy) wait until the write head has enough space to write the requested number of blocks.
-        while strict and self.header.out_index_w + increment - self.header.out_index_r >= self._num_blocks:
-            sleep(0.0001)  # just a little, so reading can catch up.
+        while strict and self._num_blocks - (self.header.out_index_f - self.header.out_index_r) < increment:
+            # logger.debug("IOBuffer: _get_out_write_batch() waiting for output blocks to be written...")
+            sleep(0.0001)
         if not strict:
-            increment = min(increment, self._num_blocks - (self.header.out_index_w - self.header.out_index_r))
-        indices = np.arange(self.header.out_index_w, self.header.out_index_w + increment) & self._mask
+            increment = min(increment, self._num_blocks - (self.header.out_index_f - self.header.out_index_r))
+        
+        # return indices for writing to the output buffer.
+        indices = np.arange(self.header.out_index_f, self.header.out_index_f + increment, dtype=np.uint64) & self._mask
         return indices
     def _set_out_written(self, increment: Optional[int] = 1):
-        """Update the write head of the output buffer to let the reader know we are done writing."""
+        """Update the write frontier of the output buffer to signal that we are done."""
         # logger.debug("IOBuffer: _set_out_written() called, increment=%d", increment)
-        self.header.out_index_w += increment
+        self.header.out_index_f += np.uint64(increment)
+        assert self.header.out_index_f <= self.header.out_index_w, \
+            f"IOBuffer: out_index_f {self.header.out_index_f} > out_index_w {self.header.out_index_w}. someone read less than what they are writing"
     def _get_out_read_batch(self, increment: Optional[int] = 1):
         # logger.debug("IOBuffer: _get_out_read_batch() called, increment=%d", increment)
         # cap the increment to the number of blocks between the read head and the write head.
-        while self.header.out_index_w - self.header.out_index_r < increment:
+        while self.header.out_index_f - self.header.out_index_r < increment:
             # logger.debug("IOBuffer: _get_out_read_batch() waiting for output blocks to be written...")
             sleep(0.0001)
-        # logger.debug("IOBuffer: _get_out_read_batch() w %d, r %d", self.header.out_index_w, self.header.out_index_r)
-        increment = min(increment, self.header.out_index_w - self.header.out_index_r)
-        indices = np.arange(self.header.out_index_r, self.header.out_index_r + increment) & self._mask
+        logger.debug("IOBuffer: _get_out_read_batch() w %d, f %d r %d", self.header.out_index_w, self.header.out_index_f, self.header.out_index_r)
+        # return the indices for reading from the output buffer.
+        indices = np.arange(self.header.out_index_r, self.header.out_index_r + increment, dtype=np.uint64) & self._mask
         # logger.debug("IOBuffer: _get_out_read_batch() returning indices %s", indices)
         return indices
+    def _set_out_read(self, increment: Optional[int] = 1):
+        """Update the read head of the output buffer to let the producer know we are done reading."""
+        # logger.debug("IOBuffer: _set_out_read() called, increment=%d", increment)
+        self.header.out_index_r += np.uint64(increment)
     
     def submit(self, **payload):
-        # logger.debug("IOBuffer: submit() called, payload=%s", payload)
-        if not self._is_attached:
-            self.attach()
+        logger.debug("IOBuffer: submit() called, payload offset %s", payload['node_offset'])
         # get the next available index for writing to the input buffer.
         index = self._next_in_w()[0]
         # logger.debug("IOBuffer: submit() got index %d for writing", index)
         # write the payload to the input block at the given index.
-        iblock = self._input_element_cls(self._input_shm, index * self._input_size)
+        iblock = self._input_element_cls(self._input_shm, np.uint64(index * self._input_size))
         iblock.write(**payload)
         # update the write frontier to let the readers know that we have submitted a new block.
-        self._update_in_w_frontier()
+        self._update_in_w_frontier(start_mod=index, increment=1)
         # logger.debug("IOBuffer: submit(), set submitted at index=%d. offset %s", index, iblock.node_offset)
     
     def ready(self, payload_list: List[Dict[str, np.ndarray]]):
         # logger.debug("IOBuffer: ready() called, payload_list length=%d", len(payload_list))
-        if not self._is_attached:
-            self.attach()
-        base = 0
         while len(payload_list) > 0:
-            indices = self._get_out_write_batch(len(payload_list), strict=False) + base
+            indices = self._next_out_w(len(payload_list), strict=False)
             for index in indices:
-                oblock = self._output_element_cls(self._output_shm, index * self._output_size)
+                oblock = self._output_element_cls(self._output_shm, np.uint64(index * self._output_size))
                 oblock.write(**payload_list.pop(0))
-            self._set_out_written(len(indices))
-            base += len(indices)
+            self._set_out_written(indices.shape[0])
     
     @contextlib.contextmanager
     def read_submited(self, max_samples:int, localize:bool=True) -> Generator[List[Union[BlockLayout, Dict[str, np.ndarray]]], None, None]:
@@ -219,14 +257,19 @@ class IOBuffer(BaseMemoryManager):
         If using with localize=False, make sure to read the blocks before exiting the context,
         otherwise the blocks will be marked as read and will not be available for reading again.
         """
-        # logger.debug("IOBuffer: read_submited() max_samples=%d, localize=%s", max_samples, localize)
-        if not self._is_attached:
-            self.attach()
         indices = self._get_in_read_batch(max_samples)
         
+        # logger.debug("IOBuffer: read_submited() max_samples=%d, localize=%s, indices=%s", max_samples, localize, indices)
+        if len(indices) == 0:
+            yield []
+            return
+        # also reserve some output blocks for writing the results.
+        # we don't care about buffer overflow; reading will take time and 
+        # we won't get indices here either.
+        self._inc_out_w(len(indices))
         ret = []
         for index in indices:
-            iblock = self._input_element_cls(self._input_shm, index * self._input_size)
+            iblock = self._input_element_cls(self._input_shm, np.uint64(index * self._input_size))
             if localize:
                 iblock = iblock.read()
                 self._set_in_read(1)  # mark the block as read
@@ -234,7 +277,7 @@ class IOBuffer(BaseMemoryManager):
         if len(ret) > 0:
             logger.debug("IOBuffer: read_submited() returning with %s inputs", len(ret))
         yield ret
-        if not localize: self._set_in_read(len(indices))
+        if not localize: self._set_in_read(indices.shape[0])
     
     @contextlib.contextmanager
     def read_ready(self, max_samples:int=1, localize:bool=True):
@@ -247,21 +290,19 @@ class IOBuffer(BaseMemoryManager):
         If using with localize=False, make sure to read the blocks before exiting the context,
         otherwise the blocks will be marked as read and will not be available for reading again.
         """
-        if not self._is_attached:
-            self.attach()
         indices = self._get_out_read_batch(max_samples)
         logger.debug("IOBuffer: read_ready() output indices to read: %s", indices)
         
         ret = []
         for index in indices:
-            oblock = self._output_element_cls(self._output_shm, index * self._output_size)
+            oblock = self._output_element_cls(self._output_shm, np.uint64(index * self._output_size))
             if localize:
                 oblock = oblock.read()
-                self._set_out_written(1)
+                self._set_out_read(1)
             ret.append(oblock)
         logger.debug("IOBuffer: read_ready() returning with %d outputs", len(ret))
         yield ret
-        if not localize: self._set_out_written(len(indices))
+        if not localize: self._set_out_read(indices.shape[0])
     
     def is_idle(self):
         return (self.header.in_index_w.peek() == self.header.in_index_r and

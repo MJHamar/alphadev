@@ -64,6 +64,7 @@ class NodeBase:
     
     def backup_value(self, action:types.Action, value: float, discount: float = 1.0, trajectory: Optional[List['NodeBase']] = []):
         """Update the visit count and total value of this node."""
+        logger.debug(f"Backing up value {value} for action {action} in node {self} (type {type(self)}).")
         if len(trajectory) == 0:
             parent = self.parent
         else:
@@ -336,6 +337,8 @@ class MCTSBase:
     
     def backup(self, node: NodeBase, value: float, trajectory: Optional[List[NodeBase]] = []):
         # Monte Carlo back-up with bootstrap from value function.
+        logger.debug(f"MCTSBase.backup(): Backing up value {value} for node: {node}. actual root: {self.get_root()}.")
+        assert node.parent is not None, f"Node node cannot be root, is it? {node.is_root()}"
         node.parent.backup_value(node.action, value, self.discount, trajectory=trajectory)
         # done.
     

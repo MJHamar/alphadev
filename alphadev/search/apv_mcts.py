@@ -19,7 +19,7 @@ from .mcts import MCTSBase, NodeBase
 _local_id = 'main'
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 logging.basicConfig(
     format=f'process {_local_id}: %(levelname)s: %(message)s',
 )
@@ -178,6 +178,7 @@ class SharedNodeBase(NodeBase, BlockLayout):
     
     def is_root(self) -> bool:
         """Check if this node is the root node."""
+        # logger.debug('%s.is_root called. p.off: %s', repr(self), self.header[self.__class__.hdr_parent])
         return self.header[self.__class__.hdr_parent] == -1
     
     def set_child(self, action: types.Action, child: 'SharedNodeBase'):
@@ -509,7 +510,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 self.attach()
                 attached = True
             except FileNotFoundError:
-                logger.debug('SharedTree.run_worker: waiting for shared memory to be created.')
+                # logger.debug('SharedTree.run_worker: waiting for shared memory to be created.')
                 # wait for the main process to create the shared memory
                 sleep(0.1)
         # loop forever
@@ -566,6 +567,9 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         This way we do not need to worry about race conditions
         in indexing and writing to the shared memory.
         """
+        # attach to inference client if needed.
+        if self.inference_server is not None:
+            self.inference_server.attach()
         # only the ROLLOUT or SEARCH tasks need a write head.
         # count how many there are
         if self.header.tasks[worker_id] in (APV_MCTS._ROLLOUT, APV_MCTS._SEARCH):
@@ -657,7 +661,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             if trajectory[-1].expanded or not trajectory[-1].is_consistent():
                 self.fail(trajectory=trajectory)
                 return False
-            node, observation = self.simulate(trajectory[-1], actions)
+            node, observation = self.simulate(node=trajectory[-1], ancestors=trajectory[:-2], actions=actions)
             if not node.is_consistent():
                 self.fail(trajectory=trajectory)
                 return False
@@ -674,7 +678,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             logger.exception('SharedTree.phase_1: error during phase 1: %s', e)
             if len(trajectory) > 0:
                 self.fail(trajectory=trajectory)
-            return False
+            raise e
         finally:
             # in either case, reset the model to the root state.
             self.model.load_checkpoint()
@@ -682,9 +686,14 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     def phase_2(self) -> bool:
         # poll for results
         with self.inference_server.read_ready() as ready:
+            if len(ready) == 0:
+                return False
+            assert len(ready) == 1, "Expected exactly one ready object."
+            ready = ready[0]
             node_offset = ready.node_offset.item()
             prior = ready.prior
             value = ready.value.item()
+        assert node_offset != -1, "Node offset must not be -1."
         node = self.get_by_offset(node_offset)
         # check consistency for the final time
         if not node.is_consistent():
@@ -711,7 +720,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     def select_child(self, node, action):
         assert node.expanded, "Node must be expanded to select a child."
         child_offset = node.select(action)
-        logger.debug('%s.select_child called with action %s. offset %s', repr(node), action, child_offset)
+        # logger.debug('%s.select_child called with action %s. offset %s', repr(node), action, child_offset)
         if child_offset == -1:
             # make a new node and ignore race conditions
             return self._make_node(parent=node, action=action)
@@ -721,8 +730,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         if parent is None and action is None:
             # create a new root node
             return self.get_by_offset(self.header.root_offset.item())
-        logger.debug('SharedTree._make_node called with parent %s, action %s.', repr(parent), action)
-        logger.debug('SharedTree._make_node: local write head %s. available %s', self._local_write_head,self.header.available[self._local_write_head])
+        # logger.debug('SharedTree._make_node called with parent %s, action %s.', repr(parent), action)
+        # logger.debug('SharedTree._make_node: local write head %s. available %s', self._local_write_head,self.header.available[self._local_write_head])
         node = self.get_node(self.header.available[self._local_write_head])
         assert not node.expanded, "Node must not be expanded when created."
         # override the parent's child pointer regardless of race conditions
@@ -740,8 +749,9 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         Can only be run from the main process
         """
         assert self._is_main, "This method can only be called from the main process."
+        self.inference_server.attach()
         offset = node.offset if node is not None else -1
-        logger.info('SharedTree._eval_await called with observation %s, node offset %s.', observation, offset)
+        logger.debug('SharedTree._eval_await called with node offset %s.', offset)
         self.inference_server.submit(**{
             'node_offset': offset, 'observation': observation})
         # wait for the result to be ready
@@ -751,7 +761,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             assert ready.node_offset == offset, f"The node offset in the ready object {ready.node_offset} does not match the requested node {offset}. The inference server had leftovers."
             prior = ready.prior
             value = ready.value.item()
-        logger.debug('SharedTree._eval_await: returning with prior %s, value %s.', prior.shape, value)
+        # logger.debug('SharedTree._eval_await: returning with prior %s, value %s.', prior.shape, value)
         return prior, value
     
     def configure(self):
@@ -827,7 +837,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         # this way we are guaranteed that no two workers will write to the same block
         # while also avoiding having to synchronize the write head.
         self._local_write_head = self._local_write_head + self.write_head_increment
-        logger.debug('SharedTree._update_index: local write head updated to %s.', self._local_write_head)
+        # logger.debug('SharedTree._update_index: local write head updated to %s.', self._local_write_head)
         return self._local_write_head
     
     def fail(self, trajectory: Optional[List[SharedNodeBase]] = None, node: Optional[SharedNodeBase] = None):

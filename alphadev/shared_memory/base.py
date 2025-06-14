@@ -10,7 +10,7 @@ import atomics
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class ArrayElement(object):
     def __init__(self, dtype: np.dtype, shape: tuple):
@@ -19,16 +19,16 @@ class ArrayElement(object):
         self._size = None
     
     def _get_size(self, *args, **kwargs):
-        return np.int32(np.dtype(self.dtype).itemsize * np.prod(self.shape))
+        return np.uint64(np.dtype(self.dtype).itemsize * np.prod(self.shape))
     
     def size(self, *args, **kwargs):
         if self._size is None:
             self._size = self._get_size(*args, **kwargs)
         return self._size
     def create(self, shm=None, offset=None, *args, **kwargs):
+        # logger.debug(f"Creating ArrayElement with dtype={self.dtype}, shape={self.shape}, shm={shm}, offset={offset}")
         # if shm is None, numpy ignores the offset 
-        self._shm = shm
-        self._offset = offset
+        offset = np.uint64(offset)
         
         buffer = shm.buf if shm is not None else None
         return np.ndarray(self.shape, dtype=self.dtype, buffer=buffer, offset=offset)
@@ -52,11 +52,11 @@ class NestedArrayElement(ArrayElement):
     def create(self, shm=None, offset=None, *args, **kwargs):
         elements = {}
         buffer = shm.buf if shm is not None else None
-        crnt_offset = offset
+        crnt_offset = np.uint64(offset)
         if isinstance(self.model, dict):
             for name, element in self.model.items():
                 elements[name] = np.ndarray(element.shape, dtype=element.dtype, buffer=shm.buf, offset=crnt_offset)
-                crnt_offset += np.int32(element.dtype.itemsize * np.prod(element.shape))
+                crnt_offset += np.uint64(element.dtype.itemsize * np.prod(element.shape))
         elif isinstance(self.model, NamedTuple):
             for name in self.model._fields:
                 element = getattr(self.model, name)
@@ -83,9 +83,10 @@ class BinaryArrayElement(ArrayElement):
         return self._size
     def create(self, shm=None, offset=None, *args, **kwargs):
         """Create a binary array in the shared memory buffer."""
-        assert shm is not None, "Shared memory must be provided to create a BinaryArrayElement."
-        assert offset is not None, "Offset must be provided to create a BinaryArrayElement."
-        return shm.buf[offset:offset+self._size] # return a slice of the shared memory buffer with the specified size
+        # logger.debug(f"Creating BinaryArrayElement with size={self._size}, shm={shm}, offset={offset}")
+        offset = int(offset) if offset is not None else 0
+        size = int(self._size)
+        return shm.buf[offset:offset+size] # return a slice of the shared memory buffer with the specified size
 
 # Actomics should only be used in a multiprocessing context.
 class AtomicContext:
@@ -145,7 +146,7 @@ class BlockLayout:
         is_fine = True
         for attr in self._required_attributes:
             if not hasattr(self, attr) and not attr in self._lazy_elements:
-                logger.error(f"BlockLayout {self.__class__.__name__} is missing required attribute: {attr}")
+                # logger.error(f"BlockLayout {self.__class__.__name__} is missing required attribute: {attr}")
                 is_fine = False
         if not is_fine:
             raise ValueError(f"BlockLayout {self.__class__.__name__} is not properly defined. Missing required attributes: {self._required_attributes}")
@@ -172,10 +173,12 @@ class BlockLayout:
         This allows for dynamic creation of elements based on the class definition.
         """
         if name in self._lazy_elements:
+            # logger.debug(f"Accessing lazy element {name} in {self.__class__.__name__}.")
             element_spec = self._lazy_elements[name]
             # logger.debug(f"Accessing element {name} in {self.__class__.__name__}. Element spec: {element_spec}")
             if isinstance(element_spec, functools.partial):
                 # If the element is an ArrayElement, create it with the current shm and offset
+                # logger.debug(f"Creating element {name} with spec {element_spec}.")
                 created = element_spec()
                 self._lazy_elements[name] = created
                 # logger.debug(f"Created element {name}: {created}")
