@@ -700,11 +700,14 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         """
         assert self._is_main, "This method can only be called from the main process."
         offset = node.offset if node is not None else -1
+        logger.info('SharedTree._eval_await called with observation %s, node offset %s.', observation, offset)
         self.inference_server.submit(**{
             'node_offset': offset, 'observation': observation})
         # wait for the result to be ready
-        with self.inference_server.read_ready() as ready:
-            assert ready.node_offset == offset, "The node offset in the ready object does not match the requested node. The inference server had leftovers."
+        with self.inference_server.read_ready(max_samples=1) as ready:
+            logger.debug('SharedTree._eval_await: received ready object %s.', ready)
+            ready = ready[0]
+            assert ready.node_offset == offset, f"The node offset in the ready object {ready.node_offset} does not match the requested node {offset}. The inference server had leftovers."
             prior = ready.prior
             value = ready.value.item()
         return prior, value

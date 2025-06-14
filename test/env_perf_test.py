@@ -14,6 +14,7 @@ import numpy as np
 
 from alphadev.environment import AssemblyGame, EnvironmentFactory, AssemblyGameModel, ModelFactory
 from alphadev.acting import MCTSActor
+from alphadev.agents import MCTS
 from alphadev.search.mcts import PUCTSearchPolicy
 from alphadev.utils import TaskSpec, generate_sort_inputs
 from alphadev.config import AlphaDevConfig
@@ -62,13 +63,13 @@ def actor_env_from_config(path) -> EnvironmentLoop:
     environment = EnvironmentFactory(config)()
     env_executor = EnvironmentLoop(
         environment=environment,
-        actor=agent,
+        actor=agent._actor,
         counter=agent.counter,
         should_update=False,
         logger=agent.logger,
         observers=[]
     )
-    return agent._actor, env_executor
+    return agent, env_executor
 
 
 def print_mask_stats(action_space_storage):
@@ -162,7 +163,7 @@ def profile_select_n_actions(env, actor, num_actions):
     # print_mask_stats(actor._model._environment._action_space_storage)
     return stats
 
-def main(id_, actor, env_loop):
+def main(id_, agent:MCTS, env_loop):
     actor = env_loop._actor
     env = env_loop._environment
     
@@ -188,6 +189,6 @@ if __name__ == '__main__':
         sys.argv.append('debug')
     print("Arguments:", sys.argv)
     assert len(sys.argv) == 3, "Usage: python env_perf_test.py <id> <config_path>"
-    actor, env_loop = actor_env_from_config(sys.argv[2])
-    print(f"Using actor {actor} and environment loop {env_loop}.")
-    main(id_=sys.argv[1], actor=actor, env_loop=env_loop)
+    agent, env_loop = actor_env_from_config(sys.argv[2])
+    print(f"Using actor {agent._actor} and environment loop {env_loop}.")
+    main(id_=sys.argv[1], agent=agent, env_loop=env_loop)

@@ -175,7 +175,7 @@ class BlockLayout:
             element[...] = value
         for name, value in kwargs.items():
             if hasattr(self, name):
-                element = getattr(self, name)()
+                element = getattr(self, name)
                 if isinstance(element, np.ndarray):
                     element[...] = value
                 elif isinstance(element, (dict, namedtuple)):
@@ -188,7 +188,7 @@ class BlockLayout:
     def read(self):
         """Create a localized namedtuple with the contents of the block."""
         return namedtuple(self.__class__.__name__, self.__class__._elements.keys())(
-            **{name: getattr(self, name)().copy()
+            **{name: getattr(self, name).copy()
                for name in self.__class__._elements.keys()}  # skip atomic counters for localization
         )
     

@@ -209,9 +209,8 @@ class MCTS(agent.Agent):
             print('Shutting down inference service...')
             name, proc, fl = self.inference_handle[0]
             proc.terminate()
-            proc.join()
+            proc.wait(timeout=2)
             fl.close()
-            fl.unlink()  # remove the temporary file
 
 class DistributedMCTS:
     """Distributed MCTS agent."""

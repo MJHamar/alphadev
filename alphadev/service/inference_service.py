@@ -16,7 +16,7 @@ from .service import Service
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class InferenceTaskBase(BlockLayout):
@@ -32,6 +32,9 @@ class InferenceTaskBase(BlockLayout):
                 dtype=np.float32, shape=(), model=input_model)
         return InferenceTask
 
+    def __repr__(self):
+        return f"InferenceTask(node_offset={self.node_offset}, observation={self.observation})"
+
 class InferenceResultBase(BlockLayout):
     _required_attributes = ['node_offset', 'prior', 'value']
     _elements = {
@@ -46,6 +49,9 @@ class InferenceResultBase(BlockLayout):
                 'value': ArrayElement(np.float32, ()), # **SCALAR** value estimate of the node
             })
         return InferenceResult
+
+    def __repr__(self):
+        return f"InferenceResult(node_offset={self.node_offset}, prior={self.prior}, value={self.value})"
 
 class AlphaDevInferenceClient(IOBuffer):
     """
@@ -132,11 +138,12 @@ class AlphaDevInferenceService(Service, IOBuffer):
         
         if self._network is None:
             self._network, self._variable_client = self._create_network()
-            print(f"AlphaDevInferenceService: created network {self._network}")
+            self.logger.info(f"AlphaDevInferenceService: created network {self._network}")
         
         def stack_requests(*requests):
             return tf.stack(requests, axis=0)
         
+        self.logger.info(f"AlphaDevInferenceService: starting with batch size {self.batch_size}, network={self._network}, variable_client={self._variable_client}")
         while not self._stop_requested:
             poll_start = tf.timestamp()
             with self.read_submited(self.batch_size, localize=False) as tasks:
@@ -166,6 +173,7 @@ class AlphaDevInferenceService(Service, IOBuffer):
             ) for off, p, v in zip(node_offsets, prior, value)])
             ready_end = tf.timestamp()
             self.logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
+        self.logger.info("AlphaDevInferenceService: stopping run loop.")
 
     def stop(self):
         """Stop the inference service."""

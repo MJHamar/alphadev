@@ -161,7 +161,7 @@ class AlphaDevConfig(object):
             num_locations=self.num_regs+self.num_mem,
             num_regs=self.num_regs,
             num_mem=self.num_mem,
-            num_actions=252, # original value was 271
+            num_actions=210, # original value was 271
             correct_reward=self.correct_reward,
             correctness_reward_weight=self.correctness_reward_weight,
             latency_reward_weight=self.latency_reward_weight,
@@ -192,7 +192,7 @@ class AlphaDevConfig(object):
                 self.search_buffer_size = self.async_search_processes_per_pool
             elif not (self.async_search_processes_per_pool, int):
                 raise ValueError("search_buffer_size must be 'auto' or an integer.")
-            
+
             if isinstance(self.search_batch_size, str) and self.search_batch_size == 'auto':
                 self.search_batch_size = self.async_search_processes_per_pool
             elif not isinstance(self.search_batch_size, int):
