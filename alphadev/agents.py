@@ -47,7 +47,6 @@ import numpy as np
 from .dual_value_az import DualValueAZLearner
 from .network import NetworkFactory, make_input_spec
 from .acting import MCTSActor
-from .search.mcts import PUCTSearchPolicy
 from .observers import MCTSObserver
 from .service.service import Program, ReverbService, RPCService, RPCClient, deploy_service
 from .service.inference_service import InferenceFactory, AlphaDevInferenceClient, AlphaDevInferenceService
@@ -76,11 +75,14 @@ class MCTS(agent.Agent):
         dirichlet_alpha: float = 1.0,
         exploration_fraction: float = 0.0,
         search_retain_subtree: bool = True,
-        use_apv_mcts: bool = False,
         # APV MCTS parameters
-        use_inference_server: bool = False,
+        use_apv_mcts: bool = False,
         apv_processes_per_pool: Optional[int] = None,
         virtual_loss_const: Optional[float] = None,
+        # inference server parameters
+        use_inference_server: bool = False,
+        search_batch_size: int = 1,
+        search_buffer_size: int = 3,
         # Other parameters
         use_dual_value_network: bool = False,
         logger: loggers.Logger = None,
@@ -88,7 +90,7 @@ class MCTS(agent.Agent):
     ):
         if use_apv_mcts:
             print('WARNING: APV_MCTS cannot be used in single-threaded mode. Support only for testing purposes.')
-
+        
         extra_spec = {
             'pi':
                 specs.Array(
@@ -104,33 +106,38 @@ class MCTS(agent.Agent):
             signature=adders.NStepTransitionAdder.signature(
                 environment_spec, extra_spec))
         self._server = reverb.Server([replay_table], port=None)
-
+        
         # The adder is used to insert observations into replay.
         address = f'localhost:{self._server.port}'
         adder = adders.NStepTransitionAdder(
             client=reverb.Client(address),
             n_step=n_step,
             discount=discount)
-
+        
         # The dataset provides an interface to sample from replay.
         dataset = datasets.make_reverb_dataset(server_address=address)
         dataset = dataset.batch(batch_size, drop_remainder=True)
-
+        
         if not use_apv_mcts or not use_inference_server:
             inference_client = None
             self.inference_handle = None
         elif use_inference_server:
             inference_service = AlphaDevInferenceService(
-                num_blocks=apv_processes_per_pool*2, # 2x the number of processes.
+                num_blocks=search_buffer_size, # 2x the number of processes.
                 network_factory=network_factory,
                 input_spec=environment_spec.observations,
-                output_spec=environment_spec.actions.shape[0], # num actions
+                output_spec=environment_spec.actions.num_values, # num actions
+                batch_size=search_batch_size,
                 variable_service=None,
                 factory_args=([make_input_spec(environment_spec.observations)],), # for the network factory
             )
             # run the service
             inference_client = inference_service.create_handle()
             self.inference_handle = deploy_service(inference_service.run, device_config=None, label='inference_service')
+        else:
+            # If we are not using APV MCTS, we don't need an inference service.
+            inference_client = None
+            self.inference_handle = None
         
         # initialize the network we are training
         network = network_factory(make_input_spec(environment_spec.observations))

@@ -120,7 +120,7 @@ class AlphaDevInferenceService(Service, IOBuffer):
             )
         return tf.function(network), variable_client
     
-    def run(self):
+    def run(self, *args, **kwargs):
         """Run the inference service.
         Take batches of inference tasks, process them with the network and write the results back to the shared memory.
         Note that  IOBuffer onlly uses a lock for writing, reading is lock free. consequently,
@@ -178,7 +178,7 @@ class AlphaDevInferenceService(Service, IOBuffer):
         The client can be used to submit inference tasks and read results.
         """
         return AlphaDevInferenceClient(
-            num_blocks=self.num_blocks,
+            num_blocks=self._num_blocks,
             input_cls=self.input_element,
             output_cls=self.output_element,
             name=self.name

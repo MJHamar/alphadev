@@ -160,6 +160,7 @@ class MCTSActor(acmeMCTSActor):
         variable_service: Optional[VariableService] = None,
         variable_update_period: int = 100,
     ):
+        logger.info("Initializing MCTSActor in single-threaded mode.")
         # make an evaluation factory, which will instantiate the network, 
         # initialize its parameters and connect to the variable service.
         eval_factory = self._make_eval_factory(
@@ -191,6 +192,7 @@ class MCTSActor(acmeMCTSActor):
             virtual_loss_const: Optional[float] = None,
     ):
         """Initializes the actor in 'streamlined' APV_MCTS mode."""
+        logger.info("Initializing MCTSActor in APV_MCTS 'streamlined' mode.")
         # make an evaluation factory, which will instantiate the network, 
         # initialize its parameters and connect to the variable service.
         eval_factory = self._make_eval_factory(
@@ -222,6 +224,7 @@ class MCTSActor(acmeMCTSActor):
         virtual_loss_const: Optional[float] = None,
     ):
         """Initializes the actor in 'alphago' APV_MCTS mode."""
+        logger.info("Initializing MCTSActor in APV_MCTS 'alphago' mode.")
         # In this mode, we use the inference service to perform policy and value evaluation.
         # The inference service is expected to be an instance of AlphaDevInferenceClient.
         if not isinstance(inference_service, AlphaDevInferenceClient):

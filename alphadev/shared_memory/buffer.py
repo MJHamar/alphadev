@@ -2,6 +2,7 @@ from .base import (
     ArrayElement, AtomicCounterElement, NestedArrayElement,
     BlockLayout, BaseMemoryManager)
 import multiprocessing as mp
+import multiprocessing.shared_memory as mp_shm
 from typing import Union, Callable, Dict, List, Optional, Generator
 import numpy as np
 import contextlib
@@ -14,7 +15,7 @@ class BufferInputFull(Exception): pass
 class BufferOutputFull(Exception): pass
 
 class BufferHeader(BlockLayout):
-    _required_attributes = ['in_index_w', 'in_index_f', 'in_index_r', 'in_index_rf', 'out_index_w', 'out_index_f', 'out_index_r']
+    _required_attributes = ['in_index_w', 'in_index_f', 'in_index_r', 'out_index_w', 'out_index_r']
     _elements = {
         # MPSC input buffer with frontiers with the invariant
         # read_head <= write_frontier <= write head and
@@ -47,6 +48,8 @@ class IOBuffer(BaseMemoryManager):
     def __init__(
         self, num_blocks, input_element: BlockLayout,
         output_element: BlockLayout, name: str = 'IOBuffer'):
+        self.name = name
+        
         self._header_cls = BufferHeader
         self._header_size = self._header_cls.get_block_size()
         self._header_name = f'{name}_header'
@@ -70,9 +73,9 @@ class IOBuffer(BaseMemoryManager):
     def configure(self):
         """To be called by the parent process to allocate shared memory blocks."""
         self._is_main = True
-        self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=True, size=self._header_size)
-        self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=True, size=self._input_size*self._num_blocks)
-        self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=True, size=self._output_size*self._num_blocks)
+        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
+        self._input_shm = mp_shm.SharedMemory(name=self._input_name, create=True, size=self._input_size*self._num_blocks)
+        self._output_shm = mp_shm.SharedMemory(name=self._output_name, create=True, size=self._output_size*self._num_blocks)
         
         self.header = self._header_cls(self._header_shm, 0, length=self._num_blocks)
         
@@ -89,9 +92,9 @@ class IOBuffer(BaseMemoryManager):
     
     def attach(self):
         self._is_main = False
-        self._header_shm = mp.shared_memory.SharedMemory(name=self._header_name, create=False, size=self._header_size)
-        self._input_shm = mp.shared_memory.SharedMemory(name=self._input_name, create=False, size=self._input_size)
-        self._output_shm = mp.shared_memory.SharedMemory(name=self._output_name, create=False, size=self._output_size)
+        self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
+        self._input_shm = mp_shm.SharedMemory(name=self._input_name, create=False, size=self._input_size)
+        self._output_shm = mp_shm.SharedMemory(name=self._output_name, create=False, size=self._output_size)
         self.header = self._header_cls(self._header_shm, 0, length=self._num_blocks)
     
     def __del__(self):

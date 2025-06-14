@@ -1,16 +1,8 @@
 """Definition of the AlphaZero learner with a dual value head."""
 import tensorflow as tf
-from acme.agents.tf.mcts import types
-import tree
-import numpy as np
-from scipy import special
 
 from .distribution import DistributionSupport
-from .acting import MCTSActor
-from .search.mcts import mcts, DvNode, visit_count_policy
 from .learning import AZLearner
-from .service.service import RPCClient
-from .service.variable_service import VariableService
 
 import logging
 logger = logging.getLogger(__name__)

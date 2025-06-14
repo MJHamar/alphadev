@@ -19,10 +19,11 @@ num_simulations: 1000
 discount: 1.0
 search_retain_subtree: True
 use_async_search: True
-search_batch_size: 1
-async_search_processes_per_pool: 8
+async_search_processes_per_pool: 1
 async_seach_virtual_loss: -1.0
-async_search_buffer_size: 'auto' # same as number of actors
+search_use_inference_server: True
+search_batch_size: 5 #'auto'
+search_buffer_size: 5 #'auto'
 
 # UCB formula
 pb_c_base: 19652

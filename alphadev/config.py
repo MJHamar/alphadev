@@ -98,9 +98,11 @@ class AlphaDevConfig(object):
     # search single-threaded or asynchronous
     use_async_search: bool = True # if False, all actors will have their own version of the network
     async_search_processes_per_pool: Union[int, str] = 'auto' # number of processes per pool, 'auto' will distribute all available cores evently
-    search_batch_size: int = 1
     async_seach_virtual_loss: float = -1.0 
-    async_search_buffer_size: int = 'auto'
+    # whether the search workers should use a dedicated inference server or instantiate the network directly
+    search_use_inference_server: bool = True # if False, the network will be used directly in the actor
+    search_batch_size: int = 'auto'
+    search_buffer_size: int = 'auto'
     # device config
     device_config_path: Optional[str] = 'device_config.yaml'
     
@@ -185,10 +187,16 @@ class AlphaDevConfig(object):
                 self.async_search_processes_per_pool = os.cpu_count() // self.async_search_num_pools
             elif not isinstance(self.async_search_processes_per_pool, int):
                 raise ValueError("async_search_processes_per_pool must be 'auto' or an integer.")
-            if isinstance(self.async_search_buffer_size, str) and self.async_search_buffer_size == 'auto':
-                self.async_search_buffer_size = self.async_search_processes_per_pool
+        if self.search_use_inference_server:
+            if isinstance(self.search_buffer_size, str) and self.search_buffer_size == 'auto':
+                self.search_buffer_size = self.async_search_processes_per_pool
             elif not (self.async_search_processes_per_pool, int):
-                raise ValueError("async_search_buffer_size must be 'auto' or an integer.")
+                raise ValueError("search_buffer_size must be 'auto' or an integer.")
+            
+            if isinstance(self.search_batch_size, str) and self.search_batch_size == 'auto':
+                self.search_batch_size = self.async_search_processes_per_pool
+            elif not isinstance(self.search_batch_size, int):
+                raise ValueError("search_batch_size must be 'auto' or an integer.")
         
         if self.replay_server_port is None:
             self.replay_server_port = portpicker.pick_unused_port()

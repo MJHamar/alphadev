@@ -47,7 +47,7 @@ def make_agent(config: AlphaDevConfig):
     
     if config.use_async_search:
         inference_factory = InferenceFactory(
-            num_blocks=config.async_search_buffer_size,
+            num_blocks=config.search_buffer_size,
             input_spec=env_spec.observations,
             output_spec=config.task_spec.num_actions, # TODO: obtain output spec from the network.
             batch_size=config.search_batch_size,
@@ -59,6 +59,7 @@ def make_agent(config: AlphaDevConfig):
         inference_factory = None
     
     if config.distributed:
+        assert False, "Distributed MCTS doesn't work rn."
         # -- distributed MCTS agent
         return DistributedMCTS(
             # device configuration for the different processes.
@@ -120,10 +121,12 @@ def make_agent(config: AlphaDevConfig):
             exploration_fraction=config.root_exploration_fraction,
             search_retain_subtree=config.search_retain_subtree,
             use_apv_mcts=config.use_async_search,
-            
-            inference_factory=inference_factory,
             apv_processes_per_pool=config.async_search_processes_per_pool,
             virtual_loss_const=config.async_seach_virtual_loss,
+            
+            use_inference_server=config.search_use_inference_server,
+            search_batch_size=config.search_batch_size,
+            search_buffer_size=config.search_buffer_size,
             
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger=cfg_logger,

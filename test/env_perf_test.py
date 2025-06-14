@@ -14,7 +14,7 @@ import numpy as np
 
 from alphadev.environment import AssemblyGame, EnvironmentFactory, AssemblyGameModel, ModelFactory
 from alphadev.acting import MCTSActor
-from alphadev.search import PUCTSearchPolicy
+from alphadev.search.mcts import PUCTSearchPolicy
 from alphadev.utils import TaskSpec, generate_sort_inputs
 from alphadev.config import AlphaDevConfig
 from alphadev.network import AlphaDevNetwork, NetworkFactory, make_input_spec
@@ -50,54 +50,8 @@ def make_ts(num_inputs):
         inputs=generate_sort_inputs(3,5,num_inputs),
         emulator_mode='i32'
     )
-    
-task_a10_i10 = make_ts(10)
-
-env_10 = AssemblyGame(task_spec=task_a10_i10)
 
 config = AlphaDevConfig.from_yaml(CFG_PATH)
-
-actor_10 = MCTSActor(
-    environment_spec=make_environment_spec(env_10),
-    network=DummyNetwork(num_actions=task_a10_i10.num_actions),
-    model=AssemblyGameModel(task_spec=task_a10_i10),
-    search_policy=PUCTSearchPolicy(c_puct_base=19652, c_puct_init=1.25),
-    temperature_fn=lambda x: 1.0,  # always deterministic
-    num_simulations=100,# make 100 rollouts
-    discount=1.0,
-)
-
-def make_apv_actor(config: AlphaDevConfig) -> MCTSActor:
-    env_10_spec = make_environment_spec(env_10)
-    net_factory = NetworkFactory(config)
-    inference_factory = InferenceFactory(
-        num_blocks=config.num_simulations,
-        input_spec=env_10_spec.observations,
-        output_spec=config.task_spec.num_actions, # TODO: obtain output spec from the network.
-        batch_size=config.search_batch_size,
-        network_factory=net_factory,
-        variable_update_period=config.variable_update_period,
-        network_factory_args=(make_input_spec(env_10_spec.observations),),
-    )
-    return MCTSActor(
-        environment_spec=env_10_spec,
-        model=AssemblyGameModel(task_spec=task_a10_i10),
-        discount=config.discount,
-        num_simulations=config.num_simulations,
-        search_policy=PUCTSearchPolicy(config.pb_c_base, config.pb_c_init),
-        temperature_fn=config.temperature_fn,
-        dirichlet_alpha=config.root_dirichlet_alpha,
-        exploration_fraction=config.root_exploration_fraction,
-        use_apv_mcts=True,
-        search_retain_subtree=config.search_retain_subtree,
-        apv_processes_per_pool=config.async_search_processes_per_pool,
-        search_batch_size=config.search_batch_size,
-        network=None,
-        variable_client=None,
-        # APV MCTS mode
-        inference_factory=inference_factory,
-        virtual_loss_const=config.async_seach_virtual_loss,
-    )
 
 # realistic scenario
 def actor_env_from_config(path) -> EnvironmentLoop:
@@ -180,7 +134,7 @@ def profile_env_loop(env, actor, num_steps):
     profiler.disable()
     stats = pstats.Stats(profiler)
     stats.sort_stats('cumulative')
-    print_mask_stats(actor._model._environment._action_space_storage)
+    # print_mask_stats(actor._model._environment._action_space_storage)
     return stats
 
 def profile_prepared_env_loop(loop: EnvironmentLoop, num_steps):
@@ -205,16 +159,12 @@ def profile_select_n_actions(env, actor, num_actions):
     profiler.disable()
     stats = pstats.Stats(profiler)
     stats.sort_stats('cumulative')
-    print_mask_stats(actor._model._environment._action_space_storage)
+    # print_mask_stats(actor._model._environment._action_space_storage)
     return stats
 
-def main(id_, actor=None, env_loop=None):
-    if actor is None:
-        actor = actor_10
-    if env_loop is None:
-        env = env_10
-    else:
-        env = env_loop._environment
+def main(id_, actor, env_loop):
+    actor = env_loop._actor
+    env = env_loop._environment
     
     num_steps = 100
     num_episodes = 1 # x100
@@ -226,8 +176,6 @@ def main(id_, actor=None, env_loop=None):
     print("Profiling Environment Loop...")
     if env_loop is not None:
         env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
-    else:
-        env_loop_stats = profile_env_loop(env_10, actor_10, num_episodes)
     env_loop_stats.dump_stats(f'profile/env_loop_profile_{id_}.prof')
     subprocess.run(['flameprof', '-i', f'profile/env_loop_profile_{id_}.prof', '-o', f'profile/env_loop_flamegraph_{id_}.svg'])
     print("Profiling complete.")
@@ -239,10 +187,7 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         sys.argv.append('debug')
     print("Arguments:", sys.argv)
-    if len(sys.argv) == 3:
-        actor, env_loop = actor_env_from_config(sys.argv[2])
-        print(f"Using actor {actor} and environment loop {env_loop}.")
-        main(id_=sys.argv[1], actor=actor, env_loop=env_loop)
-    else:
-        print("No environment loop provided, using default actor and environment.")
-        main(id_=sys.argv[1])
+    assert len(sys.argv) == 3, "Usage: python env_perf_test.py <id> <config_path>"
+    actor, env_loop = actor_env_from_config(sys.argv[2])
+    print(f"Using actor {actor} and environment loop {env_loop}.")
+    main(id_=sys.argv[1], actor=actor, env_loop=env_loop)
