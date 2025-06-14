@@ -196,6 +196,11 @@ class NodeBase:
 
     def __repr__(self):
         return f"{'Root' if self.is_root() else 'Node'}(action={self.action}, ex={self.expanded}, term={self.terminal})"
+    
+    def __eq__(self):
+        """Check if two nodes are equal based on their action and parent."""
+        # FIXME
+        return False 
 
 class MCTSBase:
     """Base class for MCTS algorithms."""
@@ -295,6 +300,7 @@ class MCTSBase:
             action = self.search_policy(node)
             # use `select_child` instead of `get_child` in case we need to do extra processing.
             node = self.select_child(node, action)
+            # assert node not in trajectory, "Cycle detected. Node: {}; write head: {}; index {}; Trajectory: {}".format(node, self._local_write_head, self.header.available[self._local_write_head-2:self._local_write_head+2], trajectory)
             trajectory.append(node)
             actions.append(action)
         logger.debug(f"Selected actions: {actions} with trajectory: {trajectory}.")

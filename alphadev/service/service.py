@@ -485,6 +485,7 @@ def deploy_service(executable: callable, device_config:Dict[str, str] = None, la
             *args
         ])
         handles.append((new_label, proc, fl))
+        sleep(2) # Give the process some time to start
     return handles
 
 def terminate_services(handles) -> int:

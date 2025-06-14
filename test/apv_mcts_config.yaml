@@ -2,8 +2,8 @@ experiment_name: AlphaDev-Sort3-APV-MCTS
 
 # Environment
 num_inputs: 17
-num_mem: 3
-num_regs: 6
+num_mem: 6
+num_regs: 5
 items_to_sort: 3
 correct_reward: 1.0
 correctness_reward_weight: 2.0
@@ -15,7 +15,7 @@ emulator_mode: 'i32'
 # Self-Play
 num_actors: 2
 max_moves: 100
-num_simulations: 100
+num_simulations: 1000
 discount: 1.0
 search_retain_subtree: True
 use_async_search: True

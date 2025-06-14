@@ -17,7 +17,7 @@ from .mcts import MCTSBase, NodeBase
 _local_id = 'main'
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 logging.basicConfig(
     format=f'process {_local_id}: %(levelname)s: %(message)s',
 )
@@ -220,10 +220,16 @@ class SharedNodeBase(NodeBase, BlockLayout):
         """
         return self.children[action]
 
+    def __eq__(self, other):
+        # same parent and action
+        return self.header[self.__class__.hdr_parent] == other.header[self.__class__.hdr_parent] and \
+            self.header[self.__class__.hdr_action] == other.header[self.__class__.hdr_action]
+
 class SharedTreeHeaderBase(BlockLayout):
     _required_attributes = ['root_offset', 'available', 'tasks']
     _elements = {
         'root_offset': ArrayElement(np.int32, ()),  # offset of the root node in the shared memory
+        'num_writers': ArrayElement(np.int32, ()),  # number of writer processes.
     }
     @classmethod
     def define(cls, length: int, num_workers: int):
@@ -327,7 +333,6 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         # process-local
         self._is_main = False
         self._local_write_head = None
-        self._write_head_increment = None
         self._is_attached = False
         # shared memory objects
         self._header_shm = None
@@ -472,7 +477,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 self.attach()
                 attached = True
             except FileNotFoundError:
-                logger.debug('SharedTree._worker_init: waiting for shared memory to be created.')
+                logger.debug('SharedTree.run_worker: waiting for shared memory to be created.')
                 # wait for the main process to create the shared memory
                 sleep(0.1)
         # loop forever
@@ -484,7 +489,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 continue
             # perform the task until the tree is full.
             if task_id == APV_MCTS._EXIT:
-                logger.debug('SharedTree._worker_init: worker %d received exit signal.', worker_id)
+                logger.debug('SharedTree.run_worker: worker %d received exit signal.', worker_id)
                 break
             stats = []
             # reset local write head for this worker if applicable
@@ -510,7 +515,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             passes = sum([1 for result, _ in stats if result])
             fails = len(stats) - passes
             pass_times = [t for result, t in stats if result]
-            logger.info('SharedTree._worker_init: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
+            logger.debug('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
                 worker_id, task_id, passes, fails,
                 np.mean(pass_times) if pass_times else 0.0,
                 np.min(pass_times) if pass_times else 0.0,
@@ -526,15 +531,12 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         """
         # only the ROLLOUT or SEARCH tasks need a write head.
         # count how many there are
-        self._write_head_increment = (
-            np.sum(self.header.tasks == APV_MCTS._ROLLOUT) +
-            np.sum(self.header.tasks == APV_MCTS._SEARCH))
         if self.header.tasks[worker_id] in (APV_MCTS._ROLLOUT, APV_MCTS._SEARCH):
             self._local_write_head = worker_id
         else:
             self._local_write_head = None
         logger.debug('SharedTree.worker_ready: worker %d is ready with write head %s, increment %s.',
-            worker_id, self._local_write_head, self._write_head_increment)
+            worker_id, self._local_write_head, self.write_head_increment)
     
     def search(self, observation: types.Observation, last_action: Optional[int] = None):
         """
@@ -556,21 +558,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             # wait for the worker processes to finish searching
             sleep(0.001)
                 # DFS on the tree to see longest path from the root
-        if logger.isEnabledFor(logging.DEBUG):
-            frontier = [(root, 0)]
-            max_path = 0
-            while frontier:
-                node, depth = frontier.pop()
-                if not node.expanded:
-                    continue
-                for action in range(self.num_actions):
-                    child_offset = node.get_child(action)
-                    if child_offset == -1:
-                        continue
-                    child_node = self._node_cls(self._data_shm, child_offset)
-                    frontier.append((child_node, depth + 1))
-                    max_path = max(max_path, depth + 1)
-            logger.debug('SharedTree.search: longest path from root is %d.', max_path)
+        self.clear_tasks()
         return root
     
     def rollout(self) -> bool:
@@ -579,36 +567,36 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         try:
             # 1. search for a leaf node in the tree.
             # the in_tree phase cannot break otherwise we are doomed.
-            # logger.debug('SharedTree.rollout: --- in_tree call')
+            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- in_tree call')
             trajectory, actions = self.in_tree(root)
             # check for race conditions 
             #  - another process expanded in the meantime or
             #  - the last node is not consistent with its parent.
             if trajectory[-1].expanded or not trajectory[-1].is_consistent():
-                # logger.debug('SharedTree.rollout: fail after in_tree exp: %s, consistent: %s', trajectory[-1].expanded, trajectory[-1].is_consistent())
+                logger.debug(f'SharedTree.rollout_{self._local_write_head}: fail after in_tree exp: %s, consistent: %s', trajectory[-1].expanded, trajectory[-1].is_consistent())
                 self.fail(trajectory=trajectory)
                 return False
             # 2. simulate the trajectory
-            # logger.debug('SharedTree.rollout: --- simulate call')
+            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- simulate call')
             node, observation = self.simulate(node=trajectory[-1], ancestors=trajectory[:-2], actions=actions)
             if not node.is_consistent():
-                # logger.debug('SharedTree.rollout: fail after simulate: node %s is not consistent with its parent %s.', repr(node), repr(node.parent))
+                logger.debug(f'SharedTree.rollout_{self._local_write_head}: fail after simulate: node %s is not consistent with its parent %s.', repr(node), repr(node.parent))
                 self.fail(trajectory=trajectory)
                 return False
             # 3. evaluate the node
-            # logger.debug('SharedTree.rollout: --- evaluate call')
+            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- evaluate call')
             _, value = self.evaluate(node, observation)
             # 4. backup the value and the node
-            # logger.debug('SharedTree.rollout: --- backup call')
+            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- backup call')
             self.backup(node, value)
             self.succeed()
-            # logger.debug('SharedTree.rollout: --- success.')
+            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- success.')
             return True
         except TreeFull: # can happen, nothing to do
             self.fail(trajectory=trajectory)
             return False
         except Exception as e:
-            # logger.exception('SharedTree.rollout: error during rollout: %s', e)
+            logger.exception(f'SharedTree.rollout_{self._local_write_head}: error during rollout: %s', e)
             if len(trajectory) > 0:
                 self.fail(trajectory=trajectory)
             raise e
@@ -680,8 +668,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     
     def select_child(self, node, action):
         assert node.expanded, "Node must be expanded to select a child."
-        # logger.debug('%s.select_child called with action %s.', repr(node), action)
         child_offset = node.select(action)
+        logger.debug('%s.select_child called with action %s. offset %s', repr(node), action, child_offset)
         if child_offset == -1:
             # make a new node and ignore race conditions
             return self._make_node(parent=node, action=action)
@@ -691,12 +679,10 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         if parent is None and action is None:
             # create a new root node
             return self.get_by_offset(self.header.root_offset.item())
-        if self._local_write_head is None:
-            assert not self._is_main, "_make_node should only be called from a worker process."
-            raise TreeFull()
-        # logger.debug('SharedTree._make_node called with parent %s, action %s.', repr(parent), action)
-        # logger.debug('SharedTree._make_node: local write head %s. available %s', self._local_write_head,self.header.available[self._local_write_head])
+        logger.debug('SharedTree._make_node called with parent %s, action %s.', repr(parent), action)
+        logger.debug('SharedTree._make_node: local write head %s. available %s', self._local_write_head,self.header.available[self._local_write_head])
         node = self.get_node(self.header.available[self._local_write_head])
+        assert not node.expanded, "Node must not be expanded when created."
         # override the parent's child pointer regardless of race conditions
         node.set_parent(parent, action)
         parent.set_child(action, node)  # set the child pointer in the parent node
@@ -782,7 +768,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         # increment the write head by the number of workers.
         # this way we are guaranteed that no two workers will write to the same block
         # while also avoiding having to synchronize the write head.
-        self._local_write_head = self._local_write_head + self._write_head_increment
+        self._local_write_head = self._local_write_head + self.write_head_increment
+        logger.debug('SharedTree._update_index: local write head updated to %s.', self._local_write_head)
         return self._local_write_head
     
     def fail(self, trajectory: Optional[List[SharedNodeBase]] = None, node: Optional[SharedNodeBase] = None):
@@ -837,6 +824,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         if self.inference_server is None:
             # signal all workers to perform rollouts
             self.header.tasks[:] = APV_MCTS._ROLLOUT
+            self.header.num_writers[...] = self.num_workers
         else:
             # all but one worker searches, the last one backtracks
             tasks = np.full(self.header.tasks.shape, APV_MCTS._SEARCH, dtype=np.int32)
@@ -844,4 +832,18 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             # if this is not the case, the memory will have holes in it.
             tasks[-1] = APV_MCTS._BACKTRACK
             self.header.tasks[:] = tasks
+            self.header.num_writers[...] = self.num_workers - 1
         logger.debug('SharedTree.allocate_tasks: tasks allocated: %s', self.header.tasks)
+    
+    @property
+    def write_head_increment(self) -> int:
+        while (increment := self.header.num_writers) == 0:
+            # wait for the main process to set the write head
+            sleep(0.001)
+        return increment
+    
+    def clear_tasks(self):
+        """Clear the tasks in the header."""
+        self.header.tasks[:] = APV_MCTS._IDLE
+        self.header.num_writers[...] = 0
+        # logger.debug('SharedTree.clear_tasks: tasks cleared.')
