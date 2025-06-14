@@ -15,7 +15,7 @@ emulator_mode: 'i32'
 # Self-Play
 num_actors: 2
 max_moves: 100
-num_simulations: 1000
+num_simulations: 100
 discount: 1.0
 search_retain_subtree: True
 use_async_search: True

@@ -68,6 +68,8 @@ class DummyModel:
         """Returns a list of legal actions."""
         return np.array([True]*ADConfig.task_spec.num_actions, dtype=np.bool_)
 
+def select_one(root):
+    return 1
 
 def run_mcts():
     """Run the MCTS algorithm with a dummy model and evaluation function."""
@@ -90,7 +92,8 @@ def run_mcts():
         num_simulations=num_simulations,
         num_actions=ADConfig.task_spec.num_actions,
         model=DummyModel(timestep),
-        search_policy=PUCTSearchPolicy(),
+        # search_policy=PUCTSearchPolicy(),
+        search_policy=select_one,
         num_workers=1,
         inference_server=None,
         evaluation_factory=dummy_eval_factory,

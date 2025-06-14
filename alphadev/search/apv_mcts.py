@@ -555,6 +555,22 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         while not np.all(self.header.tasks == APV_MCTS._IDLE):
             # wait for the worker processes to finish searching
             sleep(0.001)
+                # DFS on the tree to see longest path from the root
+        if logger.isEnabledFor(logging.DEBUG):
+            frontier = [(root, 0)]
+            max_path = 0
+            while frontier:
+                node, depth = frontier.pop()
+                if not node.expanded:
+                    continue
+                for action in range(self.num_actions):
+                    child_offset = node.get_child(action)
+                    if child_offset == -1:
+                        continue
+                    child_node = self._node_cls(self._data_shm, child_offset)
+                    frontier.append((child_node, depth + 1))
+                    max_path = max(max_path, depth + 1)
+            logger.debug('SharedTree.search: longest path from root is %d.', max_path)
         return root
     
     def rollout(self) -> bool:
@@ -760,7 +776,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 self._data_shm.unlink()
             except FileNotFoundError:
                 logger.warning('SharedTree.__del__: shared memory already unlinked.')
-        logger.debug('SharedTree.__del__: %s terminated', self.name)
+        # logger.debug('SharedTree.__del__: %s terminated', self.name)
     
     def _update_index(self):
         # increment the write head by the number of workers.
