@@ -512,15 +512,16 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             self.header.tasks[worker_id] = APV_MCTS._IDLE
             # log the statistics
             # TODO: pass stats to main process.
-            passes = sum([1 for result, _ in stats if result])
-            fails = len(stats) - passes
-            pass_times = [t for result, t in stats if result]
-            logger.debug('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
-                worker_id, task_id, passes, fails,
-                np.mean(pass_times) if pass_times else 0.0,
-                np.min(pass_times) if pass_times else 0.0,
-                np.max(pass_times) if pass_times else 0.0
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                passes = sum([1 for result, _ in stats if result])
+                fails = len(stats) - passes
+                pass_times = [t for result, t in stats if result]
+                logger.debug('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
+                    worker_id, task_id, passes, fails,
+                    np.mean(pass_times) if pass_times else 0.0,
+                    np.min(pass_times) if pass_times else 0.0,
+                    np.max(pass_times) if pass_times else 0.0
+                )
     
     def worker_ready(self, worker_id: int):
         """
