@@ -17,7 +17,7 @@ from .mcts import MCTSBase, NodeBase
 _local_id = 'main'
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 logging.basicConfig(
     format=f'process {_local_id}: %(levelname)s: %(message)s',
 )
@@ -406,7 +406,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             # 4.1 if the legal actions are not set, we need to get them from the model.
             legal_actions = self.model.legal_actions()
             new_root.set_legal_actions(legal_actions)
-        
+        logger.debug('SharedTree.init_tree: root node %s initialized.',
+            repr(new_root))
         # 5. return the root node.
         return new_root
     
@@ -481,17 +482,21 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 # wait for the main process to create the shared memory
                 sleep(0.1)
         # loop forever
+        logger.debug('SharedTree.run_worker: worker %d attached to shared memory.', worker_id)
         while True:
             task_id = self.header.tasks[worker_id]
+            logger.debug('SharedTree.run_worker: worker %d waiting for task, current task id: %d.', worker_id, task_id)
             while task_id == APV_MCTS._IDLE:
                 task_id = self.header.tasks[worker_id]
                 sleep(0.001) # stay eager for the next task
                 continue
+            logger.debug('SharedTree.run_worker: worker %d received task %d.', worker_id, task_id)
             # perform the task until the tree is full.
             if task_id == APV_MCTS._EXIT:
                 logger.debug('SharedTree.run_worker: worker %d received exit signal.', worker_id)
                 break
             stats = []
+            logger.debug('SharedTree.run_worker: worker %d starting task %d.', worker_id, task_id)
             # reset local write head for this worker if applicable
             self.worker_ready(worker_id)
             while not self.is_full(task_id):
@@ -705,11 +710,12 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             'node_offset': offset, 'observation': observation})
         # wait for the result to be ready
         with self.inference_server.read_ready(max_samples=1) as ready:
-            logger.debug('SharedTree._eval_await: received ready object %s.', ready)
+            assert len(ready) == 1, "Expected exactly one ready object."
             ready = ready[0]
             assert ready.node_offset == offset, f"The node offset in the ready object {ready.node_offset} does not match the requested node {offset}. The inference server had leftovers."
             prior = ready.prior
             value = ready.value.item()
+        logger.debug('SharedTree._eval_await: returning with prior %s, value %s.', prior.shape, value)
         return prior, value
     
     def configure(self):
@@ -836,6 +842,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             # if this is not the case, the memory will have holes in it.
             tasks[-1] = APV_MCTS._BACKTRACK
             self.header.tasks[:] = tasks
+            assert self.num_workers > 1, "At least two workers are required for APV_MCTS with inference server."
             self.header.num_writers[...] = self.num_workers - 1
         logger.debug('SharedTree.allocate_tasks: tasks allocated: %s', self.header.tasks)
     

@@ -176,9 +176,10 @@ class IOBuffer(BaseMemoryManager):
         while self.header.out_index_w - self.header.out_index_r < increment:
             # logger.debug("IOBuffer: _get_out_read_batch() waiting for output blocks to be written...")
             sleep(0.0001)
+        # logger.debug("IOBuffer: _get_out_read_batch() w %d, r %d", self.header.out_index_w, self.header.out_index_r)
         increment = min(increment, self.header.out_index_w - self.header.out_index_r)
         indices = np.arange(self.header.out_index_r, self.header.out_index_r + increment) & self._mask
-        logger.debug("IOBuffer: _get_out_read_batch() returning indices %s", indices)
+        # logger.debug("IOBuffer: _get_out_read_batch() returning indices %s", indices)
         return indices
     
     def submit(self, **payload):
@@ -231,7 +232,7 @@ class IOBuffer(BaseMemoryManager):
                 self._set_in_read(1)  # mark the block as read
             ret.append(iblock)
         if len(ret) > 0:
-            logger.debug("IOBuffer: read_submited() returning %s", ret)
+            logger.debug("IOBuffer: read_submited() returning with %s inputs", len(ret))
         yield ret
         if not localize: self._set_in_read(len(indices))
     
@@ -246,10 +247,10 @@ class IOBuffer(BaseMemoryManager):
         If using with localize=False, make sure to read the blocks before exiting the context,
         otherwise the blocks will be marked as read and will not be available for reading again.
         """
-        # logger.debug("IOBuffer: read_ready() called, max_samples=%d, localize=%s", max_samples, localize)
         if not self._is_attached:
             self.attach()
         indices = self._get_out_read_batch(max_samples)
+        logger.debug("IOBuffer: read_ready() output indices to read: %s", indices)
         
         ret = []
         for index in indices:
@@ -258,7 +259,7 @@ class IOBuffer(BaseMemoryManager):
                 oblock = oblock.read()
                 self._set_out_written(1)
             ret.append(oblock)
-        logger.debug("IOBuffer: read_ready() returning %s", ret)
+        logger.debug("IOBuffer: read_ready() returning with %d outputs", len(ret))
         yield ret
         if not localize: self._set_out_written(len(indices))
     
