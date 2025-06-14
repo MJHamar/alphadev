@@ -489,7 +489,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             stats = []
             # reset local write head for this worker if applicable
             self.worker_ready(worker_id)
-            while not self.is_full():
+            while not self.is_full(task_id):
                 start = time() # start the timer
                 if task_id == APV_MCTS._ROLLOUT:
                     # perform a rollout
@@ -766,13 +766,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         # increment the write head by the number of workers.
         # this way we are guaranteed that no two workers will write to the same block
         # while also avoiding having to synchronize the write head.
-        index = self._local_write_head + self._write_head_increment
-        if index >= self.num_nodes:
-            self._local_write_head = None # we are done
-            return None
-        else:
-            self._local_write_head = self.header.available[index]
-            return self._local_write_head
+        self._local_write_head = self._local_write_head + self._write_head_increment
+        return self._local_write_head
     
     def fail(self, trajectory: Optional[List[SharedNodeBase]] = None, node: Optional[SharedNodeBase] = None):
         if trajectory is not None:
@@ -805,12 +800,22 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     def get_by_offset(self, offset: int) -> SharedNodeBase:
         return self._node_cls(self._data_shm, offset)
     
-    def is_full(self) -> bool:
+    def is_full(self, task_id) -> bool:
         """
-        Check if the tree is full.
+        Check if the tree is full. The logic differs depending on the task:
+        - For ROLLOUT and SEARCH tasks, the tree is full if the local write head
+          is greater than or equal to the number of blocks.
+        - For BACKTRACK tasks, the tree is full if the inference server is idle
+          and all tasks in the header are set to IDLE or one of them EXITed.
+        - For IDLE and EXIT task ids, an exception is raised.
         The tree is full if the index is equal to the number of blocks.
         """
-        return self._local_write_head is None or self._local_write_head >= self.num_nodes
+        if task_id == APV_MCTS._ROLLOUT or task_id == APV_MCTS._SEARCH:
+            return self._local_write_head >= self.num_nodes
+        elif task_id == APV_MCTS._BACKTRACK:
+            return self.inference_server.is_idle() and np.all(self.header.tasks[:-1] == APV_MCTS._IDLE)
+        else:
+            raise ValueError(f"Invalid task_id {task_id}. Cannot check if the tree is full.")
     
     def allocate_tasks(self):
         if self.inference_server is None:
