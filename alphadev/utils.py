@@ -1,7 +1,7 @@
 from typing import Any, Callable, List, NamedTuple, Tuple, Dict, Generator, Literal
 import itertools
 import numpy as np
-import tensorflow as tf
+from .tf_util import tf
 
 # #################
 # Type definitions

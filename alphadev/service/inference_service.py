@@ -2,7 +2,7 @@ from typing import Callable, Union, Optional, NamedTuple, Dict, Any
 from time import sleep
 import numpy as np
 import sonnet as snn
-import tensorflow as tf
+from ..tf_util import tf
 import tree
 
 from acme.tf import variable_utils as tf2_variable_utils

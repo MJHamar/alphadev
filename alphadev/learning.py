@@ -1,7 +1,7 @@
 """Customized implementation of the AZLearner class from acme."""
 from typing import Optional, List
 import sonnet as snn
-import tensorflow as tf
+from .tf_util import tf
 import numpy as np
 
 import acme

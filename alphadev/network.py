@@ -5,7 +5,7 @@
 from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import sonnet as snn
-import tensorflow as tf
+from .tf_util import tf
 
 import ml_collections
 import functools

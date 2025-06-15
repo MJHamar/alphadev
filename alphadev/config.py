@@ -6,7 +6,6 @@ import dataclasses
 import ml_collections
 import numpy as np
 import portpicker
-import tensorflow as tf
 
 from acme.utils.loggers import make_default_logger, Logger
 

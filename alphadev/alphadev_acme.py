@@ -2,7 +2,7 @@
 Main script for running AlphaDev with an ACME and reverb backend.
 """
 import sonnet as snn
-import tensorflow as tf
+from .tf_util import tf
 
 import numpy as np
 import ml_collections

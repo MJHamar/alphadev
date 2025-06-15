@@ -34,7 +34,7 @@ import dm_env
 import numpy as np
 from scipy import special
 import sonnet as snt
-import tensorflow as tf
+from .tf_util import tf
 import tree
 
 from .observers import MCTSObserver

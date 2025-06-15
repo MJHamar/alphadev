@@ -1,4 +1,4 @@
-import tensorflow as tf
+from .tf_util import tf
 
 import logging
 logger = logging.getLogger(__name__)

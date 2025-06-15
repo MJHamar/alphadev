@@ -1,215 +1,125 @@
-import sys
-import os
-from alphadev.config import AlphaDevConfig
-import tensorflow as tf
+from enum import Enum
 import yaml
 
-import acme.tf.utils as tf2_utils
-from acme.specs import make_environment_spec
+class ProcessType(Enum):
+    LEARNER = "learner"
+    ACTOR = "actor"
+    CONTROLLER = "controller"
 
-class DeviceAllocationConfig:
+def compute_device_config(ad_config_path: str):
     """
-    When using distributed training, this class is used to pre-compute the device allocation for each concurrent component.
+    To be called prior to running the alphadev pipeline.
     
-    What we expect:
-    - 1 learner process.
-    - N+1 actor processes (N for experience replay, 1 for evaluation).
-    - OR, a single inference service that does inference for all actors.
+    Computes a device configuration based on the configuration file.
     
-    Before distributed training is launched, we perform the following steps:
-    1. Construct an instance of the network on CPU to determine its size.
-    2. Pre-compute device allocation for each component based on the number of components, number of available GPUs and the size of the network.
-        - For the learner process, we assume network_size * 3 memory demand.
-        - For each actor process, we assume network_size * 1.2 memory demand.
-    3. Prepare callbacks to be called by each component when their corresponding process is launched.
-    If no GPU is available, this is a NoOp.
+    There are three types of configurations:
+    - learner: uses the GPU for training.
+    - actor: uses the GPU for inference.
+    - controller: does not use the GPU but supervises the other processes.
+    
+    This method finds the expected number of GPU workers and divides the available GPUs evently among them.
+    There is always one learner process.
+    Depending on the mcts configuration, there is either
+    - num_actors actor processes, in case of single-threaded MCTS or alphago-style APV MCTS,
+    - num_actors * (async_search_processes_per_pool + 1) actor processes, in case of distributed MCTS.
+        the +1 comes from the fact that the controller (APV_MCTS) also needs GPU to initialize the search tree.
+    The controller process does not use the GPU.
     """
-    ACTOR_PROCESS = 'actor'
-    LEARNER_PROCESS = 'learner'
-    APV_WORKER_PROCESS = 'apv_worker'
+    # import tensorflow here
+    import tensorflow as tf
+    from .config import AlphaDevConfig
     
-    def __init__(self, config: AlphaDevConfig):
-        self.config = config
-        self.inference_mode = False # TODO: remove
-        self.num_actors = config.num_actors if not self.inference_mode else 1
-        self.gpus = tf.config.list_physical_devices('GPU')
-        # determine the network size in a new process so that we don't interfere with the main process
-        self.device_allocations = self.compute_device_allocations()
+    ad_config = AlphaDevConfig.from_yaml(ad_config_path)
     
-    def get(self, process_type: str, index: int = 0) -> dict:
-        key = self.make_process_key(process_type, index)
-        return self.device_allocations[key] if key in self.device_allocations else None
+    cpu_device = tf.config.list_physical_devices('CPU')[0]
+    gpu_devices = tf.config.list_physical_devices('GPU')
     
-    @classmethod
-    def load_empty(cls):
-        cfg = cls.__new__(cls)
-        cfg.device_allocations = {}
-        return cfg
+    config = {}
+    # 1. controller configuration
+    config[ProcessType.CONTROLLER] = {
+        "device_name": cpu_device.name,
+        "allocation_size": None,
+    }
+    # 2. find the number of GPU users
+    num_gpu_users = 1  # always one learner
+    if not ad_config.use_async_search:
+        num_gpu_users += ad_config.num_actors
+    elif ad_config.search_use_inference_server:
+        # alphadev-style APV MCTS. one GPU user for each actor.
+        num_gpu_users += ad_config.num_actors
+    else:
+        # 'streamlined' MCTS. every search actor uses the GPU.
+        num_gpu_users += ad_config.num_actors * (ad_config.async_search_processes_per_pool + 1)
+    # 3. divide the GPUs among the GPU users
+    num_gpus = len(gpu_devices)
+    if num_gpus == 0:
+        config[ProcessType.LEARNER] = config[ProcessType.ACTOR] = config[ProcessType.CONTROLLER]
+        return config
+    users_per_gpu = num_gpu_users // num_gpus
+    if users_per_gpu == 0: # the unlikely case when there are more GPUs than users
+        users_per_gpu = 1
+    gpu_sizes = [gpu_devices[i % num_gpus].memory_limit // users_per_gpu for i in range(num_gpu_users)]
+    # 4. assign the GPUs to the processes
+    config[ProcessType.LEARNER] = {
+        "device_name": gpu_devices[0].name,
+        "allocation_size": gpu_sizes[0],
+    }
+    # 5. assign the GPUs to the actors
+    config[ProcessType.ACTOR] = [{
+        "device_name": gpu_devices[i].name,
+        "allocation_size": gpu_sizes[i],
+    } for i in range(1, num_gpu_users)]
     
-    @classmethod
-    def load(cls, config_path: str):
-        raise NotImplementedError(
-            "Loading from a file is not implemented yet. "
-            "Please use the constructor to create a new instance."
-        )
-    
-    @staticmethod
-    def make_process_key(process_type: str, index: int = 0) -> str:
-        return f"{process_type}_{index}"
-    
-    def _compute_network_size(self, batch_size: int = 1) -> int:
-        """Compute the size of the network in bytes."""
-        from .network import NetworkFactory, make_input_spec
-        from .environment import EnvironmentFactory
-        print("Computing network size...")
-        # create a new tf session temporarily to containerize this computation
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            print("Using GPU for network size computation.")
-            tf.config.experimental.set_memory_growth(gpus[0], True)
-            env = EnvironmentFactory(self.config)()
-            env_spec = make_environment_spec(env)
-            network = NetworkFactory(self.config)(make_input_spec(env_spec.observations))
-            tf2_utils.create_variables(
-                network, [env_spec.observations],
-                batch_size=batch_size,
-            )
-            memory_info = tf.config.experimental.get_memory_info(gpus[0])
-            print("Peak Memory Usage:", memory_info['peak'])
-            return memory_info['peak']
-        else:
-            print("No GPU available, returning 0 for network size.")
-            return 0
-    
-    def compute_network_size(self, batch_size: int = 1) -> int:
-        import multiprocessing as mp
-        
-        with mp.Pool(1) as pool:
-            network_size = pool.apply(self._compute_network_size, args=(batch_size,))
-        
-        print(f"Network size: {network_size} bytes")
-        return network_size
-    
-    def _get_total_memory(self):
-        import subprocess
-        
-        try:
-            # nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits
-            output = subprocess.check_output(
-                ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
-                encoding='utf-8', stderr=subprocess.DEVNULL
-            )
-            mem_mb = output.strip().split('\n')
-            mem_bytes = [int(mb) * 1024 * 1024 for mb in mem_mb]
-            return mem_bytes
-        except subprocess.CalledProcessError:
-            print("Failed to get GPU memory info, returning empty list.")
-            return []
-    
-    def compute_device_allocations(self):
-        """
-        Compute the device allocations for each component.
-        """
-        if len(self.gpus) == 0:
-            print("No GPUs available, returning empty device allocations.")
-            return {}
-        
-        device_allocations = {}
-        
-        gpu_totals = self._get_total_memory()
-        print(f"Total GPU memory available: {gpu_totals} bytes")
-        if not gpu_totals:
-            print("No GPU memory information available, returning empty device allocations.")
-            return {}
-        assert len(gpu_totals) == len(self.gpus), "Mismatch between number of GPUs and memory totals."
-        
-        gpu_available = dict(zip(self.gpus, gpu_totals))
-        gpu_totals = sum(gpu_available.values())
-        # device_allocations[self._make_process_key('inference_service')] = {
-        #     'gpu': learner_gpu,
-        #     'memory': actor_memory
-        # }
-        learner_memory = self.compute_network_size(self.config.batch_size) * 3
-        print(f"Learner process memory allocation: {learner_memory} bytes")
-        if self.inference_mode:
-            actor_memory = self.compute_network_size(self.config.batch_size) * 2
-            print(f"Inference service memory allocation: {actor_memory} bytes")
-        else:
-            actor_memory = self.compute_network_size(1) * 2
-            print(f"Actor process memory allocation: {actor_memory} bytes")
-        
-        min_slot_sizes = [learner_memory] + [actor_memory] * self.num_actors
-        process_types = [self.LEARNER_PROCESS] + [self.ACTOR_PROCESS] * self.num_actors
-        # iteratively, we distribute the processes (1 learner, N actors) evenly across the avilable GPUs,
-        # keeping track of the total memory demand for each GPU
-        gpu_allocations = {gpu: [] for gpu in self.gpus}
-        # allocate the learner to the first GPU
-        learner_gpu = self.gpus[0]
-        gpu_allocations[learner_gpu].append(0)
-        gpu_index = 1 if len(self.gpus) > 1 else 0
-        for i in range(1, self.num_actors + 1):
-            gpu = self.gpus[gpu_index]
-            gpu_allocations[gpu].append(i)
-            gpu_index = (gpu_index + 1) % len(self.gpus)
-        print(f"GPU allocations: {gpu_allocations}")
-        # now, gpu_allocations maps process indices to GPUs.
-        # we are ready to compute the device allocations
-        for gpu, indices in gpu_allocations.items():
-            gpu_memory = gpu_available[gpu]
-            slot_size = gpu_memory // len(indices)
-            for index in indices:
-                if slot_size < min_slot_sizes[index]:
-                    raise ValueError(
-                        f"Not enough memory on GPU {gpu} for process {process_types[index]}: "
-                        f"required {min_slot_sizes[index]} bytes, available {slot_size} bytes."
-                    )
-                process_type = process_types[index]
-                # decrement the index by 1 for the actor processes.
-                idx = index-1 if index > 0 else 0
-                device_allocations[self._make_process_key(process_type, idx)] = {
-                    'gpu': gpu,
-                    'memory': slot_size
-                }
-        print(f"Device allocations: {device_allocations}")
-        return device_allocations
+    return config
 
-def apply_device_config(device_allocation: dict):
-    """
-    Apply the device allocation configuration to the current TensorFlow session.
+class DeviceConfig:
+    def __init__(self, path: str):
+        self.config = yaml.safe_load(open(path, 'r'))
     
-    Args:
-        device_allocation: A dictionary with keys 'gpu' and 'memory'
-        corresponding to the GPU device and memory allocation for the process.
-    """
-    tf.config.experimental.set_memory_growth(
-        device_allocation['gpu'], True
-    )
-    tf.config.set_visible_devices(
-        device_allocation['gpu'], 'GPU'
-    )
-    tf.config.set_logical_device_configuration(
-        device_allocation['gpu'],
-        [tf.config.LogicalDeviceConfiguration(memory_limit=device_allocation['memory'])]
-    )
+    def get_config(self, process_type: ProcessType):
+        # TODO: support for multiple devices
+        # right now only one will be used even if there are multiple.
+        dev_cfg = self.config[process_type]
+        if isinstance(dev_cfg, list):
+            # for actor processes, return the first element.
+            return dev_cfg[0]
+        return dev_cfg
 
-D_CFG = DeviceAllocationConfig.load_empty()
-
-def main():
-    """
-    Main entry point to configure device allocations prior to launching the distributed program.
+def apply_device_config(local_tf, device_name=None, allocation_size=None):
+    if device_name is None:
+        # set CPU as the only visible device
+        local_tf.config.set_visible_devices([], 'GPU')
+        return local_tf
+    if allocation_size is not None:
+        # set the visible device with a specific allocation size
+        local_tf.config.set_visible_devices([local_tf.config.PhysicalDevice(device_name, memory_limit=allocation_size)], 'GPU')
+    else:
+        # if no allocation size is specified, set memory growth to True
+        local_tf.config.set_visible_devices([local_tf.config.PhysicalDevice(device_name)], 'GPU')
+        local_tf.config.experimental.set_memory_growth(local_tf.config.PhysicalDevice(device_name) , True)
     
-    Expects a single argument:
-    - config_yaml_path: Path to the configuration file
-    
-    Will save the device allocation config to the path specified in the configuration file under the key 'device_config_path'.
-    """
-    config = AlphaDevConfig.from_yaml(sys.argv[1])
-    device_config = DeviceAllocationConfig(config)
-    device_config_path = config.device_config_path
-    with open(device_config_path, 'w') as f:
-        yaml.dump(device_config.device_allocations, f)
-    print(f"Device allocations saved to {device_config_path}")
+    return local_tf
 
-if __name__ == '__main__':
-    main()
-    print("Device configuration completed successfully.")
+def get_device_config_from_cli(args):
+    """Parse device config-related arguments and remove them"""
+    config = {}
+    if '--device_name' in args:
+        device_name_index = args.index('--device_name') + 1
+        config['device_name'] = args[device_name_index]
+        args.pop(device_name_index)
+        args.pop(device_name_index - 1)
+        if '--allocation_size' in args:
+            allocation_size_index = args.index('--allocation_size') + 1
+            config['allocation_size'] = int(args[allocation_size_index])
+            args.pop(allocation_size_index)
+            args.pop(allocation_size_index - 1)
+        elif '--allocation_ratio' in args:
+            allocation_ratio_index = args.index('--allocation_ratio') + 1
+            config['allocation_ratio'] = float(args[allocation_ratio_index])
+            args.pop(allocation_ratio_index)
+            args.pop(allocation_ratio_index - 1)
+    else:
+        config['device_name'] = None
+        config['allocation_size'] = None
+        config['allocation_ratio'] = None
+    return config

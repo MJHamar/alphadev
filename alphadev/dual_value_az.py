@@ -1,5 +1,5 @@
 """Definition of the AlphaZero learner with a dual value head."""
-import tensorflow as tf
+from .tf_util import tf
 
 from .distribution import DistributionSupport
 from .learning import AZLearner
