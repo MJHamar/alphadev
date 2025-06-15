@@ -85,19 +85,19 @@ class DeviceConfig:
             return dev_cfg[0]
         return dev_cfg
 
-def apply_device_config(local_tf, device_name=None, allocation_size=None):
-    if device_name is None:
+def apply_device_config(local_tf, config = None):
+    
+    if config is None:
         # set CPU as the only visible device
         local_tf.config.set_visible_devices([], 'GPU')
         return local_tf
+    device = local_tf.config.PhysicalDevice(config['device_name'])
+    allocation_size = config['allocation_size']
+    # set the visible device with a specific allocation size
+    local_tf.config.set_visible_devices([device], 'GPU')
     if allocation_size is not None:
-        # set the visible device with a specific allocation size
-        local_tf.config.set_visible_devices([local_tf.config.PhysicalDevice(device_name, memory_limit=allocation_size)], 'GPU')
-    else:
-        # if no allocation size is specified, set memory growth to True
-        local_tf.config.set_visible_devices([local_tf.config.PhysicalDevice(device_name)], 'GPU')
-        local_tf.config.experimental.set_memory_growth(local_tf.config.PhysicalDevice(device_name) , True)
-    
+        local_tf.config.experimental.set_memory_growth(local_tf.config.PhysicalDevice(device) , True)
+        local_tf.config.set_logical_device_configuration([local_tf.config.LogicalDeviceConfiguration(device, memory_limit=allocation_size)], 'GPU')
     return local_tf
 
 def get_device_config_from_cli(args):
