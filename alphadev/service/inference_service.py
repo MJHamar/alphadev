@@ -192,62 +192,6 @@ class AlphaDevInferenceService(Service, IOBuffer):
             name=self.name
         )
 
-class InferenceFactory:
-    """
-    Factory pattern for creating AlphaDevInferenceService instances.
-    In a single distributed run, there may be several inference services (one for each actor pool)
-    
-    Running the inference service can be done in a separate process,
-    using the `run_inference` function as the insertion point.
-    """
-    def __init__(self,
-        num_blocks:int,
-        input_spec: Union[dict, NamedTuple],
-        output_spec: Union[dict, NamedTuple],
-        batch_size:int,
-        network_factory: NetworkFactory,
-        variable_update_period: int = 100,
-        network_factory_args: tuple = (),
-        network_factory_kwargs: Dict[str, Any] = {},
-        name: str = 'AlphaDevInferenceService'
-        ):
-        self._num_blocks = num_blocks
-        self._input_spec = input_spec
-        self._output_spec = output_spec
-        self._batch_size = batch_size
-        self._network_factory = network_factory
-        self._variable_service = None  # to be set later
-        self._variable_update_period = variable_update_period
-        self._network_factory_args = network_factory_args
-        self._network_factory_kwargs = network_factory_kwargs
-        self._name = name
-    
-    def set_variable_service(self, variable_service: VariableService):
-        """
-        Set the variable service for the inference factory.
-        This is used to update the variables in the inference service.
-        """
-        self._variable_service = variable_service
-        return self
-    
-    def __call__(
-        self, variable_service: Optional[VariableService] = None, label:str = None) -> AlphaDevInferenceService:
-        """
-        Create an instance of the inference service.
-        """
-        return AlphaDevInferenceService(
-            num_blocks=self._num_blocks,
-            input_spec=self._input_spec,
-            output_spec=self._output_spec,
-            batch_size=self._batch_size,
-            network_factory=self._network_factory,
-            variable_service=variable_service or self._variable_service,
-            variable_update_period=self._variable_update_period,
-            factory_args=self._network_factory_args,
-            factory_kwargs=self._network_factory_kwargs,
-            name=label or self._name
-        )
-
 class InferenceNetworkFactory:
     """Callable which creates a network, its variables, and connects to a variable service.
     Calling this method will return a callable which updates the variables in the network and 

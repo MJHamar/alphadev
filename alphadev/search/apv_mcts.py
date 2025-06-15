@@ -808,7 +808,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=True, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=True, size=self._data_size)
         self._checkpoint_shm = mp_shm.SharedMemory(name=self._checkpoint_name, create=True, size=self._checkpoint_size)
-
+        
         self.header = self._header_cls(self._header_shm, 0)
         self.checkpoint = self._checkpoint_cls(self._checkpoint_shm, 0)
         
@@ -845,15 +845,26 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self.checkpoint = self._checkpoint_cls(self._checkpoint_shm, 0)
     
     def __del__(self):
+        global _local_id
+        logger.debug('SharedTree.__del__ called for %s; local id %s main %s.', self.name, _local_id, self._is_main)
         if not self._is_main and self._is_attached:
             self._header_shm.close()
             self._data_shm.close()
             self._checkpoint_shm.close()
         elif self._is_main:
+            logger.debug('SharedTree.__del__: main process %s is terminating.', self.name)
             # signal worker to exit gracefully
             self.header.tasks[:] = APV_MCTS._EXIT
-            # terminate the workers
-            service.terminate_services(self.worker_handles)
+            # terminate the workers; they should terminate on their own (given the EXIT task)
+            num_not_terminated = len(self.worker_handles)
+            while num_not_terminated > 0:
+                for handle in self.worker_handles:
+                    proc: subprocess.Popen = handle[1]
+                    if rc := proc.poll() is not None:
+                        logger.debug('SharedTree.__del__: worker %s terminated with return code %s.', handle[0], rc)
+                        num_not_terminated -= 1
+                sleep(0.5) # wait for the workers
+            logger.debug('SharedTree.__del__: all workers terminated.')
             # only the main process should unlink the shared memory
             try:
                 self._header_shm.unlink()
@@ -950,12 +961,14 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     
     def broadcast_checkpoint(self, checkpoint: AssemblyGame):
         # FIXME: env should be immutable and checkpoint np-serializable.
+        logger.debug('SharedTree.broadcast_checkpoint called.')
         assert self._is_main, "broadcast_checkpoint() should only be called in the main process."
         ckpt_bin = pickle.dumps(checkpoint)
         self.checkpoint.data[:len(ckpt_bin)] = ckpt_bin
         self.checkpoint.size[...] = len(ckpt_bin)
     
     def worker_load_checkpoint(self) -> AssemblyGame:
+        logger.debug('SharedTree.worker_load_checkpoint called.')
         assert not self._is_main, "worker_get_checkpoint() should only be called in worker processes."
         if self.checkpoint.size == 0:
             raise ValueError("Checkpoint is not set. The main process should call broadcast_checkpoint() first.")

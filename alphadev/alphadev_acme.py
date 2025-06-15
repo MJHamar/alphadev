@@ -21,7 +21,7 @@ from .network import AlphaDevNetwork, NetworkFactory, make_input_spec
 from .environment import AssemblyGame, AssemblyGameModel, EnvironmentFactory, ModelFactory
 from .service.variable_service import VariableService
 from .device_config import DeviceAllocationConfig
-from .service.inference_service import InferenceFactory
+
 
 import logging
 logger = logging.getLogger(__name__)
@@ -44,19 +44,6 @@ def make_agent(config: AlphaDevConfig):
     env_spec = make_environment_spec(env_factory())
     # -- search policy
     search_policy = PUCTSearchPolicy(config.pb_c_base, config.pb_c_init)
-    
-    if config.use_async_search:
-        inference_factory = InferenceFactory(
-            num_blocks=config.search_buffer_size,
-            input_spec=env_spec.observations,
-            output_spec=config.task_spec.num_actions, # TODO: obtain output spec from the network.
-            batch_size=config.search_batch_size,
-            network_factory=net_factory,
-            variable_update_period=config.variable_update_period,
-            network_factory_args=(make_input_spec(env_spec.observations),),
-        )
-    else:
-        inference_factory = None
     
     if config.distributed:
         assert False, "Distributed MCTS doesn't work rn."

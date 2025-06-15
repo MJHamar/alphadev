@@ -488,9 +488,9 @@ def deploy_service(executable: callable, device_config:Dict[str, str] = None, la
         sleep(2) # Give the process some time to start
     return handles
 
-def terminate_services(handles) -> int:
+def terminate_services(handles, poll=True) -> int:
     base_logger.info('Start monitoring services for termination...')
-    while True:
+    while poll: # keep processes alive until one of them stops by itself.
         for name, proc, _ in handles:
             proc: subprocess.Popen = proc
             rc = proc.poll()

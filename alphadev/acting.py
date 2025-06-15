@@ -217,6 +217,11 @@ class MCTSActor(acmeMCTSActor):
             name=f'{self.name}_mcts'
             )
     
+    def __del__(self):
+        """Destructor to clean up resources."""
+        if hasattr(self, 'mcts'):
+            del self.mcts
+    
     def _init_mode2_2(
         self,
         inference_service: AlphaDevInferenceClient,

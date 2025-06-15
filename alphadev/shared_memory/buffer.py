@@ -107,10 +107,11 @@ class IOBuffer(BaseMemoryManager):
     
     def __del__(self):
         """Clean up shared memory blocks in the main process."""
-        del self.header
-        self._header_shm.close()
-        self._input_shm.close()
-        self._output_shm.close()
+        if hasattr(self, 'header'):
+            del self.header
+            self._header_shm.close()
+            self._input_shm.close()
+            self._output_shm.close()
         if self._is_main:
             self._header_shm.unlink()
             self._input_shm.unlink()

@@ -20,25 +20,11 @@ from alphadev.utils import TaskSpec, generate_sort_inputs
 from alphadev.config import AlphaDevConfig
 from alphadev.network import AlphaDevNetwork, NetworkFactory, make_input_spec
 from alphadev.alphadev_acme import make_agent
-from alphadev.service.inference_service import InferenceFactory
 from acme.specs import make_environment_spec
 from acme.environment_loop import EnvironmentLoop
 
 CFG_PATH = f'{os.path.dirname(__file__)}/apv_mcts_config.yaml'
 
-class DummyNetwork(snn.Module):
-    def __init__(self, num_actions):
-        super().__init__()
-        self.num_actions = num_actions
-        self.last_action = 0 # cycle through all actions one by one to make this deterministic
-        self.value = tf.constant([0.0], dtype=tf.float32)  # dummy value
-    
-    @tf.function
-    def __call__(self, observation):
-        pi = tf.one_hot([self.last_action], self.num_actions) #add batch dim
-        self.last_action = (self.last_action + 1) % self.num_actions
-        return pi, self.value
-        
 # 10 actions and 10 inputs
 def make_ts(num_inputs):
     return TaskSpec(
@@ -163,38 +149,50 @@ def profile_select_n_actions(env, actor, num_actions):
     # print_mask_stats(actor._model._environment._action_space_storage)
     return stats
 
-def main(id_, prof_output_dir, agent:MCTS, env_loop):
-    actor = env_loop._actor
-    env = env_loop._environment
-    
-    num_steps = 10
-    num_episodes = 1 # x100
-    
-    print("Profiling select_action...")
-    select_action_stats = profile_select_n_actions(env, actor, num_steps)
-    select_action_stats.dump_stats(f'{prof_out_dir}/select_action_profile_{id_}.prof')
-    subprocess.run(['flameprof', '-i', f'{prof_out_dir}/select_action_profile_{id_}.prof', '-o', f'{prof_out_dir}/select_action_flamegraph_{id_}.svg'])
-    # print("Profiling Environment Loop...")
-    # if env_loop is not None:
-    #     env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
-    # env_loop_stats.dump_stats(f'{prof_out_dir}/env_loop_profile_{id_}.prof')
-    # subprocess.run(['flameprof', '-i', f'{prof_out_dir}/env_loop_profile_{id_}.prof', '-o', f'{prof_out_dir}/env_loop_flamegraph_{id_}.svg'])
-    print("Profiling complete.")
-    print(f"Profiles saved to '{prof_out_dir}/select_action_profile.prof' and '{prof_out_dir}/env_loop_profile.prof'.")
-    
 if __name__ == '__main__':
     import sys
-    if len(sys.argv) < 2:
-        sys.argv.append('debug')
-    print("Arguments:", sys.argv)
-    assert len(sys.argv) == 3, "Usage: python env_perf_test.py <id> <config_path>"
     
     prof_out_dir = os.path.abspath(os.path.join('profile', sys.argv[1]))
-    os.makedirs(prof_out_dir, exist_ok=True)
-    os.environ['PROFILER_OUTPUT_DIR'] = prof_out_dir
-    print(f"Profiler output directory: {prof_out_dir}")
+    select_prof_out_dir = os.path.join(prof_out_dir, 'select_action')
+    env_prof_out_dir = os.path.join(prof_out_dir, 'env_loop')
+    
+    
+    num_steps = 100
+    num_episodes = 1 # x100
+
+    
+    os.makedirs(select_prof_out_dir, exist_ok=True)
+    os.environ['PROFILER_OUTPUT_DIR'] = select_prof_out_dir
+    print(f"Profiler output directory: {select_prof_out_dir}")
+    
+    # agent, env_loop = actor_env_from_config(sys.argv[2])
+    
+    # print(f"Using actor {agent._actor} and environment loop {env_loop}.")
+    # print("Profiling select_action...")
+    
+    # select_start = time()
+    # select_action_stats = profile_select_n_actions(env_loop._environment, agent._actor, num_steps)
+    # select_end = time()
+    
+    # select_action_stats.dump_stats(f'{select_prof_out_dir}/select_action_profile.prof')
+    # subprocess.run(['flameprof', '-i', f'{select_prof_out_dir}/select_action_profile.prof', '-o', f'{select_prof_out_dir}/select_action_flamegraph.svg'])
+    
+    
+    os.makedirs(env_prof_out_dir, exist_ok=True)
+    os.environ['PROFILER_OUTPUT_DIR'] = env_prof_out_dir
+    print(f"Profiler output directory: {env_prof_out_dir}")
     
     agent, env_loop = actor_env_from_config(sys.argv[2])
-    
     print(f"Using actor {agent._actor} and environment loop {env_loop}.")
-    main(id_=sys.argv[1],  prof_output_dir=prof_out_dir, agent=agent, env_loop=env_loop)
+    print("Profiling Environment Loop...")
+
+    env_start = time()
+    env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
+    env_end = time()
+
+    env_loop_stats.dump_stats(f'{prof_out_dir}/env_loop_profile.prof')
+    subprocess.run(['flameprof', '-i', f'{env_prof_out_dir}/env_loop_profile.prof', '-o', f'{env_prof_out_dir}/env_loop_flamegraph.svg'])
+    
+    print("Profiling complete.")
+    # print(f"Select Action Time: {select_end - select_start:.2f} seconds.")
+    print(f"Environment Loop Time: {env_end - env_start:.2f} seconds.")

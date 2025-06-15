@@ -48,8 +48,8 @@ from .dual_value_az import DualValueAZLearner
 from .network import NetworkFactory, make_input_spec
 from .acting import MCTSActor
 from .observers import MCTSObserver
-from .service.service import Program, ReverbService, RPCService, RPCClient, deploy_service
-from .service.inference_service import InferenceFactory, AlphaDevInferenceClient, AlphaDevInferenceService
+from .service.service import Program, ReverbService, RPCService, RPCClient, deploy_service, terminate_services
+from .service.inference_service import AlphaDevInferenceClient, AlphaDevInferenceService
 from .config import AlphaDevConfig
 from .device_config import DeviceAllocationConfig
 from .service.variable_service import VariableService
@@ -205,12 +205,17 @@ class MCTS(agent.Agent):
 
     def __del__(self):
         print('Shutting down MCTS agent...')
+        if hasattr(self, '_actor'):
+            del self._actor # delete the actor.
+        if hasattr(self, '_learner'):
+            del self._learner # delete the learner.
+        if hasattr(self, '_counter') and hasattr(self, '_logger'):
+            # delete the counter and logger.
+            del self.counter; del self.logger # delete the counter and logger.
+        # stop the inference service if it exists
         if self.inference_handle is not None:
             print('Shutting down inference service...')
-            name, proc, fl = self.inference_handle[0]
-            proc.terminate()
-            proc.wait(timeout=2)
-            fl.close()
+            terminate_services(self.inference_handle, poll=False)
 
 class DistributedMCTS:
     """Distributed MCTS agent."""
@@ -252,7 +257,7 @@ class DistributedMCTS:
         virtual_loss_const: Optional[float] = None,
         # inference server 
         use_inference_server: bool = False,
-        inference_factory: Optional[InferenceFactory] = None,
+        # inference_factory: Optional[] = None,
         # Other parameters
         use_dual_value_network: bool = False,
         logger_factory: Callable[[], loggers.Logger] = None,
@@ -260,6 +265,7 @@ class DistributedMCTS:
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
     ):
         # check parameters
+        assert False, "Distributed MCTS is not supported rn."
 
         # Internalize the device configuration.
         self._device_config = device_config
@@ -303,13 +309,13 @@ class DistributedMCTS:
             self._search_virual_loss_const = virtual_loss_const
         else:
             # make sure we don't pass these accidentally.
-            self._inference_factory = inference_factory
+            # self._inference_factory = 0
             self._search_num_actors = apv_processes_per_pool
             self._search_virual_loss_const = virtual_loss_const
         # If using inference server, we need to provide the inference factory.
-        if use_inference_server:
-            assert inference_factory is not None, 'Inference factory must be provided when using inference server.'
-            self._inference_factory = inference_factory
+        # if use_inference_server:
+            # assert inference_factory is not None, 'Inference factory must be provided when using inference server.'
+            # self._inference_factory = inference_factory
         
         self._use_dual_value_network = use_dual_value_network
         # set up logging
