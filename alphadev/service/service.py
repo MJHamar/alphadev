@@ -307,7 +307,7 @@ class RPCService(Service):
                  fork_worker:bool=True,
                  worker_polling_interval:float=1.0,
                  logger=None):
-        super().__init__(self, logger)
+        super().__init__(logger)
         self._conn_config = conn_config
         self._fork_worker = fork_worker
         self._worker_polling_interval = worker_polling_interval
@@ -317,7 +317,6 @@ class RPCService(Service):
         self._service = make_service_backend(
             conn_config=conn_config,
             label=instance_cls.__name__ + '.' + uuid().hex[:4],
-            instance_cls=instance_cls,
             logger=logger
         )
         self._should_run = self._registered_methods.pop('run', None) is not None

@@ -86,7 +86,7 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
             'action': action,
             'probs': probs,
             'priors': node.prior,
-            'expanded': np.asarray([(c.children is not None) for c in node.children.elements()]),
+            # 'expanded': np.asarray([(c.children is not None) for c in node.children.elements()]),
             'values': node.children_values,
             'temperature': temperature,
             'steps': training_steps,

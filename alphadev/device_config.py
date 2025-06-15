@@ -142,6 +142,8 @@ def get_device_config_from_cli(args):
     return config
 
 def get_cli_args_from_config(config):
+    if config is None:
+        return []
     cli = ['--device_type', config['device_type']]
     cli += ['--device_id', str(config['device_id'])]
     if 'allocation_size' in config and config['allocation_size'] is not None:

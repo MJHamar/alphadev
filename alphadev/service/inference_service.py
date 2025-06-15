@@ -16,7 +16,7 @@ from .service import Service
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class InferenceTaskBase(BlockLayout):
@@ -163,16 +163,16 @@ class AlphaDevInferenceService(Service, IOBuffer):
             inference_start = tf.timestamp()
             prior, *values = self._network(inputs)
             ready_start = tf.timestamp()
-            self.logger.debug(f"AlphaDevInferenceService: prior type={type(prior)} values {values}")
+            # self.logger.debug(f"AlphaDevInferenceService: prior type={type(prior)} values {values[0]}")
             value = values[0] # ugly hack but there are versions of the network where >2 values are returned.
-            self.logger.debug(f"obtained shapes from network: offsets={node_offsets}, prior={prior.shape}, value={value.shape}")
+            # self.logger.debug(f"obtained shapes from network: offsets={node_offsets}, prior={prior.shape}, value={value.shape}")
             self.ready([dict(
                 node_offset=off,
                 prior=p,
                 value=v
             ) for off, p, v in zip(node_offsets, prior, value)])
             ready_end = tf.timestamp()
-            self.logger.debug('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
+            self.logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
         self.logger.info("AlphaDevInferenceService: stopping run loop.")
 
     def stop(self):

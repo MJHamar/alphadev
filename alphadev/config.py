@@ -160,7 +160,7 @@ class AlphaDevConfig(object):
             num_locations=self.num_regs+self.num_mem,
             num_regs=self.num_regs,
             num_mem=self.num_mem,
-            num_actions=210, # original value was 271
+            num_actions=252, # original value was 271
             correct_reward=self.correct_reward,
             correctness_reward_weight=self.correctness_reward_weight,
             latency_reward_weight=self.latency_reward_weight,

@@ -429,7 +429,7 @@ class DistributedMCTS:
             num_simulations=self._num_simulations,
             search_policy=self._search_policy,
             temperature_fn=self._temperature_fn,
-            dirichlet_alpha=self.dirichlet_alpha,
+            dirichlet_alpha=self._dirichlet_alpha,
             exploration_fraction=self._exploration_fraction,
             search_retain_subtree=self._search_retain_subtree,
             # implementation-specific parameters
@@ -445,7 +445,7 @@ class DistributedMCTS:
             adder=adder,
             counter=counter,
             observers=mcts_observers,
-            name=f'actor/{index}'
+            name=f'actor_{index}'
         )
 
         observers = self._observers(logger)
@@ -481,7 +481,7 @@ class DistributedMCTS:
             num_simulations=self._num_simulations,
             search_policy=self._search_policy,
             temperature_fn=self._temperature_fn,
-            dirichlet_alpha=self.dirichlet_alpha,
+            dirichlet_alpha=self._dirichlet_alpha,
             exploration_fraction=self._exploration_fraction,
             search_retain_subtree=self._search_retain_subtree,
             # implementation-specific parameters
@@ -597,7 +597,7 @@ class DistributedMCTS:
                             conn_config=config.distributed_backend_config,
                             instance_factory=self.actor,
                             instance_cls=acme.EnvironmentLoop,
-                            args=(counter, logger, None, actor_inference_client),
+                            args=(idx, replay, counter, logger, None, actor_inference_client),
                         ))
                 else:
                     program.add_service(
@@ -605,7 +605,7 @@ class DistributedMCTS:
                             conn_config=config.distributed_backend_config,
                             instance_factory=self.actor,
                             instance_cls=acme.EnvironmentLoop,
-                            args=(counter, logger, variable_service, None),
+                            args=(idx, replay, counter, logger, variable_service, None),
                         ), actor_device_config)
         
         return program
