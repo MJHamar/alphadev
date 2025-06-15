@@ -47,6 +47,7 @@ dependencies = [
     "wandb",
     "redis",
     "atomics",
+    "pynvml",
 
     # tinyfive submodule (editable install from local path):
     "tinyfive @ {root:uri}/tinyfive" # Changed from file:./tinyfive

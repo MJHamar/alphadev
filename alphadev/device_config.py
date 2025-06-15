@@ -28,6 +28,7 @@ def compute_device_config(ad_config_path: str):
     # import tensorflow here
     import tensorflow as tf
     from .config import AlphaDevConfig
+    import pynvml
     
     ad_config = AlphaDevConfig.from_yaml(ad_config_path)
     
@@ -59,18 +60,26 @@ def compute_device_config(ad_config_path: str):
     users_per_gpu = num_gpu_users // num_gpus
     if users_per_gpu == 0: # the unlikely case when there are more GPUs than users
         users_per_gpu = 1
-    gpu_sizes = [gpu_devices[i % num_gpus].memory_limit // users_per_gpu for i in range(num_gpu_users)]
+    pynvml.nvmlInit()
+    sizes = []
+    for i in range(num_gpus):
+        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        sizes.append(mem_info.total)
+
+    print(f"GPU device sizes:", sizes)
+    per_process_alloc = [sizes[i % num_gpus] // users_per_gpu for i in range(num_gpu_users)]
     # 4. assign the GPUs to the processes
     config[LEARNER] = {
         "device_type": "GPU",
         "device_id": 0,
-        "allocation_size": gpu_sizes[0],
+        "allocation_size": per_process_alloc[0],
     }
     # 5. assign the GPUs to the actors
     config[ACTOR] = [{
         "device_type": "GPU",
-        "device_id": i,
-        "allocation_size": gpu_sizes[i],
+        "device_id": i % num_gpus,
+        "allocation_size": per_process_alloc[i],
     } for i in range(1, num_gpu_users)]
     
     return config
@@ -101,7 +110,7 @@ def apply_device_config(local_tf, config = None):
     if allocation_size is not None:
         local_tf.config.experimental.set_memory_growth(device, True)
         local_tf.config.set_logical_device_configuration([
-            local_tf.config.LogicalDeviceConfiguration(device, memory_limit=allocation_size)], config['device_type'])
+            local_tf.config.LogicalDeviceConfiguration(memory_limit=allocation_size)], config['device_type'])
     return local_tf
 
 def get_device_config_from_cli(args):
