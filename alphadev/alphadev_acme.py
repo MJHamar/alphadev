@@ -40,11 +40,10 @@ def make_agent(config: AlphaDevConfig):
     search_policy = PUCTSearchPolicy(config.pb_c_base, config.pb_c_init)
     
     if config.distributed:
-        assert False, "Distributed MCTS doesn't work rn."
         # -- distributed MCTS agent
         return DistributedMCTS(
             # device configuration for the different processes.
-            device_config=DeviceAllocationConfig(config),
+            device_config=device_config,
             # basic params
             environment_factory=env_factory,
             network_factory=net_factory,
@@ -61,7 +60,6 @@ def make_agent(config: AlphaDevConfig):
             dirichlet_alpha=config.root_dirichlet_alpha,
             exploration_fraction=config.root_exploration_fraction,
             search_retain_subtree=config.search_retain_subtree,
-            use_apv_mcts=config.use_async_search,
             # training parameters
             batch_size=config.batch_size,
             prefetch_size=config.prefetch_size,
@@ -74,9 +72,13 @@ def make_agent(config: AlphaDevConfig):
             n_step=config.n_step,
             learning_rate=config.lr_init,
             # APV MCTS parameters
-            inference_factory=inference_factory,
+            use_apv_mcts=config.use_async_search,
             apv_processes_per_pool=config.async_search_processes_per_pool,
             virtual_loss_const=config.async_seach_virtual_loss,
+            # Inference server parameters
+            use_inference_server=config.search_use_inference_server,
+            search_batch_size=config.search_batch_size,
+            search_buffer_size=config.search_buffer_size,
             # Other parameters
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger_factory=config.logger_factory,
