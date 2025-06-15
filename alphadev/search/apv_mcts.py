@@ -5,6 +5,9 @@ import numpy as np
 import functools
 import pickle
 
+import os
+import subprocess
+
 from acme.agents.tf.mcts.search import SearchPolicy
 from acme.agents.tf.mcts import types
 from acme.agents.tf.mcts import models
@@ -19,7 +22,7 @@ from .mcts import MCTSBase, NodeBase
 _local_id = 'main'
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 logging.basicConfig(
     format=f'process {_local_id}: %(levelname)s: %(message)s',
 )
@@ -515,6 +518,15 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 sleep(0.1)
         # loop forever
         logger.debug('SharedTree.run_worker: worker %d attached to shared memory.', worker_id)
+        # do profiling if enabled
+        prof_dir = os.environ.get('PROFILER_OUTPUT_DIR', None)
+        if prof_dir is not None:
+            import cProfile
+            import pstats
+            profiler = cProfile.Profile()
+            profiler.enable()
+            logger.info(f"mcts_worker_{worker_id} profiling enabled. Output directory: {prof_dir}")
+
         while True:
             task_id = self.header.tasks[worker_id]
             logger.debug('SharedTree.run_worker: worker %d waiting for task, current task id: %d.', worker_id, task_id)
@@ -559,6 +571,15 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                     np.min(pass_times) if pass_times else 0.0,
                     np.max(pass_times) if pass_times else 0.0
                 )
+        # do profiling if enabled
+        if prof_dir is not None:
+            profiler.disable()
+            profiler.disable()
+            stats = pstats.Stats(profiler)
+            stats.sort_stats('cumulative')
+            stats.dump_stats(os.path.join(prof_dir, f'mcts_worker_{worker_id}_profile.prof'))
+            subprocess.run(['flameprof', '-i', os.path.join(prof_dir, f'mcts_worker_{worker_id}_profile.prof'), '-o', os.path.join(prof_dir, f'mcts_worker_{worker_id}_profile.svg')])
+
     
     def worker_ready(self, worker_id: int):
         """
@@ -610,33 +631,38 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     def rollout(self) -> bool:
         root = self.get_root()
         trajectory = []  
+        times = [None] * 4
         try:
             # 1. search for a leaf node in the tree.
             # the in_tree phase cannot break otherwise we are doomed.
-            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- in_tree call')
+            # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- in_tree call')
+            times[0] = time()
             trajectory, actions = self.in_tree(root)
             # check for race conditions 
             #  - another process expanded in the meantime or
             #  - the last node is not consistent with its parent.
             if trajectory[-1].expanded or not trajectory[-1].is_consistent():
-                logger.debug(f'SharedTree.rollout_{self._local_write_head}: fail after in_tree exp: %s, consistent: %s', trajectory[-1].expanded, trajectory[-1].is_consistent())
+                # logger.debug(f'SharedTree.rollout_{self._local_write_head}: fail after in_tree exp: %s, consistent: %s', trajectory[-1].expanded, trajectory[-1].is_consistent())
                 self.fail(trajectory=trajectory)
                 return False
             # 2. simulate the trajectory
-            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- simulate call')
+            # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- simulate call')
+            times[1] = time()
             node, observation = self.simulate(node=trajectory[-1], ancestors=trajectory[:-2], actions=actions)
             if not node.is_consistent():
-                logger.debug(f'SharedTree.rollout_{self._local_write_head}: fail after simulate: node %s is not consistent with its parent %s.', repr(node), repr(node.parent))
+                # logger.debug(f'SharedTree.rollout_{self._local_write_head}: fail after simulate: node %s is not consistent with its parent %s.', repr(node), repr(node.parent))
                 self.fail(trajectory=trajectory)
                 return False
             # 3. evaluate the node
-            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- evaluate call')
+            # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- evaluate call')
+            times[2] = time()
             _, value = self.evaluate(node, observation)
             # 4. backup the value and the node
-            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- backup call')
-            self.backup(node, value)
+            # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- backup call')
+            times[3] = time()
+            self.backup(node, np.asarray(value))
             self.succeed()
-            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- success.')
+            # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- success.')
             return True
         except TreeFull: # can happen, nothing to do
             self.fail(trajectory=trajectory)
@@ -648,7 +674,18 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             raise e
         finally:
             # in either case, reset the model to the root state.
+            load_start = time()
             self.model.load_checkpoint()
+            load_end = time()
+            logger.debug('SharedTree.rollout_{wh}: total {total:.5f}; tree {tree:.5f}; sim {sim:5f}; eval {eval:5f}; backup {backup:5f}; load {load:.5f}.'.format(
+                wh=self._local_write_head,
+                total=load_end - times[0],
+                tree=times[1] - times[0] if times[1] is not None else 9.9999,
+                sim=times[2] - times[1] if times[1] is not None and times[2] is not None else 9.9999,
+                eval=times[3] - times[2] if times[2] is not None and times[3] is not None else 9.9999,
+                backup=load_start - times[3] if times[3] is not None else 9.9999,
+                load=load_end - load_start
+            ))
     
     def phase_1(self) -> bool:
         root = self.get_root()
@@ -751,7 +788,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         assert self._is_main, "This method can only be called from the main process."
         self.inference_server.attach()
         offset = node.offset if node is not None else -1
-        logger.debug('SharedTree._eval_await called with node offset %s.', offset)
+        # logger.debug('SharedTree._eval_await called with node offset %s.', offset)
         self.inference_server.submit(**{
             'node_offset': offset, 'observation': observation})
         # wait for the result to be ready
@@ -784,7 +821,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         Same with the root_offset and action in the header.
         """
         assert self._is_main, "reset() should only be called in the main process."
-        logger.debug('SharedTree.reset called.')
+        # logger.debug('SharedTree.reset called.')
         # 1. reset the header's counter and available array.
         self._header_cls.clear_block(self._header_shm, 0)
         # 2. clear all nodes that are available for writing.
@@ -798,7 +835,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self._checkpoint_cls.clear_block(self._checkpoint_shm, 0)
     
     def attach(self):
-        logger.debug('SharedTree.attach')
+        # logger.debug('SharedTree.attach')
         self._is_main = False; self._is_attached = True
         self._header_shm = mp_shm.SharedMemory(name=self._header_name, create=False, size=self._header_size)
         self._data_shm = mp_shm.SharedMemory(name=self._data_name, create=False, size=self._data_size)

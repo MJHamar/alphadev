@@ -189,7 +189,7 @@ class AlphaDevConfig(object):
                 raise ValueError("async_search_processes_per_pool must be 'auto' or an integer.")
         if self.search_use_inference_server:
             if isinstance(self.search_buffer_size, str) and self.search_buffer_size == 'auto':
-                self.search_buffer_size = self.async_search_processes_per_pool
+                self.search_buffer_size = self.async_search_processes_per_pool * 2
             elif not (self.async_search_processes_per_pool, int):
                 raise ValueError("search_buffer_size must be 'auto' or an integer.")
 

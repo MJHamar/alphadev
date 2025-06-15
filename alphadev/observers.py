@@ -82,11 +82,10 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
         """
         Called when an action is selected.
         """
-        print(f"writing to the logger service")
         self._logger.write({
             'action': action,
             'probs': probs,
-            'priors': node.children_priors,
+            'priors': node.prior,
             'expanded': np.asarray([(c.children is not None) for c in node.children.elements()]),
             'values': node.children_values,
             'temperature': temperature,

@@ -281,6 +281,8 @@ class InferenceNetworkFactory:
             observation = tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation)
             outputs = compiled_network(observation)
             # outputs is assumed to be a tuple of (prior, value, [other outputs])
-            return outputs[0], outputs[1]  # return prior and value
+            return ( # return prior and value
+                tf2_utils.squeeze_batch_dim(outputs[0]),
+                tf2_utils.squeeze_batch_dim(outputs[1]))
         
         return inference

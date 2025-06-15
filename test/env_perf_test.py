@@ -163,25 +163,24 @@ def profile_select_n_actions(env, actor, num_actions):
     # print_mask_stats(actor._model._environment._action_space_storage)
     return stats
 
-def main(id_, agent:MCTS, env_loop):
+def main(id_, prof_output_dir, agent:MCTS, env_loop):
     actor = env_loop._actor
     env = env_loop._environment
     
-    num_steps = 100
+    num_steps = 10
     num_episodes = 1 # x100
     
     print("Profiling select_action...")
     select_action_stats = profile_select_n_actions(env, actor, num_steps)
-    select_action_stats.dump_stats(f'profile/select_action_profile_{id_}.prof')
-    subprocess.run(['flameprof', '-i', f'profile/select_action_profile_{id_}.prof', '-o', f'profile/select_action_flamegraph_{id_}.svg'])
-    print("Profiling Environment Loop...")
-    if env_loop is not None:
-        env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
-    env_loop_stats.dump_stats(f'profile/env_loop_profile_{id_}.prof')
-    subprocess.run(['flameprof', '-i', f'profile/env_loop_profile_{id_}.prof', '-o', f'profile/env_loop_flamegraph_{id_}.svg'])
+    select_action_stats.dump_stats(f'{prof_out_dir}/select_action_profile_{id_}.prof')
+    subprocess.run(['flameprof', '-i', f'{prof_out_dir}/select_action_profile_{id_}.prof', '-o', f'{prof_out_dir}/select_action_flamegraph_{id_}.svg'])
+    # print("Profiling Environment Loop...")
+    # if env_loop is not None:
+    #     env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
+    # env_loop_stats.dump_stats(f'{prof_out_dir}/env_loop_profile_{id_}.prof')
+    # subprocess.run(['flameprof', '-i', f'{prof_out_dir}/env_loop_profile_{id_}.prof', '-o', f'{prof_out_dir}/env_loop_flamegraph_{id_}.svg'])
     print("Profiling complete.")
-    print("Profiles saved to 'profile/select_action_profile.prof' and 'profile/env_loop_profile.prof'.")
-    
+    print(f"Profiles saved to '{prof_out_dir}/select_action_profile.prof' and '{prof_out_dir}/env_loop_profile.prof'.")
     
 if __name__ == '__main__':
     import sys
@@ -189,6 +188,13 @@ if __name__ == '__main__':
         sys.argv.append('debug')
     print("Arguments:", sys.argv)
     assert len(sys.argv) == 3, "Usage: python env_perf_test.py <id> <config_path>"
+    
+    prof_out_dir = os.path.abspath(os.path.join('profile', sys.argv[1]))
+    os.makedirs(prof_out_dir, exist_ok=True)
+    os.environ['PROFILER_OUTPUT_DIR'] = prof_out_dir
+    print(f"Profiler output directory: {prof_out_dir}")
+    
     agent, env_loop = actor_env_from_config(sys.argv[2])
+    
     print(f"Using actor {agent._actor} and environment loop {env_loop}.")
-    main(id_=sys.argv[1], agent=agent, env_loop=env_loop)
+    main(id_=sys.argv[1],  prof_output_dir=prof_out_dir, agent=agent, env_loop=env_loop)
