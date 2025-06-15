@@ -2,13 +2,14 @@
 Entrypoint for service processes.
 """
 
+# import the tf_util module to make sure the device is configured properly
+from ..tf_util import tf
+
 import os
 import sys
 from absl import app
 import argparse
 
-# import the tf_util module to make sure the device is configured properly
-from ..tf_util import tf
 
 import logging
 
@@ -26,10 +27,6 @@ def parse_args():
     parser.add_argument('executable_path', type=str, help='Path to the executable file.')
     parser.add_argument('--label', type=str, required=True, help='String identifier of the process.')
     args = parser.parse_args()
-    assert ((args.device_name is not None and args.allocation_size is not None)
-            or
-            (args.device_name is None and args.allocation_size is None)), \
-                "Both --device_name and --allocation_size must be provided together or not at all."
     return args
 
 # parse arguments
@@ -48,7 +45,7 @@ with open(config.executable_path, 'rb') as f:
     executable = cloudpickle.load(f)
 
 # clean stdin to avoid parsing unknown flags
-sys.argv = sys.argv.clear()
+sys.argv = sys.argv[:1]
 
 # run the executable
 app.run(executable)

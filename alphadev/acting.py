@@ -43,6 +43,7 @@ from .search.apv_mcts import APV_MCTS
 from .network import NetworkFactory, make_input_spec
 from .service.variable_service import VariableService
 from .service.inference_service import AlphaDevInferenceClient, InferenceNetworkFactory
+from .device_config import DeviceConfig, ACTOR, CONTROLLER
 
 import logging
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ class MCTSActor(acmeMCTSActor):
     """Executes a policy- and value-network guided MCTS search."""
     def __init__(
         self,
+        device_config: DeviceConfig,
         environment_spec: specs.EnvironmentSpec,
         model: models.Model,
         discount: float,
@@ -103,6 +105,7 @@ class MCTSActor(acmeMCTSActor):
             variable_client=None,
         )
         self.name = name
+        self._device_config = device_config
         
         self._dirichlet_alpha = dirichlet_alpha
         self._exploration_fraction = exploration_fraction
@@ -114,7 +117,6 @@ class MCTSActor(acmeMCTSActor):
         self._observers = observers
         
         self._use_apv_mcts = use_apv_mcts
-        
         
         self.last_action = None  # Last action selected by the actor.
         
@@ -202,6 +204,7 @@ class MCTSActor(acmeMCTSActor):
             variable_update_period=variable_update_period,
         )
         self.mcts = APV_MCTS(
+            device_config=self._device_config,
             num_simulations=self._num_simulations,
             num_actions=self._num_actions,
             model=self._model,
@@ -217,11 +220,6 @@ class MCTSActor(acmeMCTSActor):
             name=f'{self.name}_mcts'
             )
     
-    def __del__(self):
-        """Destructor to clean up resources."""
-        if hasattr(self, 'mcts'):
-            del self.mcts
-    
     def _init_mode2_2(
         self,
         inference_service: AlphaDevInferenceClient,
@@ -236,6 +234,7 @@ class MCTSActor(acmeMCTSActor):
             raise ValueError(f"Inference service must be an instance of AlphaDevInferenceClient not {type(inference_service)}.")
         
         self.mcts = APV_MCTS(
+            device_config=self._device_config,
             num_simulations=self._num_simulations,
             num_actions=self._num_actions,
             model=self._model,
@@ -250,7 +249,12 @@ class MCTSActor(acmeMCTSActor):
             # TODO pass lambda_ to give different weights to reward and value averages
             name=f'{self.name}_mcts'
         )
-
+    
+    def __del__(self):
+        """Destructor to clean up resources."""
+        if hasattr(self, 'mcts'):
+            del self.mcts
+    
     def _forward(
         self, observation: types.Observation) -> Tuple[types.Probs, types.Value]:
         """Performs a forward pass of the policy-value network."""

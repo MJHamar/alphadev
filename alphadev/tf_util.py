@@ -5,7 +5,7 @@ from .device_config import apply_device_config, get_device_config_from_cli
 
 config = get_device_config_from_cli(sys.argv)
 
-from tensorflow import tf
+import tensorflow as tf
 
 tf = apply_device_config(tf, config)
 

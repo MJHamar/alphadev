@@ -70,7 +70,7 @@ redis_host: 'localhost'
 redis_port: 6379
 redis_db: 0
 variable_service_name: 'variable'
-device_config_path: './device_config.yaml'
+device_config_path: './test_device_config.yaml'
 # Logging
 use_wandb: False
 wandb_project: alphadev

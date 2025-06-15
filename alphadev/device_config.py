@@ -1,10 +1,10 @@
 from enum import Enum
 import yaml
 
-class ProcessType(Enum):
-    LEARNER = "learner"
-    ACTOR = "actor"
-    CONTROLLER = "controller"
+
+LEARNER = "learner"
+ACTOR = "actor"
+CONTROLLER = "controller"
 
 def compute_device_config(ad_config_path: str):
     """
@@ -36,8 +36,9 @@ def compute_device_config(ad_config_path: str):
     
     config = {}
     # 1. controller configuration
-    config[ProcessType.CONTROLLER] = {
-        "device_name": cpu_device.name,
+    config[CONTROLLER] = {
+        "device_type": "CPU",
+        "device_id": 0,
         "allocation_size": None,
     }
     # 2. find the number of GPU users
@@ -53,20 +54,22 @@ def compute_device_config(ad_config_path: str):
     # 3. divide the GPUs among the GPU users
     num_gpus = len(gpu_devices)
     if num_gpus == 0:
-        config[ProcessType.LEARNER] = config[ProcessType.ACTOR] = config[ProcessType.CONTROLLER]
+        config[LEARNER] = config[ACTOR] = config[CONTROLLER]
         return config
     users_per_gpu = num_gpu_users // num_gpus
     if users_per_gpu == 0: # the unlikely case when there are more GPUs than users
         users_per_gpu = 1
     gpu_sizes = [gpu_devices[i % num_gpus].memory_limit // users_per_gpu for i in range(num_gpu_users)]
     # 4. assign the GPUs to the processes
-    config[ProcessType.LEARNER] = {
-        "device_name": gpu_devices[0].name,
+    config[LEARNER] = {
+        "device_type": "GPU",
+        "device_id": 0,
         "allocation_size": gpu_sizes[0],
     }
     # 5. assign the GPUs to the actors
-    config[ProcessType.ACTOR] = [{
-        "device_name": gpu_devices[i].name,
+    config[ACTOR] = [{
+        "device_type": "GPU",
+        "device_id": i,
         "allocation_size": gpu_sizes[i],
     } for i in range(1, num_gpu_users)]
     
@@ -76,7 +79,7 @@ class DeviceConfig:
     def __init__(self, path: str):
         self.config = yaml.safe_load(open(path, 'r'))
     
-    def get_config(self, process_type: ProcessType):
+    def get_config(self, process_type: str):
         # TODO: support for multiple devices
         # right now only one will be used even if there are multiple.
         dev_cfg = self.config[process_type]
@@ -86,28 +89,35 @@ class DeviceConfig:
         return dev_cfg
 
 def apply_device_config(local_tf, config = None):
-    
+    print("Applying device configuration", config)
     if config is None:
         # set CPU as the only visible device
         local_tf.config.set_visible_devices([], 'GPU')
         return local_tf
-    device = local_tf.config.PhysicalDevice(config['device_name'])
-    allocation_size = config['allocation_size']
+    device = local_tf.config.list_physical_devices(config['device_type'])[config['device_id']]
+    allocation_size = config.get('allocation_size', None)
     # set the visible device with a specific allocation size
-    local_tf.config.set_visible_devices([device], 'GPU')
+    local_tf.config.set_visible_devices([device], config['device_type'])
     if allocation_size is not None:
-        local_tf.config.experimental.set_memory_growth(local_tf.config.PhysicalDevice(device) , True)
-        local_tf.config.set_logical_device_configuration([local_tf.config.LogicalDeviceConfiguration(device, memory_limit=allocation_size)], 'GPU')
+        local_tf.config.experimental.set_memory_growth(device, True)
+        local_tf.config.set_logical_device_configuration([
+            local_tf.config.LogicalDeviceConfiguration(device, memory_limit=allocation_size)], config['device_type'])
     return local_tf
 
 def get_device_config_from_cli(args):
     """Parse device config-related arguments and remove them"""
     config = {}
-    if '--device_name' in args:
-        device_name_index = args.index('--device_name') + 1
-        config['device_name'] = args[device_name_index]
-        args.pop(device_name_index)
-        args.pop(device_name_index - 1)
+    if '--device_type' in args:
+        device_type_index = args.index('--device_type') + 1
+        config['device_type'] = args[device_type_index]
+        args.pop(device_type_index)
+        args.pop(device_type_index - 1)
+        
+        device_id_index = args.index('--device_id') + 1
+        config['device_id'] = int(args[device_id_index])
+        args.pop(device_id_index)
+        args.pop(device_id_index - 1)
+        
         if '--allocation_size' in args:
             allocation_size_index = args.index('--allocation_size') + 1
             config['allocation_size'] = int(args[allocation_size_index])
@@ -119,7 +129,25 @@ def get_device_config_from_cli(args):
             args.pop(allocation_ratio_index)
             args.pop(allocation_ratio_index - 1)
     else:
-        config['device_name'] = None
-        config['allocation_size'] = None
-        config['allocation_ratio'] = None
+        return None
     return config
+
+def get_cli_args_from_config(config):
+    cli = ['--device_type', config['device_type']]
+    cli += ['--device_id', str(config['device_id'])]
+    if 'allocation_size' in config and config['allocation_size'] is not None:
+        cli += ['--allocation_size', str(config['allocation_size'])]
+    return cli
+
+if __name__ == '__main__':
+    import sys
+    from .config import AlphaDevConfig
+    ad_config_path = sys.argv[1] 
+    ad_config = AlphaDevConfig.from_yaml(ad_config_path)
+    device_config = compute_device_config(ad_config_path)
+    print("Computed device configuration:")
+    for process_type, cfg in device_config.items():
+        print(f"{process_type}: {cfg}")
+    with open(ad_config.device_config_path, 'w') as f:
+        yaml.dump(device_config, f, default_flow_style=False)
+    print(f"Device configuration saved to {ad_config.device_config_path}")

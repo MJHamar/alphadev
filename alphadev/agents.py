@@ -51,7 +51,7 @@ from .observers import MCTSObserver
 from .service.service import Program, ReverbService, RPCService, RPCClient, deploy_service, terminate_services
 from .service.inference_service import AlphaDevInferenceClient, AlphaDevInferenceService
 from .config import AlphaDevConfig
-from .device_config import DeviceAllocationConfig
+from .device_config import DeviceConfig, ACTOR
 from .service.variable_service import VariableService
 
 
@@ -60,6 +60,7 @@ class MCTS(agent.Agent):
 
     def __init__(
         self,
+        device_config: DeviceConfig,
         model: models.Model,
         network_factory: NetworkFactory,
         optimizer: snt.Optimizer,
@@ -133,7 +134,8 @@ class MCTS(agent.Agent):
             )
             # run the service
             inference_client = inference_service.create_handle()
-            self.inference_handle = deploy_service(inference_service.run, device_config=None, label='inference_service')
+            self.inference_handle = deploy_service(
+                inference_service.run, device_config=device_config.get_config(ACTOR), label='inference_service')
         else:
             # If we are not using APV MCTS, we don't need an inference service.
             inference_client = None
@@ -151,6 +153,7 @@ class MCTS(agent.Agent):
         mcts_observers = mcts_observers(logger)
         
         actor = MCTSActor(
+            device_config=device_config,
             environment_spec=environment_spec,
             model=model,
             discount=discount,
@@ -223,7 +226,7 @@ class DistributedMCTS:
     def __init__(
         self,
         # device configuration for the different processes.
-        device_config: DeviceAllocationConfig,
+        device_config: DeviceConfig,
         # basic params
         environment_factory: Callable[[], dm_env.Environment],
         network_factory: Callable[[specs.DiscreteArray], snt.Module],
@@ -548,8 +551,8 @@ class DistributedMCTS:
 
         with program.group('learner'):
             learner_device_config = self._device_config.get(
-                DeviceAllocationConfig.make_process_key(
-                    DeviceAllocationConfig.LEARNER_PROCESS
+                DeviceConfig.make_process_key(
+                    DeviceConfig.LEARNER_PROCESS
                 )
             , None)
             program.add_service(
@@ -563,8 +566,8 @@ class DistributedMCTS:
 
         with program.group('evaluator'):
             eval_device_config = self._device_config.get(
-                DeviceAllocationConfig.make_process_key(
-                    DeviceAllocationConfig.ACTOR_PROCESS, 0
+                DeviceConfig.make_process_key(
+                    DeviceConfig.ACTOR_PROCESS, 0
                 ), None
             )
             program.add_service(
@@ -581,8 +584,8 @@ class DistributedMCTS:
             for idx in range(self._num_actors):
                 if self._use_inference_server:
                     inference_device_config = self._device_config.get(
-                        DeviceAllocationConfig.make_process_key(
-                            DeviceAllocationConfig.INFERENCE_PROCESS, idx
+                        DeviceConfig.make_process_key(
+                            DeviceConfig.INFERENCE_PROCESS, idx
                         ), None
                     )
                     # Create the inference service for this actor.
@@ -596,8 +599,8 @@ class DistributedMCTS:
                     inference = None
                 
                 actor_device_config = self._device_config.get(
-                    DeviceAllocationConfig.make_process_key(
-                        DeviceAllocationConfig.ACTOR_PROCESS, idx
+                    DeviceConfig.make_process_key(
+                        DeviceConfig.ACTOR_PROCESS, idx
                     )
                 , None)
                 program.add_service(

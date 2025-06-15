@@ -14,7 +14,7 @@ from acme.agents.tf.mcts import models
 
 from ..service import service
 from ..service.inference_service import AlphaDevInferenceClient, InferenceNetworkFactory
-from ..device_config import DeviceAllocationConfig, D_CFG
+from ..device_config import DeviceConfig, ACTOR, CONTROLLER
 from ..shared_memory.base import BlockLayout, ArrayElement, BinaryArrayElement, BaseMemoryManager
 from ..environment import AssemblyGame, AssemblyGameModel
 from .mcts import MCTSBase, NodeBase
@@ -286,6 +286,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     _SEARCH = 2 # worker should perform phase 1 of the search (in_tree ... simulate)
     _BACKTRACK = 3 # worker should perform phase 2 of the search (backtracking)
     def __init__(self,
+        device_config: DeviceConfig,
         # MCTSBase required parameters
         num_simulations: int,
         num_actions: int,
@@ -310,6 +311,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         :param node_width: maximum number of children per node, i.e. number of actions in the environment.
         :param vl_constant: constant virtual loss to apply during rollouts.
         """
+        self._device_config = device_config
+        
         self.num_simulations = num_simulations
         self.num_actions = num_actions
         self.model = model
@@ -373,10 +376,10 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self._data_shm = None
         self._checkpoint_shm = None
         # declare workers and run them.
-        global D_CFG
         worker_handles = []
-        worker_device_config = D_CFG.get(
-                DeviceAllocationConfig.make_process_key(DeviceAllocationConfig.APV_WORKER_PROCESS))
+        # if there is an inference server, the actors we deploy here play controller roles.
+        # otherwise, in 'streamlined' mode, they are actors.
+        worker_device_config = device_config.get_config(CONTROLLER if inference_server is not None else ACTOR)
         worker_calls = [functools.partial(self.run_worker, i) for i in range(self.num_workers)]
         for call in worker_calls:
             handle = service.deploy_service(

@@ -17,6 +17,7 @@ from uuid import uuid4 as uuid
 import subprocess
 import cloudpickle
 from tempfile import NamedTemporaryFile
+from ..device_config import get_cli_args_from_config
 
 import logging
 base_logger = logging.getLogger(__name__)
@@ -475,8 +476,7 @@ def deploy_service(executable: callable, device_config:Dict[str, str] = None, la
         base_logger.debug('Wrote service executable to temporary file: %s', fl.name)
         fl.flush()
         args = ['--label', new_label]
-        if device_config is not None:
-            args += ['--device_name', device_config['gpu'], '--allocation_size', str(device_config['memory'])]
+        args.extend(get_cli_args_from_config(device_config))
         base_logger.info('Launching service: %s', new_label)
         proc = subprocess.Popen([
             sys.executable,

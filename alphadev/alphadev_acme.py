@@ -4,24 +4,17 @@ Main script for running AlphaDev with an ACME and reverb backend.
 import sonnet as snn
 from .tf_util import tf
 
-import numpy as np
-import ml_collections
 
-from acme.specs import EnvironmentSpec, make_environment_spec, Array, BoundedArray, DiscreteArray
-from acme.agents.tf.mcts import models
+from acme.specs import make_environment_spec
 from acme.environment_loop import EnvironmentLoop
-from acme.utils.counting import Counter
 
-from tinyfive.multi_machine import multi_machine
 from .agents import MCTS, DistributedMCTS # copied from github (not in the dm-acme package)
 
 from .config import AlphaDevConfig
 from .search.mcts import PUCTSearchPolicy
-from .network import AlphaDevNetwork, NetworkFactory, make_input_spec
-from .environment import AssemblyGame, AssemblyGameModel, EnvironmentFactory, ModelFactory
-from .service.variable_service import VariableService
-from .device_config import DeviceAllocationConfig
-
+from .network import NetworkFactory
+from .environment import AssemblyGame, EnvironmentFactory, ModelFactory
+from .device_config import DeviceConfig
 
 import logging
 logger = logging.getLogger(__name__)
@@ -36,6 +29,7 @@ class optimizer_factory:
     def __call__(self): return snn.optimizers.Momentum(learning_rate=self._learning_rate, momentum=self._momentum)
 
 def make_agent(config: AlphaDevConfig):
+    device_config = DeviceConfig(config.device_config_path)
     # -- create factories
     env_factory = EnvironmentFactory(config)
     net_factory = NetworkFactory(config)
@@ -92,6 +86,7 @@ def make_agent(config: AlphaDevConfig):
     else:
         cfg_logger = config.logger_factory()
         return MCTS(
+            device_config=device_config,
             model=mod_factory(None),
             network_factory=net_factory,
             optimizer=opt_factory(),
