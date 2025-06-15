@@ -109,8 +109,8 @@ def apply_device_config(local_tf, config = None):
     local_tf.config.set_visible_devices([device], config['device_type'])
     if allocation_size is not None:
         local_tf.config.experimental.set_memory_growth(device, True)
-        local_tf.config.set_logical_device_configuration([
-            local_tf.config.LogicalDeviceConfiguration(memory_limit=allocation_size)], config['device_type'])
+        local_tf.config.set_logical_device_configuration(
+            device, [local_tf.config.LogicalDeviceConfiguration(memory_limit=allocation_size)])
     return local_tf
 
 def get_device_config_from_cli(args):
