@@ -51,7 +51,7 @@ from .observers import MCTSObserver
 from .service.service import Program, ReverbService, RPCService, RPCClient, deploy_service, terminate_services
 from .service.inference_service import AlphaDevInferenceClient, AlphaDevInferenceService
 from .config import AlphaDevConfig
-from .device_config import DeviceConfig, ACTOR
+from .device_config import DeviceConfig, ACTOR, LEARNER, CONTROLLER
 from .service.variable_service import VariableService
 
 
@@ -243,7 +243,6 @@ class DistributedMCTS:
         dirichlet_alpha: float = 1.0,
         exploration_fraction: float = 0.0,
         search_retain_subtree: bool = True,
-        use_apv_mcts: bool = False,
         # training
         batch_size: int = 256,
         prefetch_size: int = 4,
@@ -256,11 +255,13 @@ class DistributedMCTS:
         n_step: int = 5,
         learning_rate: float = 1e-3,
         # APV MCTS parameters
+        use_apv_mcts: bool = False,
         apv_processes_per_pool: Optional[int] = None,
         virtual_loss_const: Optional[float] = None,
         # inference server 
         use_inference_server: bool = False,
-        # inference_factory: Optional[] = None,
+        search_batch_size: int = None,
+        search_buffer_size: int = None,
         # Other parameters
         use_dual_value_network: bool = False,
         logger_factory: Callable[[], loggers.Logger] = None,
@@ -268,7 +269,6 @@ class DistributedMCTS:
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
     ):
         # check parameters
-        assert False, "Distributed MCTS is not supported rn."
 
         # Internalize the device configuration.
         self._device_config = device_config
@@ -292,6 +292,8 @@ class DistributedMCTS:
         self._search_retain_subtree = search_retain_subtree
         self._use_apv_mcts = use_apv_mcts
         self._use_inference_server = use_inference_server
+        self._search_buffer_size = search_buffer_size
+        self._search_batch_size = search_batch_size
         
         # Training parameters
         self._batch_size = batch_size
@@ -402,7 +404,7 @@ class DistributedMCTS:
         counter: counting.Counter,
         logger: loggers.Logger,
         variable_service: Optional[VariableService] = None,
-        inference_service: Optional[AlphaDevInferenceClient] = None,
+        inference_client: Optional[AlphaDevInferenceClient] = None,
     ) -> acme.EnvironmentLoop:
         """The actor process."""
 
@@ -412,17 +414,6 @@ class DistributedMCTS:
 
         mcts_observers = self._mcts_observers(logger)
         
-        if self._use_inference_server:
-            assert inference_service is not None, 'Inference service must be provided when using inference server.'
-            network = None
-        else:
-            network = self._network_factory(make_input_spec(self._env_spec.observations))
-            variable_client = tf2_variable_utils.VariableClient(
-                client=variable_service,
-                variables={'network': network.trainable_variables},
-                update_period=self._variable_update_period,
-            )
-        
         # Component to add things into replay.
         adder = adders.NStepTransitionAdder(
             client=replay,
@@ -431,6 +422,7 @@ class DistributedMCTS:
         )
 
         actor = MCTSActor(
+            device_config=self._device_config,
             environment_spec=self._env_spec,
             model=model,
             discount=self._discount,
@@ -443,10 +435,10 @@ class DistributedMCTS:
             # implementation-specific parameters
             use_apv_mcts=self._use_apv_mcts,
             # single-threaded mode
-            network=network,
-            variable_client=variable_client,
+            network_factory=self._network_factory,
+            variable_service=variable_service,
             # APV MCTS mode
-            inference_service=self._inference_service,
+            inference_service=inference_client,
             apv_processes_per_pool=self._search_num_actors,
             virtual_loss_const=self._search_virual_loss_const,
             # other
@@ -472,6 +464,7 @@ class DistributedMCTS:
         counter: counting.Counter,
         logger: loggers.Logger,
         variable_service: VariableService = None,
+        inference_client: Optional[AlphaDevInferenceClient] = None,
     ):
         """The evaluation process."""
         # Build environment, model, network.
@@ -480,18 +473,8 @@ class DistributedMCTS:
 
         mcts_observers = self._mcts_observers(logger)
         
-        if self._use_apv_mcts:
-            network = variable_client = None
-            self._inference_factory.set_variable_service(variable_service)
-        else:
-            network = self._network_factory(make_input_spec(self._env_spec.observations))
-            variable_client = tf2_variable_utils.VariableClient(
-                client=variable_service,
-                variables={'network': network.trainable_variables},
-                update_period=self._variable_update_period,
-            )
-        
         actor = MCTSActor(
+            device_config=self._device_config,
             environment_spec=self._env_spec,
             model=model,
             discount=self._discount,
@@ -504,10 +487,11 @@ class DistributedMCTS:
             # implementation-specific parameters
             use_apv_mcts=self._use_apv_mcts,
             # single-threaded mode
-            network=network,
-            variable_client=variable_client,
+            network_factory=self._network_factory,
+            variable_service=variable_service, # can be None
+            variable_update_period=self._variable_update_period,
             # APV MCTS mode
-            inference_factory=self._inference_factory,
+            inference_service=inference_client, # can be None
             apv_processes_per_pool=self._search_num_actors,
             virtual_loss_const=self._search_virual_loss_const,
             # other
@@ -550,11 +534,7 @@ class DistributedMCTS:
                 )
 
         with program.group('learner'):
-            learner_device_config = self._device_config.get(
-                DeviceConfig.make_process_key(
-                    DeviceConfig.LEARNER_PROCESS
-                )
-            , None)
+            learner_device_config = self._device_config.get_config(LEARNER)
             program.add_service(
                 RPCService(
                     conn_config=config.distributed_backend_config,
@@ -565,53 +545,67 @@ class DistributedMCTS:
                 )
 
         with program.group('evaluator'):
-            eval_device_config = self._device_config.get(
-                DeviceConfig.make_process_key(
-                    DeviceConfig.ACTOR_PROCESS, 0
-                ), None
-            )
-            program.add_service(
-                RPCService(
-                    conn_config=config.distributed_backend_config,
-                    instance_factory=self.evaluator,
-                    instance_cls=acme.EnvironmentLoop,
-                    args=(counter, logger, variable_service),
-                ),
-                device_config=eval_device_config
-                )
+            eval_device_config = self._device_config.get_config(ACTOR)
+            if self._use_inference_server:
+                eval_inference_client = program.add_service(
+                    AlphaDevInferenceService(
+                        num_blocks=self._search_buffer_size, # 2x the number of processes.
+                        network_factory=self._network_factory,
+                        input_spec=self._env_spec.observations,
+                        output_spec=self._env_spec.actions.num_values, # num actions
+                        batch_size=self._search_batch_size,
+                        variable_service=variable_service,
+                        variable_update_period=self._variable_update_period,
+                        factory_args=([make_input_spec(self._env_spec.observations)],), # for the network factory
+                        name='eval_inference_service',
+                    ), device_config=eval_device_config)
+                program.add_service(
+                    RPCService(
+                        conn_config=config.distributed_backend_config,
+                        instance_factory=self.evaluator,
+                        instance_cls=acme.EnvironmentLoop,
+                        args=(counter, logger, None, eval_inference_client),
+                    ))
+            else:
+                program.add_service(
+                    RPCService(
+                        conn_config=config.distributed_backend_config,
+                        instance_factory=self.evaluator,
+                        instance_cls=acme.EnvironmentLoop,
+                        args=(counter, logger, variable_service, None),
+                    ), eval_device_config)
 
         with program.group('actor'):
             for idx in range(self._num_actors):
                 if self._use_inference_server:
-                    inference_device_config = self._device_config.get(
-                        DeviceConfig.make_process_key(
-                            DeviceConfig.INFERENCE_PROCESS, idx
-                        ), None
+                    actor_device_config = self._device_config.get_config(ACTOR)
+                    actor_inference_client = program.add_service(
+                        AlphaDevInferenceService(
+                            num_blocks=self._search_buffer_size, # 2x the number of processes.
+                            network_factory=self._network_factory,
+                            input_spec=self._env_spec.observations,
+                            output_spec=self._env_spec.actions.num_values, # num actions
+                            batch_size=self._search_batch_size,
+                            variable_service=variable_service,
+                            variable_update_period=self._variable_update_period,
+                            factory_args=([make_input_spec(self._env_spec.observations)],), # for the network factory
+                            name=f'actorr_{idx}_inference',
+                        ), device_config=actor_device_config
                     )
-                    # Create the inference service for this actor.
-                    inference = self._inference_factory(variable_service=variable_service, label=f'inference/{idx}')
                     program.add_service(
-                        inference,
-                        device_config=inference_device_config,
-                    )
-                    variable_service = None # don't pass it to the actor, it will use the inference service instead
+                        RPCService(
+                            conn_config=config.distributed_backend_config,
+                            instance_factory=self.actor,
+                            instance_cls=acme.EnvironmentLoop,
+                            args=(counter, logger, None, actor_inference_client),
+                        ))
                 else:
-                    inference = None
-                
-                actor_device_config = self._device_config.get(
-                    DeviceConfig.make_process_key(
-                        DeviceConfig.ACTOR_PROCESS, idx
-                    )
-                , None)
-                program.add_service(
-                    RPCService(
-                        conn_config=config.distributed_backend_config,
-                        instance_factory=self.actor,
-                        instance_cls=acme.EnvironmentLoop,
-                        args=(
-                            idx, replay, counter, logger, variable_service, inference
-                        ),),
-                    device_config=actor_device_config, # NOTE: only used when using single-threaded actors
-                    )
+                    program.add_service(
+                        RPCService(
+                            conn_config=config.distributed_backend_config,
+                            instance_factory=self.actor,
+                            instance_cls=acme.EnvironmentLoop,
+                            args=(counter, logger, variable_service, None),
+                        ), actor_device_config)
         
         return program
