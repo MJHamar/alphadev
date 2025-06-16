@@ -1,9 +1,9 @@
-experiment_name: AlphaDev-Sort3-APV-MCTS
+experiment_name: AlphaDev-sort3
 
 # Environment
 num_inputs: 17
-num_mem: 6
-num_regs: 5
+num_mem: 3
+num_regs: 6
 items_to_sort: 3
 correct_reward: 1.0
 correctness_reward_weight: 2.0
@@ -14,14 +14,16 @@ emulator_mode: 'i32'
 
 # Self-Play
 num_actors: 2
-max_moves: 100
-num_simulations: 1000
+max_moves: 20
+num_simulations: 100
 discount: 1.0
+root_dirichlet_alpha: 0.03
+root_exploration_fraction: 0.25
 search_retain_subtree: True
 use_async_search: True
 async_search_processes_per_pool: 4
 async_seach_virtual_loss: -1.0
-search_use_inference_server: True
+search_use_inference_server: False
 search_batch_size: 'auto'
 search_buffer_size: 'auto'
 
@@ -44,11 +46,11 @@ representation_attention_position_encoding: absolute
 representation_attention_num_layers: 6
 value_max: 30.0
 value_num_bins: 301
-categorical_value_loss: False
+categorical_value_loss: True
 
 # Training
 training_steps: 1000
-batch_size: 1024
+batch_size: 16
 n_step: 5
 lr_init: 0.0002
 momentum: 0.9
@@ -57,9 +59,9 @@ momentum: 0.9
 episode_accumulation_period: 2
 
 # Distributed training
-distributed: False
+distributed: True
 prefetch_size: 4
-variable_update_period: 50
+variable_update_period: 2
 target_update_period: 10
 samples_per_insert: 2
 min_replay_size: 100
@@ -70,7 +72,8 @@ redis_host: 'localhost'
 redis_port: 6379
 redis_db: 0
 variable_service_name: 'variable'
-device_config_path: './test_device_config.yaml'
+device_config_path: './device_config.yaml'
+
 # Logging
 use_wandb: False
 wandb_project: alphadev
@@ -81,7 +84,7 @@ wandb_mode: online
 wanbd_run_id: null
 
 # Observers
-observe_mcts_policy: True
-mcts_observer_ratio: 0.001
-
-do_mcts_profiling: True
+observe_mcts_policy: False
+mcts_observer_ratio: 0.1
+observe_program_correctness: False
+save_non_zero_reward_trajectories: False
