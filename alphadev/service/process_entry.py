@@ -48,6 +48,6 @@ with open(config.executable_path, 'rb') as f:
 sys.argv = sys.argv[:1]
 
 # run the executable
-app.run(executable)
+executable()
 
 logger.info(f"{config.label} exited.")

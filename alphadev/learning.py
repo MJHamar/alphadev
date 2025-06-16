@@ -12,8 +12,8 @@ from acme.tf import utils as tf2_utils
 from .service.variable_service import VariableService
 
 import logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+base_logger = logging.getLogger(__name__)
+base_logger.setLevel(logging.DEBUG)
 
 
 class AZLearner(acme.Learner):
@@ -47,7 +47,7 @@ class AZLearner(acme.Learner):
         
         # publish current variables
         if self._variable_service is not None:
-            logger.debug(f"AZLearner: initializing variable service")
+            base_logger.debug(f"AZLearner: initializing variable service")
             self._variable_service.update(self.get_variables([]))
 
     @tf.function
@@ -84,9 +84,9 @@ class AZLearner(acme.Learner):
         loss = self._step()
         self._logger.write({'loss': loss})
         counts = self._counter.increment(**{'step': 1})
-        print('counts', counts)
+        base_logger.debug('counts', counts)
         if self._variable_service is not None:
-            logger.debug(f"updating variables at step {counts['step']}")
+            base_logger.debug(f"updating variables at step {counts['step']}")
             self._variable_service.update(self.get_variables([]))
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:

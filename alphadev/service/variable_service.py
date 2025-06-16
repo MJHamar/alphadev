@@ -12,7 +12,7 @@ from ..config import AlphaDevConfig
 
 import logging
 base_logger = logging.getLogger(__name__)
-base_logger.setLevel(logging.DEBUG)
+base_logger.setLevel(logging.INFO)
 
 class VariableService():
     """Variable service that stores variables in a Redis database.
@@ -45,7 +45,7 @@ class VariableService():
     
     def update(self, variables):
         """Update the variable storage with the given variables."""
-        base_logger.debug(f"Updating variables in {self._variable_key}")
+        base_logger.info(f"Updating variables in {self._variable_key}")
         with self.connection() as conn:
             variables_bin = pickle.dumps(variables)
             conn.set(self._variable_key, variables_bin)

@@ -545,41 +545,41 @@ class DistributedMCTS:
                 device_config=learner_device_config,
                 )
 
-        with program.group('evaluator'):
-            eval_device_config = self._device_config.get_config(ACTOR)
-            if self._use_inference_server:
-                eval_inference_client = program.add_service(
-                    AlphaDevInferenceService(
-                        num_blocks=self._search_buffer_size, # 2x the number of processes.
-                        network_factory=self._network_factory,
-                        input_spec=self._env_spec.observations,
-                        output_spec=self._env_spec.actions.num_values, # num actions
-                        batch_size=self._search_batch_size,
-                        variable_service=variable_service,
-                        variable_update_period=self._variable_update_period,
-                        factory_args=([make_input_spec(self._env_spec.observations)],), # for the network factory
-                        name='eval_inference_service',
-                    ), device_config=eval_device_config)
-                program.add_service(
-                    RPCService(
-                        conn_config=config.distributed_backend_config,
-                        instance_factory=self.evaluator,
-                        instance_cls=acme.EnvironmentLoop,
-                        args=(counter, logger, None, eval_inference_client),
-                    ))
-            else:
-                program.add_service(
-                    RPCService(
-                        conn_config=config.distributed_backend_config,
-                        instance_factory=self.evaluator,
-                        instance_cls=acme.EnvironmentLoop,
-                        args=(counter, logger, variable_service, None),
-                    ), eval_device_config)
+        # with program.group('evaluator'):
+        #     eval_device_config = self._device_config.get_config(ACTOR)
+        #     if self._use_inference_server:
+        #         eval_inference_client = program.add_service(
+        #             AlphaDevInferenceService(
+        #                 num_blocks=self._search_buffer_size, # 2x the number of processes.
+        #                 network_factory=self._network_factory,
+        #                 input_spec=self._env_spec.observations,
+        #                 output_spec=self._env_spec.actions.num_values, # num actions
+        #                 batch_size=self._search_batch_size,
+        #                 variable_service=variable_service,
+        #                 variable_update_period=self._variable_update_period,
+        #                 factory_args=([make_input_spec(self._env_spec.observations)],), # for the network factory
+        #                 name='eval_inference_service',
+        #             ), device_config=eval_device_config)
+        #         program.add_service(
+        #             RPCService(
+        #                 conn_config=config.distributed_backend_config,
+        #                 instance_factory=self.evaluator,
+        #                 instance_cls=acme.EnvironmentLoop,
+        #                 args=(counter, logger, None, eval_inference_client),
+        #             ))
+        #     else:
+        #         program.add_service(
+        #             RPCService(
+        #                 conn_config=config.distributed_backend_config,
+        #                 instance_factory=self.evaluator,
+        #                 instance_cls=acme.EnvironmentLoop,
+        #                 args=(counter, logger, variable_service, None),
+        #             ), device_config=eval_device_config)
 
         with program.group('actor'):
+            actor_device_config = self._device_config.get_config(ACTOR)
             for idx in range(self._num_actors):
                 if self._use_inference_server:
-                    actor_device_config = self._device_config.get_config(ACTOR)
                     actor_inference_client = program.add_service(
                         AlphaDevInferenceService(
                             num_blocks=self._search_buffer_size, # 2x the number of processes.
@@ -607,6 +607,6 @@ class DistributedMCTS:
                             instance_factory=self.actor,
                             instance_cls=acme.EnvironmentLoop,
                             args=(idx, replay, counter, logger, variable_service, None),
-                        ), actor_device_config)
+                        ), device_config=actor_device_config)
         
         return program

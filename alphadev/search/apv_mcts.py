@@ -7,6 +7,7 @@ import pickle
 
 import os
 import subprocess
+import traceback
 
 from acme.agents.tf.mcts.search import SearchPolicy
 from acme.agents.tf.mcts import types
@@ -413,17 +414,16 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 new_root = self.get_by_offset(child_offset)
         else: # no last action no tree to keep
             new_root = None
-        # logger.debug('SharedTree.init_tree: new root node %s.', repr(new_root))
-        # 2. reset the tree and its header, optionally keeping the subtree
-        self.reset_tree(keep_subtree=new_root)
-        logger.debug('SharedTree.init_tree: tree reset, keeping subtree %s.', repr(new_root))
-        # 3. create a new root node
-        if new_root is None:
+        # 2. create a new root node
+        if new_root is None: # where-ever the current header points to. (0; if retain_actions=True)
             new_root = self._make_node()
-            # logger.debug('SharedTree.init_tree: no root node to keep, created %s.', repr(new_root))
-        
-        self.set_root(new_root)  # set the new root node
-        # 4. initialize the root node with the observation if not done already
+        # logger.debug('SharedTree.init_tree: new root node %s.', repr(new_root))
+        # 3. reset the tree and its header, optionally keeping the subtree
+        #    this also resets the header; populates tha avilable array, clears the root offset etc.
+        self.reset_tree(keep_root=new_root)
+        # 4. set the new root node
+        self.set_root(new_root)
+        # 5. initialize the root node with the observation if not done already
         if not new_root.expanded:
             # logger.debug('SharedTree.init_tree: root node %s is not expanded, invoking network')
             prior, _ = self.evaluation(observation)
@@ -433,47 +433,49 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             logger.debug('SharedTree.init_tree: root node %s is already expanded, using existing prior.', repr(new_root))
             prior = new_root.prior
         
-        # 3. Add exploration noise to the prior.
+        # 6. Add exploration noise to the prior.
         noise = np.random.dirichlet(alpha=[self.dirichlet_alpha] * self.num_actions)
         prior = prior * (1 - self.exploration_fraction) + noise * self.exploration_fraction
         new_root.expand(prior) # it's fine to re-expand.
         
-        # 4. Set legal actions if not already set.
+        # 7. Set legal actions if not already set.
         if not new_root.legal_actions.any():
             # logger.debug('SharedTree.init_tree: root node %s has no legal actions set, getting them from the model.', repr(new_root))
-            # 4.1 if the legal actions are not set, we need to get them from the model.
+            # 7.1 if the legal actions are not set, we need to get them from the model.
             legal_actions = self.model.legal_actions()
             new_root.set_legal_actions(legal_actions)
         logger.debug('SharedTree.init_tree: root node %s initialized.',
             repr(new_root))
-        # 5. return the root node.
+        # 8. return the root node.
         return new_root
     
-    def reset_tree(self, keep_subtree: Optional[SharedNodeBase] = None):
+    def reset_tree(self, keep_root: Optional[SharedNodeBase]):
         """
         Reset the tree to its initial state, optionally
         keeping the subtree rooted at the given node.
         Up to num_nodes nodes are kept in the shared memory.
         """
         assert self._is_main, "reset_tree() should only be called in the main process."
+        assert keep_root is not None, "reset_tree() requires a root node to keep"
         # logger.debug('SharedTree.reset_tree called.')
         # 1. find out which nodes to keep.
         keep_nodes = np.zeros(self.num_blocks, dtype=np.bool_)
-        if keep_subtree is not None:
-            queue = [keep_subtree]; num_kept = 0
-            while queue and num_kept < self.num_nodes:
-                node = queue.pop(0)
-                idx = self.off2i(node.offset)
-                keep_nodes[idx] = True
-                for child_offset in node.children:
-                    if child_offset != -1:
-                        child_node = self._node_cls(self._data_shm, child_offset)
-                        queue.append(child_node)
-                num_kept += 1
-            # logger.debug('SharedTree.reset_tree: keeping %d nodes in the shared memory.', num_kept)
-            # clear the children pointers of the nodes at the end of the retained tree.
-            for node in queue:
-                node.parent.children[node.action_id] = -1
+        # BSF traversal of the children of the given root node.
+        queue = [keep_root]; num_kept = 0
+        while queue and num_kept < self.num_nodes:
+            node = queue.pop(0)
+            idx = self.off2i(node.offset)
+            keep_nodes[idx] = True
+            for child_offset in node.children:
+                if child_offset != -1:
+                    child_node = self._node_cls(self._data_shm, child_offset)
+                    queue.append(child_node)
+            num_kept += 1
+        logger.debug('SharedTree.reset_tree: keeping %d nodes in the shared memory.', num_kept)
+        # logger.debug('SharedTree.reset_tree: keeping %d nodes in the shared memory.', num_kept)
+        # clear the children pointers of the nodes at the end of the retained tree.
+        for node in queue:
+            node.parent.children[node.action_id] = -1
         # 2. clear all other nodes in the shared memory.
         # logger.debug('numblocks: %d, num_nodes: %d', self.num_blocks, self.num_nodes)
         for i in range(self.num_blocks):
@@ -482,11 +484,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             offset = self.i2off(i)
             self._node_cls.clear_block(self._data_shm, offset)
             node = self._node_cls(self._data_shm, offset)
-            node.set_root()  # set the node as the root (mimic the behavior of the superclass)
-            node.children[...] = -1
-        # 3. always keep the root node.
-        root = self.get_root()
-        keep_nodes[self.off2i(root.offset)] = True
+            node.set_root()  # set parent and action pointers to -1 (mimic the behavior of the superclass)
+            node.children[...] = -1 # set the children to -1
         # 4. reset the header's counter and available array.
         self._header_cls.clear_block(self._header_shm, 0)
         self.header = self._header_cls(self._header_shm, 0)
@@ -582,7 +581,6 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             stats.sort_stats('cumulative')
             stats.dump_stats(os.path.join(prof_dir, f'mcts_worker_{worker_id}_profile.prof'))
             subprocess.run(['flameprof', '-i', os.path.join(prof_dir, f'mcts_worker_{worker_id}_profile.prof'), '-o', os.path.join(prof_dir, f'mcts_worker_{worker_id}_profile.svg')])
-
     
     def worker_ready(self, worker_id: int):
         """
@@ -663,7 +661,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             # 4. backup the value and the node
             # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- backup call')
             times[3] = time()
-            self.backup(node, np.asarray(value))
+            self.backup(node, np.asarray(value), trajectory=trajectory)
             self.succeed()
             # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- success.')
             return True
@@ -772,8 +770,13 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             return self.get_by_offset(self.header.root_offset.item())
         # logger.debug('SharedTree._make_node called with parent %s, action %s.', repr(parent), action)
         # logger.debug('SharedTree._make_node: local write head %s. available %s', self._local_write_head,self.header.available[self._local_write_head])
+        logger.debug("SharedTree._make_node: make_node at idx %d, parent %s, action %s.",
+                    self.header.available[self._local_write_head], repr(parent), action)
         node = self.get_node(self.header.available[self._local_write_head])
-        assert not node.expanded, "Node must not be expanded when created."
+        assert not node.expanded, f"Node {repr(node)} is already expanded, this is unexpected."
+        # if node.expanded:
+        #     logger.warning('SharedTree._make_node: node %s is already expanded, this is unexpected.', repr(node))
+        #     node.header[self._node_cls.hdr_expanded] = False
         # override the parent's child pointer regardless of race conditions
         node.set_parent(parent, action)
         parent.set_child(action, node)  # set the child pointer in the parent node

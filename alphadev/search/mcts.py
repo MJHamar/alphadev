@@ -282,6 +282,9 @@ class MCTSBase:
     
     def rollout(self, root:NodeBase) -> None:
         trajectory, actions = self.in_tree(root)
+        if trajectory is None or actions is None:
+            logger.warning("No valid trajectory found during MCTS rollout. Skipping.")
+            return
         # 3. simulate the trajectory.
         node, timestep = self.simulate(trajectory[-1], trajectory[:-2], actions)
         # 4. evaluate (and expand) the node.
