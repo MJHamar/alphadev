@@ -12,8 +12,8 @@ from acme.tf import utils as tf2_utils
 from .service.variable_service import VariableService
 
 import logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+base_logger = logging.getLogger(__name__)
+base_logger.setLevel(logging.DEBUG)
 
 
 class AZLearner(acme.Learner):
@@ -24,8 +24,7 @@ class AZLearner(acme.Learner):
         optimizer: snn.Optimizer,
         dataset: tf.data.Dataset,
         discount: float,
-        variable_service: VariableService,
-        varibale_update_period: int = 10,
+        variable_service: VariableService = None,
         logger: Optional[loggers.Logger] = None,
         counter: Optional[counting.Counter] = None,
     ):
@@ -35,7 +34,6 @@ class AZLearner(acme.Learner):
         self._logger = logger or loggers.TerminalLogger('learner', time_delta=30.)
 
         self._variable_service = variable_service
-        self._variable_update_period = varibale_update_period
 
         # Internalize components.
         # TODO(b/155086959): Fix type stubs and remove.
@@ -44,6 +42,11 @@ class AZLearner(acme.Learner):
         self._network = network
         self._variables = network.trainable_variables
         self._discount = np.float32(discount)
+        
+        # initialize the variable service
+        if self._variable_service is not None:
+            print("Initializing variable service")
+            self._variable_service.update(self.get_variables([]))
 
     @tf.function
     def _step(self) -> tf.Tensor:
@@ -80,8 +83,8 @@ class AZLearner(acme.Learner):
         self._logger.write({'loss': loss})
         counts = self._counter.increment(**{'step': 1})
         print('counts', counts)
-        if counts['step'] % self._variable_update_period == 0:
-            logger.debug(f"updating variables at step {counts['step']}")
+        if self._variable_service is not None:
+            print(f"updating variables at step {counts['step']}")
             self._variable_service.update(self.get_variables([]))
 
     def get_variables(self, names: List[str]) -> List[List[np.ndarray]]:

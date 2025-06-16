@@ -18,7 +18,7 @@ max_moves: 100
 num_simulations: 1000
 discount: 1.0
 search_retain_subtree: True
-use_async_search: True
+use_async_search: False
 async_search_processes_per_pool: 4
 async_seach_virtual_loss: -1.0
 search_use_inference_server: True

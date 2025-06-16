@@ -169,6 +169,7 @@ class MCTS(agent.Agent):
             # single-threaded mode
             network_factory=network_factory,
             variable_service=None, # no need for variable service in single-threaded mode
+            variable_update_period=None, # no need for variable update in single-threaded mode
             # APV MCTS mode
             inference_service=inference_client,
             apv_processes_per_pool=apv_processes_per_pool,
@@ -381,7 +382,6 @@ class DistributedMCTS:
                 dataset=dataset,
                 discount=self._discount,
                 variable_service=variable_service,
-                varibale_update_period=self._variable_update_period,
                 logger=logger,
                 counter=counter,
             )
@@ -392,7 +392,6 @@ class DistributedMCTS:
                 dataset=dataset,
                 optimizer=optimizer,
                 variable_service=variable_service,
-                varibale_update_period=self._variable_update_period,
                 logger=logger,
                 counter=counter,
             )
@@ -437,6 +436,7 @@ class DistributedMCTS:
             # single-threaded mode
             network_factory=self._network_factory,
             variable_service=variable_service,
+            variable_update_period=self._variable_update_period,
             # APV MCTS mode
             inference_service=inference_client,
             apv_processes_per_pool=self._search_num_actors,

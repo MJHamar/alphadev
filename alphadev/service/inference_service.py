@@ -215,13 +215,14 @@ class InferenceNetworkFactory:
                 variables={'network': network.trainable_variables},
                 update_period=100,
             )
-        compiled_network = tf.function(network)
+        compiled_network = network
         
         def inference(observation):
             from uuid import uuid4 as uuid
             if variable_client is not None:
                 # update the variables in the network
-                variable_client.update(wait=False)
+                logger.debug(f"InferenceNetworkFactory {uuid().hex[:8]}: updating variables in the network.")
+                variable_client.update(wait=True)
             # ensure batch dimension
             inf_id = uuid().hex[:8]  # local id for logging
             observation = tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation)

@@ -165,34 +165,34 @@ if __name__ == '__main__':
     os.environ['PROFILER_OUTPUT_DIR'] = select_prof_out_dir
     print(f"Profiler output directory: {select_prof_out_dir}")
     
-    # agent, env_loop = actor_env_from_config(sys.argv[2])
-    
-    # print(f"Using actor {agent._actor} and environment loop {env_loop}.")
-    # print("Profiling select_action...")
-    
-    # select_start = time()
-    # select_action_stats = profile_select_n_actions(env_loop._environment, agent._actor, num_steps)
-    # select_end = time()
-    
-    # select_action_stats.dump_stats(f'{select_prof_out_dir}/select_action_profile.prof')
-    # subprocess.run(['flameprof', '-i', f'{select_prof_out_dir}/select_action_profile.prof', '-o', f'{select_prof_out_dir}/select_action_flamegraph.svg'])
-    
-    
-    os.makedirs(env_prof_out_dir, exist_ok=True)
-    os.environ['PROFILER_OUTPUT_DIR'] = env_prof_out_dir
-    print(f"Profiler output directory: {env_prof_out_dir}")
-    
     agent, env_loop = actor_env_from_config(sys.argv[2])
+    
     print(f"Using actor {agent._actor} and environment loop {env_loop}.")
-    print("Profiling Environment Loop...")
+    print("Profiling select_action...")
+    
+    select_start = time()
+    select_action_stats = profile_select_n_actions(env_loop._environment, agent._actor, num_steps)
+    select_end = time()
+    
+    select_action_stats.dump_stats(f'{select_prof_out_dir}/select_action_profile.prof')
+    subprocess.run(['flameprof', '-i', f'{select_prof_out_dir}/select_action_profile.prof', '-o', f'{select_prof_out_dir}/select_action_flamegraph.svg'])
+    
+    
+    # os.makedirs(env_prof_out_dir, exist_ok=True)
+    # os.environ['PROFILER_OUTPUT_DIR'] = env_prof_out_dir
+    # print(f"Profiler output directory: {env_prof_out_dir}")
+    
+    # agent, env_loop = actor_env_from_config(sys.argv[2])
+    # print(f"Using actor {agent._actor} and environment loop {env_loop}.")
+    # print("Profiling Environment Loop...")
 
-    env_start = time()
-    env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
-    env_end = time()
+    # env_start = time()
+    # env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
+    # env_end = time()
 
-    env_loop_stats.dump_stats(f'{prof_out_dir}/env_loop_profile.prof')
-    subprocess.run(['flameprof', '-i', f'{env_prof_out_dir}/env_loop_profile.prof', '-o', f'{env_prof_out_dir}/env_loop_flamegraph.svg'])
+    # env_loop_stats.dump_stats(f'{prof_out_dir}/env_loop_profile.prof')
+    # subprocess.run(['flameprof', '-i', f'{env_prof_out_dir}/env_loop_profile.prof', '-o', f'{env_prof_out_dir}/env_loop_flamegraph.svg'])
     
     print("Profiling complete.")
-    # print(f"Select Action Time: {select_end - select_start:.2f} seconds.")
-    print(f"Environment Loop Time: {env_end - env_start:.2f} seconds.")
+    print(f"Select Action Time: {select_end - select_start:.2f} seconds.")
+    # print(f"Environment Loop Time: {env_end - env_start:.2f} seconds.")
