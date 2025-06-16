@@ -22,7 +22,7 @@ from .mcts import MCTSBase, NodeBase
 _local_id = 'main'
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 logging.basicConfig(
     format=f'process {_local_id}: %(levelname)s: %(message)s',
 )
@@ -155,9 +155,22 @@ class SharedNodeBase(NodeBase, BlockLayout):
     def children_values(self) -> np.ndarray:
         vl_counts = self.visitors.sum(axis=1)
         Nr_vl = self.Nr + vl_counts
-        values_r = np.divide(self.R + self.const_vl * vl_counts, Nr_vl, self.zeros, where=Nr_vl != 0)
-        values_w = np.divide(self.W, self.Nw, self.zeros, where=self.Nw != 0)
-        return (1 - self._lam) * values_r + self._lam * values_w
+        Nr_mask = Nr_vl != 0 # race condition might make some ns nonzero and we end up with NaN.
+        Nw_mask = self.Nw != 0 # make a snapshot here. This is safe because both Nr and Nw monotonously increasing.
+        values_r = np.divide(self.R + self.const_vl * vl_counts, Nr_vl, self.zeros, where=Nr_mask)
+        values_w = np.divide(self.W, self.Nw, self.zeros, where=Nw_mask)
+        retval = (1 - self._lam) * values_r + self._lam * values_w
+        # Debug: Check division results
+        if not np.isfinite(values_w).all():
+            nan_indices = ~np.isfinite(values_w)
+            logger.warning(f'{repr(self)}: values_w contains NaN at indices {np.where(nan_indices)[0]}'\
+                f'  W[nan_indices]: {self.W[nan_indices]}' \
+                f'  Nw[nan_indices]: {self.Nw[nan_indices]}' \
+                f'  Nw_mask[nan_indices]: {Nw_mask[nan_indices]}')
+        
+        logger.debug('%s.children_values called. values_r: %s, values_w: %s, vl_counts: %s, R: %s, Nr_vl: %s, W: %s, Nw: %s, retval: %s',
+            repr(self), np.isfinite(values_r).all(), np.isfinite(values_w).all(), np.isfinite(vl_counts).all(), np.isfinite(self.R).all(), np.isfinite(Nr_vl).all(), np.isfinite(self.W).all(), np.isfinite(self.Nw).all(), np.isfinite(retval).all())
+        return retval
     
     @property
     def children_visits(self) -> np.ndarray:
@@ -661,9 +674,9 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             times[2] = time()
             _, value = self.evaluate(node, observation)
             # 4. backup the value and the node
-            # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- backup call')
+            logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- backup with value {value} for node {node}.')
             times[3] = time()
-            self.backup(node, np.asarray(value))
+            self.backup(node, value)
             self.succeed()
             # logger.debug(f'SharedTree.rollout_{self._local_write_head}: --- success.')
             return True

@@ -16,7 +16,7 @@ from .service import Service
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class InferenceTaskBase(BlockLayout):
@@ -218,12 +218,16 @@ class InferenceNetworkFactory:
         compiled_network = tf.function(network)
         
         def inference(observation):
+            from uuid import uuid4 as uuid
             if variable_client is not None:
                 # update the variables in the network
                 variable_client.update(wait=False)
             # ensure batch dimension
+            inf_id = uuid().hex[:8]  # local id for logging
             observation = tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation)
+            logger.debug(f"InferenceNetworkFactory {inf_id}: running inference on observation {observation}")
             outputs = compiled_network(observation)
+            logger.debug(f"InferenceNetworkFactory {inf_id}: obtained outputs {outputs}")
             # outputs is assumed to be a tuple of (prior, value, [other outputs])
             return ( # return prior and value
                 tf2_utils.squeeze_batch_dim(outputs[0]),

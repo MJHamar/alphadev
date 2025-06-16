@@ -11,12 +11,14 @@ from acme.agents.tf.mcts import models
 import dataclasses
 import numpy as np
 
+import tree
+
 from tqdm import tqdm
 
 import logging
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 class NodeBase:
     """Locally stored MCTS node. uses lazy evaluation."""
@@ -330,7 +332,12 @@ class MCTSBase:
             value = 0.
         else:
             # Otherwise, bootstrap from this node with our value function.
+            obs_finite = tree.map_structure(lambda x: np.isfinite(x).all(), observation)
+            assert all([v for v in obs_finite.values()]), (
+                f"Corrupted Observation: {node} with observation: {observation}. Finite: {obs_finite}.")
             prior, value = self.evaluation(observation)
+            assert np.isfinite(prior).all(), f"Prior {prior} is not finite value: {value}. Node: {node}. observation: {observation}. Finite: {obs_finite}. evaluation: {self.evaluation}."
+            assert np.isfinite(value), f"Value {value} is not finite. prior is ok. Node: {node}."
             # We also want to expand this node for next time.
             node.expand(prior)
         return prior, value
@@ -339,6 +346,7 @@ class MCTSBase:
         # Monte Carlo back-up with bootstrap from value function.
         logger.debug(f"MCTSBase.backup(): Backing up value {value} for node: {node}. actual root: {self.get_root()}.")
         assert node.parent is not None, f"Node node cannot be root, is it? {node.is_root()}"
+        assert np.isfinite(value), f"Value {value} is not finite. Node: {node}, trajectory: {trajectory}."
         node.parent.backup_value(node.action, value, self.discount, trajectory=trajectory)
         # done.
     
@@ -392,17 +400,21 @@ def puct(node: NodeBase, ucb_scaling: float = 1.) -> types.Action:
     """PUCT search policy, i.e. UCT with 'prior' policy."""
     # Action values Q(s,a) = R(s,a) / Nr(s,a) + W(s,a) / Nw(s,a).
     value_scores = node.children_values
-    # check_numerics(value_scores)
+    try:
+        check_numerics(value_scores)
+    except ValueError as e:
+        logger.exception("%s, children values has nans or infs: %s", node, e)
+        raise ValueError(f"Node: {node}, children values: {value_scores}") from e
 
     # Policy prior P(s,a).
     priors = node.prior
-    # check_numerics(priors)
+    check_numerics(priors)
 
     # Visit ratios.
     # sqrt(Nr(s))/1+Nr(s,a) according to Silver et al. 2016.
     nominator = np.sqrt(node.visit_count)
     visit_ratios = nominator / (node.children_visits + 1)
-    # check_numerics(visit_ratios)
+    check_numerics(visit_ratios)
 
     # Combine.
     puct_scores = value_scores + ucb_scaling * priors * visit_ratios
@@ -411,7 +423,7 @@ def puct(node: NodeBase, ucb_scaling: float = 1.) -> types.Action:
 argmax_rng = np.random.default_rng(42)  # Ensure we have a random number generator.
 def argmax(values: np.ndarray, mask: np.ndarray) -> types.Action:
     """Argmax with random tie-breaking."""
-    # check_numerics(values)
+    check_numerics(values)
     max_value = np.max(values*mask) # mask the values to only consider valid actions
     return np.int32(argmax_rng.choice(np.arange(values.shape[0])[values == max_value]))
 
@@ -437,6 +449,6 @@ def visit_count_policy(root: NodeBase, temperature: float = 1.0, mask: np.ndarra
         visits = visits * mask # multiply by the mask to keep the shape, but make invalid actions impossible to choose    
     rescaled_visits = visits**(1 / temperature)
     probs = rescaled_visits / np.sum(rescaled_visits)
-    # check_numerics(probs)
+    check_numerics(probs)
     
     return probs

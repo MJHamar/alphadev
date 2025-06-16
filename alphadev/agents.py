@@ -456,7 +456,7 @@ class DistributedMCTS:
             actor=actor,
             counter=counter,
             logger=logger,
-            label='actor',
+            label=f'actor_{index}',
             observers=observers)
 
     def evaluator(
@@ -573,12 +573,12 @@ class DistributedMCTS:
                         instance_factory=self.evaluator,
                         instance_cls=acme.EnvironmentLoop,
                         args=(counter, logger, variable_service, None),
-                    ), eval_device_config)
+                    ), device_config=eval_device_config)
 
         with program.group('actor'):
+            actor_device_config = self._device_config.get_config(ACTOR)
             for idx in range(self._num_actors):
                 if self._use_inference_server:
-                    actor_device_config = self._device_config.get_config(ACTOR)
                     actor_inference_client = program.add_service(
                         AlphaDevInferenceService(
                             num_blocks=self._search_buffer_size, # 2x the number of processes.
@@ -606,6 +606,6 @@ class DistributedMCTS:
                             instance_factory=self.actor,
                             instance_cls=acme.EnvironmentLoop,
                             args=(idx, replay, counter, logger, variable_service, None),
-                        ), actor_device_config)
+                        ), device_config=actor_device_config)
         
         return program
