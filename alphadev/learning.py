@@ -44,6 +44,11 @@ class AZLearner(acme.Learner):
         self._network = network
         self._variables = network.trainable_variables
         self._discount = np.float32(discount)
+        
+        # publish current variables
+        if self._variable_service is not None:
+            logger.debug(f"AZLearner: initializing variable service")
+            self._variable_service.update(self.get_variables([]))
 
     @tf.function
     def _step(self) -> tf.Tensor:
@@ -80,7 +85,7 @@ class AZLearner(acme.Learner):
         self._logger.write({'loss': loss})
         counts = self._counter.increment(**{'step': 1})
         print('counts', counts)
-        if counts['step'] % self._variable_update_period == 0:
+        if self._variable_service is not None:
             logger.debug(f"updating variables at step {counts['step']}")
             self._variable_service.update(self.get_variables([]))
 

@@ -215,6 +215,9 @@ class InferenceNetworkFactory:
                 variables={'network': network.trainable_variables},
                 update_period=100,
             )
+            # obtain the variables from the variable service
+            # this will block until the learner publishes its weights.
+            variable_client.update_and_wait()
         compiled_network = tf.function(network)
         
         def inference(observation):

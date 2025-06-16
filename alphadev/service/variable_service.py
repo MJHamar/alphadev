@@ -6,12 +6,13 @@ import redis
 import pickle
 import time
 import contextlib
+from uuid import uuid4 as uuid
 
 from ..config import AlphaDevConfig
 
 import logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+base_logger = logging.getLogger(__name__)
+base_logger.setLevel(logging.DEBUG)
 
 class VariableService():
     """Variable service that stores variables in a Redis database.
@@ -23,7 +24,7 @@ class VariableService():
     """
     def __init__(self, config: AlphaDevConfig):
         self._config = config
-        self._variable_key = f'{config.variable_service_name}'
+        self._variable_key = f'{config.variable_service_name}_{uuid().hex[:8]}'
         self._redis_config = config.distributed_backend_config
         assert self._redis_config['type'] == 'redis', "Only redis is supported for variable storage"
     
@@ -44,7 +45,7 @@ class VariableService():
     
     def update(self, variables):
         """Update the variable storage with the given variables."""
-        logger.debug(f"Updating variables in {self._variable_key}")
+        base_logger.debug(f"Updating variables in {self._variable_key}")
         with self.connection() as conn:
             variables_bin = pickle.dumps(variables)
             conn.set(self._variable_key, variables_bin)
@@ -52,7 +53,7 @@ class VariableService():
     
     def has_variables(self):
         """Check if the variable storage has variables."""
-        logger.debug(f"Checking if variables exist in {self._variable_key}")
+        base_logger.debug(f"Checking if variables exist in {self._variable_key}")
         with self.connection() as conn:
             variables_bin = conn.exists(self._variable_key)
             if variables_bin == 0:
@@ -63,7 +64,14 @@ class VariableService():
     def get_variables(self, keys=None):
         # NOTE: keys is unused because it is also unused in AZLearner.
         """Get the variables from the variable storage."""
-        logger.debug(f"Getting variables from {self._variable_key}")
+        base_logger.debug(f"Getting variables from {self._variable_key}")
+        if not self.has_variables():
+            start = time.time()
+            while not self.has_variables() and time.time() - start < 90: # wait for variables to be available
+                time.sleep(1)
+            if not self.has_variables():
+                base_logger.error("Variables not found in variable storage after waiting for 90 seconds")
+                raise ValueError("No variables found in variable storage")
         with self.connection() as conn:
             variables_bin = conn.get(self._variable_key)
             if variables_bin is None:
