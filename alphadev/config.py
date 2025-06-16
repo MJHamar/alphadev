@@ -7,6 +7,8 @@ import ml_collections
 import numpy as np
 import portpicker
 
+from datetime import datetime
+
 from acme.utils.loggers import make_default_logger, Logger
 
 
@@ -73,6 +75,8 @@ class AlphaDevConfig(object):
     lr_init: float = 2e-4
     momentum: float = 0.9
     grad_clip_norm: float = 0.2 # gradient clipping norm
+    checkpoint_dir: str = None
+    checkpoint_every: int = 100
     
     ### Single-threaded training
     episode_accumulation_period: int = 2 # how many episodes to accumulate before training
@@ -124,6 +128,10 @@ class AlphaDevConfig(object):
     do_mcts_profiling: bool = False
 
     def __post_init__(self):
+        
+        if self.checkpoint_dir is not None:
+            self.checkpoint_dir = os.path.join(self.checkpoint_dir, self.experiment_name, datetime.now().strftime('%Y-%m-%d_%H-%M'))
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
         
         self.hparams = ml_collections.ConfigDict()
         self.hparams.embedding_dim = self.embedding_dim

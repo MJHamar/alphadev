@@ -26,6 +26,9 @@ class VariableService():
         self._config = config
         self._variable_key = f'{config.variable_service_name}_{uuid().hex[:8]}'
         self._redis_config = config.distributed_backend_config
+        self._checkpoint_dir = config.checkpoint_dir
+        self._checkpoint_every = config.checkpoint_every
+        self._num_updates = 0
         assert self._redis_config['type'] == 'redis', "Only redis is supported for variable storage"
     
     @contextlib.contextmanager
@@ -46,6 +49,12 @@ class VariableService():
     def update(self, variables):
         """Update the variable storage with the given variables."""
         base_logger.info(f"Updating variables in {self._variable_key}")
+        self._num_updates += 1
+        if self._checkpoint_dir is not None and self._num_updates % self._checkpoint_every == 0:
+            base_logger.info(f"Checkpointing variables to {self._checkpoint_dir}")
+            with open(f"{self._checkpoint_dir}/variables_{self._num_updates}.pkl", "wb") as f:
+                pickle.dump(variables, f)
+        base_logger.debug(f"Storing variables in {self._variable_key}")
         with self.connection() as conn:
             variables_bin = pickle.dumps(variables)
             conn.set(self._variable_key, variables_bin)
