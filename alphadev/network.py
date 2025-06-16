@@ -7,6 +7,9 @@ from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, Tuple
 import sonnet as snn
 from .tf_util import tf
 
+tf.debugging.enable_check_numerics()
+
+
 import ml_collections
 import functools
 from acme.specs import Array, DiscreteArray
@@ -50,13 +53,13 @@ class PositionalEmbedding(snn.Module):
         self.pos_encoding = positional_encoding(length=seq_size, depth=feat_size)
 
     def __call__(self, x):
-        tf.debugging.assert_all_finite(x, "PositionalEmbedding input x")
+        # tf.debugging.assert_all_finite(x, "PositionalEmbedding input x")
         length = tf.shape(x)[1]
         # This factor sets the relative scale of the embedding and positonal_encoding.
         x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        tf.debugging.assert_all_finite(x, "PositionalEmbedding after sqrt scaling")
+        # tf.debugging.assert_all_finite(x, "PositionalEmbedding after sqrt scaling")
         x = x + self.pos_encoding[tf.newaxis, :length, :]
-        tf.debugging.assert_all_finite(x, "PositionalEmbedding output")
+        # tf.debugging.assert_all_finite(x, "PositionalEmbedding output")
         return x
 
 class MultiQueryAttentionBlock(snn.Module):
@@ -341,7 +344,7 @@ class RepresentationNet(snn.Module):
         program_encoding = None
         if self._hparams.representation.use_program:
             program_encoding = self._encode_program(inputs, batch_size)
-            tf.debugging.assert_all_finite(program_encoding, "RepresentationNet program_encoding contains NaN/Inf")
+            # tf.debugging.assert_all_finite(program_encoding, "RepresentationNet program_encoding contains NaN/Inf")
 
         if (
             self._hparams.representation.use_locations # i.e. CPU state
@@ -356,12 +359,12 @@ class RepresentationNet(snn.Module):
             locations_encoding = self._make_locations_encoding_onehot(
                 inputs, batch_size
             )
-            tf.debugging.assert_all_finite(locations_encoding, "RepresentationNet locations_encoding (onehot) contains NaN/Inf")
+            # tf.debugging.assert_all_finite(locations_encoding, "RepresentationNet locations_encoding (onehot) contains NaN/Inf")
         elif self._hparams.representation.use_locations_binary:
             locations_encoding = self._make_locations_encoding_binary(
                 inputs, batch_size
             )
-            tf.debugging.assert_all_finite(locations_encoding, "RepresentationNet locations_encoding (binary) contains NaN/Inf")
+            # tf.debugging.assert_all_finite(locations_encoding, "RepresentationNet locations_encoding (binary) contains NaN/Inf")
 
         # NOTE: this is not used.
         permutation_embedding = None
@@ -372,7 +375,7 @@ class RepresentationNet(snn.Module):
         final_output = self.aggregate_locations_program(
             locations_encoding, permutation_embedding, program_encoding, batch_size
         )
-        tf.debugging.assert_all_finite(final_output, "RepresentationNet final output contains NaN/Inf")
+        # tf.debugging.assert_all_finite(final_output, "RepresentationNet final output contains NaN/Inf")
         return final_output
 
     def _encode_program(self, inputs: CPUState, batch_size):
@@ -382,9 +385,9 @@ class RepresentationNet(snn.Module):
         program_onehot = self.make_program_onehot(
             program, batch_size, max_program_size
         )
-        tf.debugging.assert_all_finite(program_onehot, "RepresentationNet program_onehot contains NaN/Inf")
+        # tf.debugging.assert_all_finite(program_onehot, "RepresentationNet program_onehot contains NaN/Inf")
         program_encoding = self.apply_program_mlp_embedder(program_onehot)
-        tf.debugging.assert_all_finite(program_encoding, "RepresentationNet program_encoding after MLP contains NaN/Inf")
+        # tf.debugging.assert_all_finite(program_encoding, "RepresentationNet program_encoding after MLP contains NaN/Inf")
         program_encoding = self.apply_program_attention_embedder(program_encoding)
         # select the embedding corresponding to the current instruction in the corr. CPU state
         return self.pad_program_encoding( # size B x num_inputs x embedding_dim
@@ -399,28 +402,28 @@ class RepresentationNet(snn.Module):
         batch_size,
     ):
         # logger.debug("aggregate_locations_program: locations_encoding shape %s", locations_encoding.shape)
-        tf.debugging.assert_all_finite(locations_encoding, "aggregate_locations_program locations_encoding contains NaN/Inf")
+        # tf.debugging.assert_all_finite(locations_encoding, "aggregate_locations_program locations_encoding contains NaN/Inf")
         
         locations_embedding = tf.vectorized_map(self.locations_embedder, locations_encoding)
-        tf.debugging.assert_all_finite(locations_embedding, "aggregate_locations_program locations_embedding contains NaN/Inf")
+        # tf.debugging.assert_all_finite(locations_embedding, "aggregate_locations_program locations_embedding contains NaN/Inf")
         # logger.debug("aggregate_locations_program: locations_embedding shape %s", locations_embedding.shape)
 
         # broadcast the program encoding for each example.
         # this way, it matches the size of the observations.
         # logger.debug("aggregate_locations_program: program_encoding shape %s", program_encoding.shape)
-        if program_encoding is not None:
-            tf.debugging.assert_all_finite(program_encoding, "aggregate_locations_program program_encoding contains NaN/Inf")
+        # if program_encoding is not None:
+            # tf.debugging.assert_all_finite(program_encoding, "aggregate_locations_program program_encoding contains NaN/Inf")
             
         program_encoded_repeat = self.repeat_program_encoding(
             program_encoding[:, None, :], batch_size
         )
-        tf.debugging.assert_all_finite(program_encoded_repeat, "aggregate_locations_program program_encoded_repeat contains NaN/Inf")
+        # tf.debugging.assert_all_finite(program_encoded_repeat, "aggregate_locations_program program_encoded_repeat contains NaN/Inf")
         # logger.debug("aggregate_locations_program: program_encoded_repeat shape %s", program_encoded_repeat.shape)
 
         grouped_representation = tf.concat( # concat the CPU state and the program.
             [locations_embedding, program_encoded_repeat], axis=-1
         )
-        tf.debugging.assert_all_finite(grouped_representation, "aggregate_locations_program grouped_representation contains NaN/Inf")
+        # tf.debugging.assert_all_finite(grouped_representation, "aggregate_locations_program grouped_representation contains NaN/Inf")
         # logger.debug("aggregate_locations_program: grouped_representation shape %s", grouped_representation.shape)
 
         return self.apply_joint_embedder(grouped_representation, batch_size)
@@ -433,41 +436,41 @@ class RepresentationNet(snn.Module):
         return program_encoding
 
     def apply_joint_embedder(self, grouped_representation, batch_size):
-        tf.debugging.assert_all_finite(grouped_representation, "apply_joint_embedder input grouped_representation contains NaN/Inf")
+        # tf.debugging.assert_all_finite(grouped_representation, "apply_joint_embedder input grouped_representation contains NaN/Inf")
         
         assert grouped_representation.shape[:2] == (batch_size, self._task_spec.num_inputs), \
             f"grouped_representation shape {grouped_representation.shape[:2]} does not match expected shape {(batch_size, self._task_spec.num_inputs)}"
         # logger.debug("apply_joint_embedder grouped_rep shape %s", grouped_representation.shape)
         # apply MLP to the combined program and locations embedding
         permutations_encoded = self.all_locations_net(grouped_representation)
-        tf.debugging.assert_all_finite(permutations_encoded, "apply_joint_embedder permutations_encoded contains NaN/Inf")
+        # tf.debugging.assert_all_finite(permutations_encoded, "apply_joint_embedder permutations_encoded contains NaN/Inf")
         # logger.debug("apply_joint_embedder permutations_encoded shape %s", permutations_encoded.shape)
         
         # Combine all permutations into a single vector using a ResNetV2
         mean_permutations = tf.reduce_mean(permutations_encoded, axis=1, keepdims=True)
-        tf.debugging.assert_all_finite(mean_permutations, "apply_joint_embedder mean_permutations contains NaN/Inf")
+        # tf.debugging.assert_all_finite(mean_permutations, "apply_joint_embedder mean_permutations contains NaN/Inf")
         
         joint_encoding = self.joint_locations_net(mean_permutations)
-        tf.debugging.assert_all_finite(joint_encoding, "apply_joint_embedder joint_encoding after joint_locations_net contains NaN/Inf")
+        # tf.debugging.assert_all_finite(joint_encoding, "apply_joint_embedder joint_encoding after joint_locations_net contains NaN/Inf")
         # logger.debug("apply_joint_embedder joint_encoding shape %s", joint_encoding.shape)
         
         joint_encoding = self.joint_resnet(joint_encoding)
-        tf.debugging.assert_all_finite(joint_encoding, "apply_joint_embedder joint_encoding after joint_resnet contains NaN/Inf")
+        # tf.debugging.assert_all_finite(joint_encoding, "apply_joint_embedder joint_encoding after joint_resnet contains NaN/Inf")
         
         final_output = joint_encoding[:, 0, :] # remove the extra dimension
-        tf.debugging.assert_all_finite(final_output, "apply_joint_embedder final output contains NaN/Inf")
+        # tf.debugging.assert_all_finite(final_output, "apply_joint_embedder final output contains NaN/Inf")
         
         return final_output
 
     def make_program_onehot(self, program, batch_size, max_program_size):
-        # logger.debug("make_program_onehot shape %s", program.shape)
+        logger.debug("make_program_onehot shape %s, bs %s, max_prog %s", program.shape, batch_size, max_program_size)
         func = program[:, :, 0] # the opcode -- int
         arg1 = program[:, :, 1] # the first operand -- int 
         arg2 = program[:, :, 2] # the second operand -- int
         func_onehot = tf.one_hot(func, self._task_spec.num_funcs)
         arg1_onehot = tf.one_hot(arg1, self._task_spec.num_locations)
         arg2_onehot = tf.one_hot(arg2, self._task_spec.num_locations)
-        # logger.debug("func %s, arg1 %s, arg2 %s", func_onehot.shape, arg1_onehot.shape, arg2_onehot.shape)
+        logger.debug("func %s, arg1 %s, arg2 %s", func_onehot.shape, arg1_onehot.shape, arg2_onehot.shape)
         program_onehot = tf.concat(
             [func_onehot, arg1_onehot, arg2_onehot], axis=-1
         )
@@ -512,10 +515,10 @@ class RepresentationNet(snn.Module):
         return program_encoding
 
     def apply_program_mlp_embedder(self, program_encoding):
-        tf.get_logger().warning(
+        logger.warning(
             "apply_program_mlp_embedder: program_encoding %s", program_encoding)
         program_encoding = self.program_mlp_embedder(program_encoding)
-        tf.get_logger().warning(
+        logger.warning(
             "apply_program_mlp_embedder: program_encoding after MLP %s", program_encoding)
         return program_encoding
 
@@ -531,7 +534,7 @@ class RepresentationNet(snn.Module):
         assert d == self._embedding_dim, (
             f"program encoding dim {d} does not match embedding dim {self._embedding_dim}"
         ) 
-        tf.debugging.assert_all_finite(program_encoding, "apply_program_attention_embedder input program_encoding contains NaN/Inf")
+        # tf.debugging.assert_all_finite(program_encoding, "apply_program_attention_embedder input program_encoding contains NaN/Inf")
         program_encoding = self.positional_embedding(program_encoding)
 
         program_encoding = self.attention_encoders(program_encoding)
@@ -620,21 +623,21 @@ class CategoricalHead(snn.Module):
         )
 
     def __call__(self, x: tf.Tensor):
-        tf.debugging.assert_all_finite(x, "CategoricalHead input x contains NaN/Inf")
+        # tf.debugging.assert_all_finite(x, "CategoricalHead input x contains NaN/Inf")
         
         # For training returns the logits, for inference the mean.
         if len(x.shape) == 2:
             x = tf.expand_dims(x, axis=1)
         logits = self._head(x) # project the embedding to the value support's numbeer of bins 
-        tf.debugging.assert_all_finite(logits, "CategoricalHead logits after head network contains NaN/Inf")
+        # tf.debugging.assert_all_finite(logits, "CategoricalHead logits after head network contains NaN/Inf")
         
         logits = tf.reshape(logits, (-1, self._value_support.num_bins)) # B x num_bins
         probs = tf.nn.softmax(logits) # take softmax -- probabilities over the bins
-        tf.debugging.assert_all_finite(probs, "CategoricalHead probs after softmax contains NaN/Inf")
+        # tf.debugging.assert_all_finite(probs, "CategoricalHead probs after softmax contains NaN/Inf")
         
         # logger.debug("CategoricalHead: logits shape %s, probs shape %s", logits.shape, probs.shape)
         mean = self._value_support.mean(probs) # compute the mean, which is probs * [0, max_val/num_bins, 2max_val/num_bins, max_val]
-        tf.debugging.assert_all_finite(mean, "CategoricalHead mean output contains NaN/Inf")
+        # tf.debugging.assert_all_finite(mean, "CategoricalHead mean output contains NaN/Inf")
         
         return dict(logits=logits, mean=mean)
 
@@ -670,17 +673,17 @@ class PredictionNet(snn.Module):
         self.latency_value_head = CategoricalHead(self.embedding_dim, self.support)
 
     def __call__(self, embedding: tf.Tensor):
-        tf.debugging.assert_all_finite(embedding, "PredictionNet input embedding contains NaN/Inf")
+        # tf.debugging.assert_all_finite(embedding, "PredictionNet input embedding contains NaN/Inf")
         
         # logger.debug("PredictionNet: latency_value_head %s", latency_value_head)
         correctness_value = self.value_head(embedding)
-        tf.debugging.assert_all_finite(correctness_value['mean'], "PredictionNet correctness_value mean contains NaN/Inf")
-        tf.debugging.assert_all_finite(correctness_value['logits'], "PredictionNet correctness_value logits contains NaN/Inf")
+        # tf.debugging.assert_all_finite(correctness_value['mean'], "PredictionNet correctness_value mean contains NaN/Inf")
+        # tf.debugging.assert_all_finite(correctness_value['logits'], "PredictionNet correctness_value logits contains NaN/Inf")
         
         # logger.debug("PredictionNet: correctness_value shape %s", str({k:v.shape for k, v in correctness_value.items()}))
         latency_value = self.latency_value_head(embedding)
-        tf.debugging.assert_all_finite(latency_value['mean'], "PredictionNet latency_value mean contains NaN/Inf")
-        tf.debugging.assert_all_finite(latency_value['logits'], "PredictionNet latency_value logits contains NaN/Inf")
+        # tf.debugging.assert_all_finite(latency_value['mean'], "PredictionNet latency_value mean contains NaN/Inf")
+        # tf.debugging.assert_all_finite(latency_value['logits'], "PredictionNet latency_value logits contains NaN/Inf")
         
         # logger.debug("PredictionNet: latency_value shape %s", str({k:v.shape for k, v in latency_value.items()}))
 
@@ -698,7 +701,7 @@ class PredictionNet(snn.Module):
         if len(embedding.shape) == 2:
             embedding = tf.expand_dims(embedding, axis=1)
         policy = self.policy_head(embedding) # B x num_actions
-        tf.debugging.assert_all_finite(policy, "PredictionNet policy output contains NaN/Inf")
+        # tf.debugging.assert_all_finite(policy, "PredictionNet policy output contains NaN/Inf")
         
         policy = tf.reshape(policy, (-1, self.task_spec.num_actions)) # B x num_actions
         # similarly, the policy should be close to a uniform distribution
@@ -711,7 +714,7 @@ class PredictionNet(snn.Module):
         #     logger.debug("PredictionNet.distr_check: policy min %s, max %s mean %s std %s", policy_min, policy_max, policy_mean, policy_std)
         
         final_value = correctness_value['mean'] + latency_value['mean']
-        tf.debugging.assert_all_finite(final_value, "PredictionNet final value contains NaN/Inf")
+        # tf.debugging.assert_all_finite(final_value, "PredictionNet final value contains NaN/Inf")
         
         output = NetworkOutput(
             value=final_value,
@@ -776,12 +779,12 @@ class AlphaDevNetwork(snn.Module):
         logger.warning("AlphaDevNetwork [retracing]: inputs %s (only a concern if happens repeatedly)", str({k:v.shape for k,v in inputs.items()}))
         # inputs is the observation dict
         embedding: tf.Tensor = self._representation_net(inputs)
-        tf.debugging.assert_all_finite(embedding, "AlphaDevNetwork embedding from representation net contains NaN/Inf")
+        # tf.debugging.assert_all_finite(embedding, "AlphaDevNetwork embedding from representation net contains NaN/Inf")
         # logger.debug("AlphaDevNetwork: embedding shape %s", embedding.shape)
         
         prediction: NetworkOutput = self._prediction_net(embedding)
-        tf.debugging.assert_all_finite(prediction.value, "AlphaDevNetwork prediction value contains NaN/Inf")
-        tf.debugging.assert_all_finite(prediction.policy_logits, "AlphaDevNetwork prediction policy_logits contains NaN/Inf")
+        # tf.debugging.assert_all_finite(prediction.value, "AlphaDevNetwork prediction value contains NaN/Inf")
+        # tf.debugging.assert_all_finite(prediction.policy_logits, "AlphaDevNetwork prediction policy_logits contains NaN/Inf")
         # logger.debug("AlphaDevNetwork: prediction obtained")
         return self._return_fn(prediction)
     

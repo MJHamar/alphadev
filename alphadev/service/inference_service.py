@@ -225,6 +225,8 @@ class InferenceNetworkFactory:
                 # update the variables in the network
                 variable_client.update(wait=False)
             # ensure batch dimension
+            # observation['program'] += 1
+            # logger.error(f"observation_program={observation['program']}")
             observation = tree.map_structure(lambda o: tf.expand_dims(o, axis=0), observation)
             outputs = compiled_network(observation)
             # outputs is assumed to be a tuple of (prior, value, [other outputs])
