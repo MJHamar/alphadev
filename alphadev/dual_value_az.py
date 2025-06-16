@@ -5,8 +5,8 @@ from .distribution import DistributionSupport
 from .learning import AZLearner
 
 import logging
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+base_logger = logging.getLogger(__name__)
+base_logger.setLevel(logging.INFO)
 
 # From AlphaDev pseudocode
 def scalar_loss(prediction:tf.Tensor, target:tf.Tensor, value_max, num_bins) -> float:
@@ -65,6 +65,12 @@ class DualValueAZLearner(AZLearner):
             loss = tf.reduce_mean(correctness_loss + latency_loss + value_loss + policy_loss)
             
             gradients = tape.gradient(loss, self._network.trainable_variables)
+            # clip the gradients
+            gradients, _ = tf.clip_by_global_norm(gradients, self._network._hparams.grad_clip_norm)
+            
+            # base_logger.debug('losses: logits %s, value %s, target_value %s, v_loss %s, p_loss %s, loss %s, grads %s',
+            #                  logits, value, target_value, value_loss, policy_loss, loss,
+            #                  [g for g in gradients])
 
         self._optimizer.apply(gradients, self._network.trainable_variables)
 

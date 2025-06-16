@@ -3,6 +3,7 @@ from typing import Optional, List
 import sonnet as snn
 from .tf_util import tf
 import numpy as np
+import tree
 
 import acme
 from acme.utils import loggers
@@ -13,7 +14,7 @@ from .service.variable_service import VariableService
 
 import logging
 base_logger = logging.getLogger(__name__)
-base_logger.setLevel(logging.DEBUG)
+base_logger.setLevel(logging.INFO)
 
 
 class AZLearner(acme.Learner):
@@ -50,7 +51,7 @@ class AZLearner(acme.Learner):
             base_logger.debug(f"AZLearner: initializing variable service")
             self._variable_service.update(self.get_variables([]))
 
-    @tf.function
+    # @tf.function
     def _step(self) -> tf.Tensor:
         """Do a step of SGD on the loss."""
 
@@ -74,9 +75,16 @@ class AZLearner(acme.Learner):
             # Compute gradients.
             loss = tf.reduce_mean(value_loss + policy_loss)
             gradients = tape.gradient(loss, self._network.trainable_variables)
-
+            
+            # clip the gradients
+            gradients, _ = tf.clip_by_global_norm(gradients, self._network._hparams.grad_clip_norm)
+            
+            # base_logger.debug('losses: logits %s, value %s, target_value %s, v_loss %s, p_loss %s, loss %s, grads %s',
+            #                  logits, value, target_value, value_loss, policy_loss, loss,
+            #                  [g for g in gradients])
+        
         self._optimizer.apply(gradients, self._network.trainable_variables)
-
+        
         return loss
 
     def step(self):

@@ -72,6 +72,7 @@ class AlphaDevConfig(object):
     n_step: int = 5 # TD steps
     lr_init: float = 2e-4
     momentum: float = 0.9
+    grad_clip_norm: float = 0.2 # gradient clipping norm
     
     ### Single-threaded training
     episode_accumulation_period: int = 2 # how many episodes to accumulate before training
@@ -126,6 +127,7 @@ class AlphaDevConfig(object):
         
         self.hparams = ml_collections.ConfigDict()
         self.hparams.embedding_dim = self.embedding_dim
+        self.hparams.grad_clip_norm = self.grad_clip_norm
         # representation network
         self.hparams.representation = ml_collections.ConfigDict()
         self.hparams.representation.use_program = self.representation_use_program
