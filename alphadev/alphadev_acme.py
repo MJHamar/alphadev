@@ -61,6 +61,8 @@ def make_agent(config: AlphaDevConfig):
             exploration_fraction=config.root_exploration_fraction,
             search_retain_subtree=config.search_retain_subtree,
             # training parameters
+            do_train=config.do_train,
+            training_steps=config.training_steps,
             batch_size=config.batch_size,
             prefetch_size=config.prefetch_size,
             target_update_period=config.target_update_period,
@@ -112,6 +114,7 @@ def make_agent(config: AlphaDevConfig):
             search_batch_size=config.search_batch_size,
             search_buffer_size=config.search_buffer_size,
             
+            training_steps=config.training_steps,
             use_dual_value_network=config.hparams.categorical_value_loss,
             logger=cfg_logger,
             mcts_observers=config.search_observers,

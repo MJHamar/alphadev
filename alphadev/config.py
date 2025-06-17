@@ -69,6 +69,7 @@ class AlphaDevConfig(object):
     categorical_value_loss: bool = True # wheether to treat the value functions as a distribution
 
     ### Training
+    do_train: bool = True
     training_steps: int = 1000 #int(1000e3)
     batch_size: int = 8
     n_step: int = 5 # TD steps

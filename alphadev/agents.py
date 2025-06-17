@@ -85,6 +85,7 @@ class MCTS(agent.Agent):
         search_batch_size: int = 1,
         search_buffer_size: int = 3,
         # Other parameters
+        training_steps: Optional[int] = None,
         use_dual_value_network: bool = False,
         logger: loggers.Logger = None,
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
@@ -185,6 +186,7 @@ class MCTS(agent.Agent):
                 optimizer=optimizer,
                 dataset=dataset,
                 discount=discount,
+                training_steps=training_steps,
                 variable_service=None,
                 logger=self.logger,
                 counter=self.counter,
@@ -195,6 +197,7 @@ class MCTS(agent.Agent):
                 optimizer=optimizer,
                 dataset=dataset,
                 discount=discount,
+                training_steps=training_steps,
                 variable_service=None,
                 logger=self.logger,
                 counter=self.counter,
@@ -246,6 +249,8 @@ class DistributedMCTS:
         exploration_fraction: float = 0.0,
         search_retain_subtree: bool = True,
         # training
+        do_train: bool = True,
+        training_steps: int = 1000,
         batch_size: int = 256,
         prefetch_size: int = 4,
         target_update_period: int = 100,
@@ -298,6 +303,8 @@ class DistributedMCTS:
         self._search_batch_size = search_batch_size
         
         # Training parameters
+        self._do_train = do_train
+        self._training_steps = training_steps
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
         self._target_update_period = target_update_period
@@ -383,6 +390,7 @@ class DistributedMCTS:
                 dataset=dataset,
                 discount=self._discount,
                 variable_service=variable_service,
+                training_steps=self._training_steps,
                 logger=logger,
                 counter=counter,
             )
@@ -393,6 +401,7 @@ class DistributedMCTS:
                 dataset=dataset,
                 optimizer=optimizer,
                 variable_service=variable_service,
+                training_steps=self._training_steps,
                 logger=logger,
                 counter=counter,
             )
@@ -533,17 +542,17 @@ class DistributedMCTS:
                     instance_cls=loggers.Logger,
                     )
                 )
-
-        with program.group('learner'):
-            learner_device_config = self._device_config.get_config(LEARNER)
-            program.add_service(
-                RPCService(
-                    conn_config=config.distributed_backend_config,
-                    instance_factory=self.learner,
-                    instance_cls=learning.AZLearner,
-                    args=(replay, counter, variable_service, logger)),
-                device_config=learner_device_config,
-                )
+        if self._do_train:
+            with program.group('learner'):
+                learner_device_config = self._device_config.get_config(LEARNER)
+                program.add_service(
+                    RPCService(
+                        conn_config=config.distributed_backend_config,
+                        instance_factory=self.learner,
+                        instance_cls=learning.AZLearner,
+                        args=(replay, counter, variable_service, logger)),
+                    device_config=learner_device_config,
+                    )
 
         # with program.group('evaluator'):
         #     eval_device_config = self._device_config.get_config(ACTOR)
