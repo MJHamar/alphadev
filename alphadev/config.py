@@ -130,6 +130,13 @@ class AlphaDevConfig(object):
 
     def __post_init__(self):
         
+        # combine device_config with job name
+        if self.device_config_path is not None:
+            self.device_config_path = os.path.join(
+                os.path.dirname(self.device_config_path),
+                f'{os.path.basename(self.device_config_path).split(".")[0]}_{self.experiment_name}.{os.path.basename(self.device_config_path).split(".")[1]}'
+            )
+        
         if self.checkpoint_dir is not None:
             self.checkpoint_dir = os.path.join(self.checkpoint_dir, self.experiment_name, datetime.now().strftime('%Y-%m-%d_%H-%M'))
             os.makedirs(self.checkpoint_dir, exist_ok=True)
@@ -218,8 +225,6 @@ class AlphaDevConfig(object):
                     f"Device configuration file not found: {self.device_config_path}. "
                     "Please make sure to run the device configuration script first."
                 )
-            with open(self.device_config_path, 'r') as f:
-                self.device_config = yaml.safe_load(f)
     
     @classmethod
     def from_yaml(cls, path) -> 'AlphaDevConfig':
