@@ -347,18 +347,19 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         for step in steps_to_eval:
             step_reg, step_mem = self._action_ops[step] # mem=-1 if step is not a lw or sw
             # gather the allows and disallows for the step
+            new_last_reg = max(last_reg, step_reg) # lookahead.
             if step_mem > last_mem:
                 # get LW acts that this step allows, filtered by the current memory
-                allows.update([self._allows_lw[step][step_mem  ]] if step in self._allows_lw and step_mem < self.max_mem else [])
-                allows.update([self._allows_sw[step][step_mem+1]] if step in self._allows_sw and step_mem+1 < self.max_mem else [])
                 last_mem = step_mem
+                allows.update(self._allows_lw_mem[step][:new_last_reg+1] if step in self._allows_lw_mem else [])
+                allows.update(self._allows_sw_mem[step][:new_last_reg+2] if step in self._allows_sw_mem else [])
             if step_reg > last_reg:
                 assert step not in x86_source_source,\
                     f"Source-to-source step _reads_ from register>last_reg, this should not happen"
                 allows.update(self._allows_map[step])
                 # get SW acts that this step allows, filtered by the current register
-                allows.update([self._allows_lw_mem[step][step_reg  ]] if step in self._allows_lw_mem and step_reg < self.max_reg else [])
-                allows.update([self._allows_sw_mem[step][step_reg+1]] if step in self._allows_sw_mem and step_reg+1 < self.max_reg else [])
+                allows.update(self._allows_lw[step][:last_mem+1] if step in self._allows_lw else [])
+                allows.update(self._allows_sw[step][:last_mem+2] if step in self._allows_sw else [])
                 last_reg = step_reg
             # if step is an lw of sw, get the list of disallowed actions
             disallows = self._disallows_map.get(step, set())
