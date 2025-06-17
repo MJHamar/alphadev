@@ -148,7 +148,7 @@ class AlphaDevInferenceService(Service, IOBuffer):
             poll_start = tf.timestamp()
             with self.read_submited(self.batch_size, localize=False) as tasks:
                 if len(tasks) == 0: continue
-                self.logger.debug(f"AlphaDevInferenceService: processing {len(tasks)} tasks")
+                # self.logger.debug(f"AlphaDevInferenceService: processing {len(tasks)} tasks")
                 task_process_start = tf.timestamp()
                 node_offsets = []
                 inputs = []
@@ -172,7 +172,7 @@ class AlphaDevInferenceService(Service, IOBuffer):
                 value=v
             ) for off, p, v in zip(node_offsets, prior, value)])
             ready_end = tf.timestamp()
-            self.logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
+            # self.logger.info('inference total: %s; polling: %s, stacking: %s; inference: %s; ready: %s', ready_end - poll_start, task_process_start - poll_start, inference_start - task_process_start, ready_start - inference_start, ready_end - ready_start)
         self.logger.info("AlphaDevInferenceService: stopping run loop.")
 
     def stop(self):
