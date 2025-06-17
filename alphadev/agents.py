@@ -523,7 +523,10 @@ class DistributedMCTS:
             replay = program.add_service(ReverbService(
                 priority_tables_fn=self.replay, port=config.replay_server_port))
 
-        variable_service = VariableService(config)
+        if self._do_train:
+            variable_service = VariableService(config)
+        else:
+            variable_service = None
 
         with program.group('counter'):
             counter: RPCClient = program.add_service(
