@@ -27,6 +27,7 @@ class AZLearner(acme.Learner):
         discount: float,
         variable_service: VariableService,
         varibale_update_period: int = 10,
+        training_steps: Optional[int] = None,
         logger: Optional[loggers.Logger] = None,
         counter: Optional[counting.Counter] = None,
     ):
@@ -46,11 +47,14 @@ class AZLearner(acme.Learner):
         self._variables = network.trainable_variables
         self._discount = np.float32(discount)
         
+        # the superclass will take care of this parameter.
+        self._training_steps = training_steps
+        
         # publish current variables
         if self._variable_service is not None:
             base_logger.debug(f"AZLearner: initializing variable service")
             self._variable_service.update(self.get_variables([]))
-
+    
     # @tf.function
     def _step(self) -> tf.Tensor:
         """Do a step of SGD on the loss."""

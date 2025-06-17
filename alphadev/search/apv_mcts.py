@@ -354,7 +354,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         )
         # declare the checkpoint class
         ckpt_max_size = model.get_checkpoint_size()
-        self._checkpoint_cls = SharedCheckpointBase.define(size=len(ckpt_max_size)*1.2) 
+        self._checkpoint_cls = SharedCheckpointBase.define(size=ckpt_max_size*1.2)
         # declare shared memory regions
         # the header for storing tree-specific information
         self._header_size = self._header_cls.get_block_size()
