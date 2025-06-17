@@ -208,8 +208,8 @@ x86_signatures = {
     # skip jump instructions, they are not used in the published sort algorithms
     }
 
-x86_opcode2int = {
-    k: i for i, k in enumerate(x86_signatures.keys())
+x86_opcode2int = { # opcodes should be 1-indexed, so that we can use 0 as a no-op
+    k: i+1 for i, k in enumerate(x86_signatures.keys())
 }
 
 x86_source_source = {'cmp'}
