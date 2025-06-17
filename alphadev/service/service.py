@@ -373,8 +373,7 @@ class RPCService(Service):
         """
         self._service.set_close()
         if self._should_run:
-            self._runner.join(timeout=5)
-        self._worker_thread.join(timeout=5)
+            self._worker_thread.join(timeout=5)
         self.logger.info('Service %s stopped', self._service._label)
     
     def create_handle(self):

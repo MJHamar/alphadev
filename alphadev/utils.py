@@ -40,7 +40,7 @@ class Program(NamedTuple):
     asm_program: List[Callable[[int], Any]] # list of pseudo-asm instructions
     int_program: List[int] 
     def __len__(self):
-        return len(self.asm_program)
+        return len(self.int_program)
 
 # #################
 # Input geneerators

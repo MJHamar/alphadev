@@ -4,6 +4,7 @@ import numpy as np
 from dm_env import Environment, TimeStep, StepType
 from acme.specs import EnvironmentSpec, make_environment_spec as acme_make_environment_spec, Array, BoundedArray, DiscreteArray
 from acme.agents.tf.mcts import models
+import tree
 
 from tinyfive.multi_machine import multi_machine
 from .config import AlphaDevConfig
@@ -114,6 +115,7 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
                           init_active_memory=init_active_memory)
         # create cache for the masks
         self._mask_cache = {}
+        self._mask_max_size = 1000000
         self.init_stats()
     
     def init_stats(self):
@@ -142,6 +144,10 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         Each row in a mask is a boolean array over the action space, indicating whether
         the action uses the register or memory location. 
         """
+        if init_active_registers is None:
+            init_active_registers = [0,1] # X0 and the next one.
+        if init_active_memory is None:
+            init_active_memory = [0]
         
         # for each action in the action space, create two sequences:
         # 1. a collection of indices that the action directly allows
@@ -367,6 +373,11 @@ class x86ActionSpaceStorage(ActionSpaceStorage):
         # update the mask with the new allows
         mask[update] = True
         # cache the mask
+        # make sure we don't exceed the bound
+        if len(self._mask_cache) >= self._mask_max_size:
+            # remove the oldest mask
+            oldest_key = next(iter(self._mask_cache))
+            del self._mask_cache[oldest_key]
         self._mask_cache[prog_hash] = (mask, (last_reg, last_mem))
         return mask
 
@@ -572,9 +583,12 @@ class AssemblyGame(Environment):
     def step(self, actions:Union[List[int], int]) -> TimeStep:
         # logger.debug("AssemblyGame.step: action %s", action)
         action_space = self._action_space_storage.get_space()
-        if not isinstance(actions, list):
+        if isinstance(actions, int):
             # single action
             actions = [actions]
+        elif not isinstance(actions, list):
+            raise TypeError("Actions must be a list of integers or a single integer.")
+        # check if the actions are valid
         assert len(self._program) + len(actions) <= self._task_spec.max_program_size, \
             "Program size exceeded. Current size: %d, action size: %d" % (len(self._program), len(actions))
         updated_program = self._program.npy_program.copy()
@@ -685,6 +699,27 @@ class AssemblyGameModel(models.Model):
     
     def set_checkpoint(self, ckpt: AssemblyGame):
         self._ckpt = ckpt
+    
+    def get_checkpoint_size(self) -> int:
+        import pickle
+        env = self._environment
+        space_storage = env._action_space_storage
+        # the size of the checkpoint is the size of timesteps + maximum size of the mask cache
+        # randomly sample a program
+        prog = np.random.choice(np.asarray(list(space_storage.actions.keys())), size=env._task_spec.max_program_size, replace=True)
+        # execute the program and get a timestep
+        ts = env.step(prog.tolist())
+        _ = env.legal_actions()
+        mask_cache = space_storage._mask_cache
+        
+        ts_size = len(pickle.dumps(ts))
+        mask_size = len(pickle.dumps(mask_cache))
+        
+        mask_size *= space_storage._mask_max_size
+        print('Mask max size', space_storage._mask_max_size)
+        print('TS size', ts_size, 'mask size', mask_size)
+        print('Checkpoint size:', ts_size + mask_size)
+        return ts_size + mask_size
     
     def update(
         self,

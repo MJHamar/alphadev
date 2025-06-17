@@ -3,7 +3,7 @@ import numpy as np
 from tinyfive.machine import machine
 from tinyfive.multi_machine import multi_machine, pseudo_asm_machine, pseudo_asm_machine_32
 from alphadev.utils import x86_to_riscv, x86_enumerate_actions, TaskSpec, CPUState, IOExample
-from alphadev.environment import x86ActionSpaceStorage, AssemblyGame
+from alphadev.environment import x86ActionSpaceStorage, AssemblyGame, AssemblyGameModel
 
 sort3_x86_asm = [
     "mov 0x4(%0), %%eax ".strip(),
@@ -328,6 +328,10 @@ def test_assembly_game_pruning():
     assert np.array_equal(outp, test_cases[:,1,:]), f"Expected {test_cases[:,1,:]}, got {outp}"
     print("Test case 7 passed")
 
+def test_model_checkpoint_size():
+    model = AssemblyGameModel(task_spec)
+    size = model.get_checkpoint_size()
+    assert size > 0, f"Checkpoint size is {size}, expected > 0"
 
 
 if __name__ == "__main__":
@@ -338,4 +342,5 @@ if __name__ == "__main__":
     test_x86_to_riscv_translation_correct()
     test_assembly_game()
     test_assembly_game_pruning()
+    test_model_checkpoint_size()
     print("All tests passed")
