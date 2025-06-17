@@ -350,7 +350,7 @@ class DistributedMCTS:
                                                         extra_spec)
         replay_table = reverb.Table(
             name=adders.DEFAULT_PRIORITY_TABLE,
-            sampler=reverb.selectors.Uniform,
+            sampler=reverb.selectors.Uniform(),
             remover=reverb.selectors.Fifo(),
             max_size=self._max_replay_size,
             rate_limiter=limiter,
