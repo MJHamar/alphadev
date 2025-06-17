@@ -669,6 +669,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             return False
         except Exception as e:
             logger.exception(f'SharedTree.rollout_{self._local_write_head}: error during rollout: %s', e)
+            logger.error(f'State during error: tr len {len(trajectory)} trajectory: {trajectory}, terminals: {[n.terminal for n in trajectory]}, expanded: {[n.expanded for n in trajectory]}, header tasks: {self.header.tasks}, write head: {self._local_write_head}, worker id : {_local_id}, increment: {self.write_head_increment}')
             if len(trajectory) > 0:
                 self.fail(trajectory=trajectory)
             raise e

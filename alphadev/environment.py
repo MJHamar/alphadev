@@ -584,11 +584,12 @@ class AssemblyGame(Environment):
     def step(self, actions:Union[List[int], int]) -> TimeStep:
         # logger.debug("AssemblyGame.step: action %s", action)
         action_space = self._action_space_storage.get_space()
-        if isinstance(actions, int):
+        if isinstance(actions, (int, np.int32, np.int64)):
             # single action
-            actions = [actions]
-        elif not isinstance(actions, list):
-            raise TypeError("Actions must be a list of integers or a single integer.")
+            actions = [int(actions)]
+            # single action as numpy int32
+        elif not isinstance(actions, (list)):
+            raise TypeError("Actions must be a list of integers or a single integer, not %s" % type(actions))
         # check if the actions are valid
         assert len(self._program) + len(actions) <= self._task_spec.max_program_size, \
             "Program size exceeded. Current size: %d, action size: %d" % (len(self._program), len(actions))
@@ -715,6 +716,8 @@ class AssemblyGameModel(models.Model):
         
         ts_size = len(pickle.dumps(ts))
         mask_size = len(pickle.dumps(mask_cache))
+        # reset the env
+        env.reset()
         
         mask_size *= space_storage._mask_max_size
         print('Mask max size', space_storage._mask_max_size)
