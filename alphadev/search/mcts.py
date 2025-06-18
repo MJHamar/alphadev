@@ -16,7 +16,7 @@ from tqdm import tqdm
 import logging
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 class NodeBase:
     """Locally stored MCTS node. uses lazy evaluation."""

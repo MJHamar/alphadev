@@ -93,7 +93,7 @@ class DeviceConfig:
         # TODO: support for multiple devices
         # right now only one will be used even if there are multiple.
         dev_cfg = self.config[process_type]
-        if process_type == ACTOR:
+        if process_type == ACTOR and isinstance(dev_cfg, list):
             # for actor processes, return the first element.
             cfg = dev_cfg[self.num_actors]
             self.num_actors += 1
