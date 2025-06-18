@@ -9,7 +9,7 @@ import contextlib
 from time import time, sleep
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 class BufferInputFull(Exception): pass
 class BufferOutputFull(Exception): pass
@@ -211,12 +211,15 @@ class IOBuffer(BaseMemoryManager):
         self.header.out_index_f += np.uint64(increment)
         assert self.header.out_index_f <= self.header.out_index_w, \
             f"IOBuffer: out_index_f {self.header.out_index_f} > out_index_w {self.header.out_index_w}. someone read less than what they are writing"
-    def _get_out_read_batch(self, increment: Optional[int] = 1):
+    def _get_out_read_batch(self, increment: Optional[int] = 1, timeout: Optional[float] = 0.001):
         # logger.debug("IOBuffer: _get_out_read_batch() called, increment=%d", increment)
+        start = time()
         # cap the increment to the number of blocks between the read head and the write head.
-        while self.header.out_index_f - self.header.out_index_r < increment:
+        while self.header.out_index_f - self.header.out_index_r < increment and time() - start < timeout:
             # logger.debug("IOBuffer: _get_out_read_batch() waiting for output blocks to be written...")
             sleep(0.001)
+        if self.header.out_index_f - self.header.out_index_r < increment:
+            return np.array([], dtype=np.uint64)  # no blocks to read
         logger.debug("IOBuffer: _get_out_read_batch() w %d, f %d r %d", self.header.out_index_w, self.header.out_index_f, self.header.out_index_r)
         # return the indices for reading from the output buffer.
         indices = np.arange(self.header.out_index_r, self.header.out_index_r + increment, dtype=np.uint64) & self._mask
@@ -281,7 +284,7 @@ class IOBuffer(BaseMemoryManager):
         if not localize: self._set_in_read(indices.shape[0])
     
     @contextlib.contextmanager
-    def read_ready(self, max_samples:int=1, localize:bool=True):
+    def read_ready(self, max_samples:int=1, localize:bool=True, timeout: Optional[float] = 0.001):
         """
         Read at most `max_samples` ready blocks from the output buffer.
         This is a generator that yields the blocks as a batch.
@@ -291,8 +294,8 @@ class IOBuffer(BaseMemoryManager):
         If using with localize=False, make sure to read the blocks before exiting the context,
         otherwise the blocks will be marked as read and will not be available for reading again.
         """
-        indices = self._get_out_read_batch(max_samples)
-        logger.debug("IOBuffer: read_ready() output indices to read: %s", indices)
+        indices = self._get_out_read_batch(max_samples, timeout=timeout)
+        logger.debug("IOBuffer: read_ready() output indices to read: %s; out_w %s, out_f %s, out_r %s", indices, self.header.out_index_w, self.header.out_index_f, self.header.out_index_r)
         
         ret = []
         for index in indices:

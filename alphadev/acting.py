@@ -266,7 +266,6 @@ class MCTSActor(acmeMCTSActor):
             self._model.reset(observation)
         
         root = self.mcts.search(observation=observation, last_action=self.last_action)
-        print(f"Root node: {root}")
         # The agent's policy is softmax w.r.t. the *visit counts* as in AlphaZero.
         if self._counter is None:
             training_steps = 0

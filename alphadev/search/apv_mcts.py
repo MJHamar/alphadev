@@ -23,7 +23,7 @@ from .mcts import MCTSBase, NodeBase
 _local_id = 'main'
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 logging.basicConfig(
     format=f'process {_local_id}: %(levelname)s: %(message)s',
 )
@@ -566,11 +566,12 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 passes = sum([1 for result, _ in stats if result])
                 fails = len(stats) - passes
                 pass_times = [t for result, t in stats if result]
-                logger.info('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
+                logger.info('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f. tasks array: %s',
                     worker_id, task_id, passes, fails,
                     np.mean(pass_times) if pass_times else 0.0,
                     np.min(pass_times) if pass_times else 0.0,
-                    np.max(pass_times) if pass_times else 0.0
+                    np.max(pass_times) if pass_times else 0.0,
+                    self.header.tasks.tolist()
                 )
         # do profiling if enabled
         if prof_dir is not None:
@@ -697,20 +698,29 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             # check for race conditions 
             #  - another process expanded in the meantime or
             #  - the last node is not consistent with its parent.
+            logger.debug('SharedTree.phase_1 %s: in_tree returned trajectory of length %d.', _local_id, len(trajectory))
             if trajectory[-1].expanded or not trajectory[-1].is_consistent():
+                logger.debug('SharedTree.phase_1 %s: fail after in_tree exp: %s, consistent: %s', _local_id, trajectory[-1].expanded, trajectory[-1].is_consistent())
                 self.fail(trajectory=trajectory)
                 return False
+            
             node, observation = self.simulate(node=trajectory[-1], ancestors=trajectory[:-2], actions=actions)
+            logger.debug('SharedTree.phase_1 %s: simulate returned node %s', _local_id, repr(node))
             if not node.is_consistent():
+                logger.debug('SharedTree.phase_1 %s: fail after simulate: node %s is not consistent with its parent %s.', _local_id, repr(node), repr(node.parent))
                 self.fail(trajectory=trajectory)
                 return False
             if not node.terminal:
                 # instead of calling evaluate, we schedule a task for the inference server
+                logger.debug('SharedTree.phase_1 %s: submitting inference task for %s', _local_id, repr(node))
                 self.inference_server.submit(**{
                     'node_offset': node.offset, 'observation': observation})
+                logger.debug('SharedTree.phase_1 %s: task submitted for node %s.', repr(node))
+            logger.debug('SharedTree.phase_1 %s: backup reward node %s.', _local_id, repr(node))
             self.succeed()
             return True
         except TreeFull: # can happen, nothing to do
+            logger.debug('SharedTree.phase_1 %s: tree is full, failing.', _local_id)
             self.fail(trajectory=trajectory)
             return False
         except Exception as e:
@@ -719,12 +729,13 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 self.fail(trajectory=trajectory)
             raise e
         finally:
+            logger.debug('SharedTree.phase_1 %s: phase 1 finished. loading checkpoint', _local_id) 
             # in either case, reset the model to the root state.
             self.model.load_checkpoint()
     
     def phase_2(self) -> bool:
         # poll for results
-        with self.inference_server.read_ready() as ready:
+        with self.inference_server.read_ready(timeout=0.001) as ready:
             if len(ready) == 0:
                 return False
             assert len(ready) == 1, "Expected exactly one ready object."
@@ -799,8 +810,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self.inference_server.submit(**{
             'node_offset': offset, 'observation': observation})
         # wait for the result to be ready
-        with self.inference_server.read_ready(max_samples=1) as ready:
-            assert len(ready) == 1, "Expected exactly one ready object."
+        with self.inference_server.read_ready(max_samples=1, timeout=5.0) as ready:
+            assert len(ready) == 1, "Expected exactly one ready object. Receive %d. Probably a timeout." % len(ready)
             ready = ready[0]
             assert ready.node_offset == offset, f"The node offset in the ready object {ready.node_offset} does not match the requested node {offset}. The inference server had leftovers."
             prior = ready.prior
@@ -968,7 +979,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
     
     def broadcast_checkpoint(self, checkpoint: AssemblyGame):
         # FIXME: env should be immutable and checkpoint np-serializable.
-        logger.debug('SharedTree.broadcast_checkpoint called.')
+        logger.debug('SharedTree.broadcast_checkpoint, program size %d.', len(checkpoint._program))
         assert self._is_main, "broadcast_checkpoint() should only be called in the main process."
         ckpt_bin = pickle.dumps(checkpoint)
         self.checkpoint.data[:len(ckpt_bin)] = ckpt_bin
