@@ -239,6 +239,10 @@ class MCTSBase:
         # 7. return the root node.
         return root
     
+    def reset(self):
+        # nothing to do here.
+        pass
+    
     def init_tree(self,
         observation: types.Observation,
         last_action: Optional[types.Action] = None,
