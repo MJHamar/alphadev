@@ -134,7 +134,7 @@ class IOBuffer(BaseMemoryManager):
         write_head_ptr = self.header.in_index_w.peek()
         # ensure the distance between the write head and the read frontier doesn't exceed the buffer size.
         while write_head_ptr + increment - self.header.in_index_r >= self._num_blocks:
-            sleep(0.0001) # just a little, so reading can catch up.
+            sleep(0.001) # just a little, so reading can catch up.
         logger.debug("IOBuffer: _next_in_w() w %d, rf at %d r at %d", write_head_ptr, self.header.in_index_f, self.header.in_index_r)
         with self.header.in_index_w() as in_index_w:
             # increment the in_index atomically to let the other
@@ -155,7 +155,7 @@ class IOBuffer(BaseMemoryManager):
         target = np.uint64(start_mod)
         logger.debug("IOBuffer: _update_in_w_frontier() waiting for frontier %d to be %d", frontier_ptr & self._mask, target & self._mask)
         while frontier_ptr & self._mask != target & self._mask:
-            sleep(0.0001)  # just a little, so other producers can write their stuff.
+            sleep(0.001)  # just a little, so other producers can write their stuff.
         # now we can update the write frontier. no need to be atomic here.
         frontier_ptr += np.uint64(increment)
         logger.debug("IOBuffer: _update_in_w_frontier() f %d; w %d; r %d", frontier_ptr, self.header.in_index_w.peek(), self.header.in_index_r)
@@ -198,7 +198,7 @@ class IOBuffer(BaseMemoryManager):
         # (busy) wait until the write head has enough space to write the requested number of blocks.
         while strict and self._num_blocks - (self.header.out_index_f - self.header.out_index_r) < increment:
             # logger.debug("IOBuffer: _get_out_write_batch() waiting for output blocks to be written...")
-            sleep(0.0001)
+            sleep(0.001)
         if not strict:
             increment = min(increment, self._num_blocks - (self.header.out_index_f - self.header.out_index_r))
         
@@ -216,7 +216,7 @@ class IOBuffer(BaseMemoryManager):
         # cap the increment to the number of blocks between the read head and the write head.
         while self.header.out_index_f - self.header.out_index_r < increment:
             # logger.debug("IOBuffer: _get_out_read_batch() waiting for output blocks to be written...")
-            sleep(0.0001)
+            sleep(0.001)
         logger.debug("IOBuffer: _get_out_read_batch() w %d, f %d r %d", self.header.out_index_w, self.header.out_index_f, self.header.out_index_r)
         # return the indices for reading from the output buffer.
         indices = np.arange(self.header.out_index_r, self.header.out_index_r + increment, dtype=np.uint64) & self._mask
