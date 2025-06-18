@@ -86,15 +86,18 @@ def compute_device_config(ad_config_path: str):
 
 class DeviceConfig:
     def __init__(self, path: str):
+        self.num_actors = 0
         self.config = yaml.safe_load(open(path, 'r'))
     
     def get_config(self, process_type: str):
         # TODO: support for multiple devices
         # right now only one will be used even if there are multiple.
         dev_cfg = self.config[process_type]
-        if isinstance(dev_cfg, list):
+        if process_type == ACTOR:
             # for actor processes, return the first element.
-            return dev_cfg[0]
+            cfg = dev_cfg[self.num_actors]
+            self.num_actors += 1
+            return cfg
         return dev_cfg
 
 def apply_device_config(local_tf, config = None):
