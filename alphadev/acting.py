@@ -299,3 +299,9 @@ class MCTSActor(acmeMCTSActor):
         """Fetches the latest variables from the variable source, if needed."""
         # this is a no-op. Either the inference service or the evaluation factory takes care of updating the variables.
         pass
+
+    def observe_first(self, timestep):
+        # clear the last action to avoid leaking information between episodes.
+        self.mcts.reset()
+        self.last_action = None
+        return super().observe_first(timestep)
