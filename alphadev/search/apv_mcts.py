@@ -566,7 +566,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 passes = sum([1 for result, _ in stats if result])
                 fails = len(stats) - passes
                 pass_times = [t for result, t in stats if result]
-                logger.info('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f. tasks array: %s',
+                logger.debug('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f. tasks array: %s',
                     worker_id, task_id, passes, fails,
                     np.mean(pass_times) if pass_times else 0.0,
                     np.min(pass_times) if pass_times else 0.0,
@@ -680,15 +680,16 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             load_start = time()
             self.model.load_checkpoint()
             load_end = time()
-            logger.info('SharedTree.rollout_{wh}: total {total:.5f}; tree {tree:.5f}; sim {sim:5f}; eval {eval:5f}; backup {backup:5f}; load {load:.5f}.'.format(
-                wh=self._local_write_head,
-                total=load_end - times[0],
-                tree=times[1] - times[0] if times[1] is not None else 9.9999,
-                sim=times[2] - times[1] if times[1] is not None and times[2] is not None else 9.9999,
-                eval=times[3] - times[2] if times[2] is not None and times[3] is not None else 9.9999,
-                backup=load_start - times[3] if times[3] is not None else 9.9999,
-                load=load_end - load_start
-            ))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug('SharedTree.rollout_{wh}: total {total:.5f}; tree {tree:.5f}; sim {sim:5f}; eval {eval:5f}; backup {backup:5f}; load {load:.5f}.'.format(
+                    wh=self._local_write_head,
+                    total=load_end - times[0],
+                    tree=times[1] - times[0] if times[1] is not None else 9.9999,
+                    sim=times[2] - times[1] if times[1] is not None and times[2] is not None else 9.9999,
+                    eval=times[3] - times[2] if times[2] is not None and times[3] is not None else 9.9999,
+                    backup=load_start - times[3] if times[3] is not None else 9.9999,
+                    load=load_end - load_start
+                ))
     
     def phase_1(self) -> bool:
         root = self.get_root()
