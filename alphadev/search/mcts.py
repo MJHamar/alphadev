@@ -64,7 +64,7 @@ class NodeBase:
     
     def backup_value(self, action:types.Action, value: float, discount: float = 1.0, trajectory: Optional[List['NodeBase']] = []):
         """Update the visit count and total value of this node."""
-        logger.debug(f"Backing up value {value} for action {action} in node {self} (type {type(self)}).")
+        # logger.debug(f"Backing up value {value} for action {action} in node {self} (type {type(self)}).")
         if len(trajectory) == 0:
             parent = self.parent
         else:

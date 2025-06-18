@@ -9,7 +9,7 @@ import contextlib
 from time import time, sleep
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 class BufferInputFull(Exception): pass
 class BufferOutputFull(Exception): pass

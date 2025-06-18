@@ -566,7 +566,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
                 passes = sum([1 for result, _ in stats if result])
                 fails = len(stats) - passes
                 pass_times = [t for result, t in stats if result]
-                logger.debug('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
+                logger.info('SharedTree.run_worker: worker %d finished task %d with pass/fail %d/%d, avg time %.3f, min time %.3f, max time %.3f.',
                     worker_id, task_id, passes, fails,
                     np.mean(pass_times) if pass_times else 0.0,
                     np.min(pass_times) if pass_times else 0.0,
@@ -626,6 +626,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             sleep(0.005)
                 # DFS on the tree to see longest path from the root
         self.clear_tasks()
+        logger.debug('%s: all workers finished searching. Returning root node %s.', self.name, repr(root))
         return root
     
     def rollout(self) -> bool:
