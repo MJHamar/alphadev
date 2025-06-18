@@ -623,7 +623,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self.allocate_tasks()
         while not np.all(self.header.tasks == APV_MCTS._IDLE):
             # wait for the worker processes to finish searching
-            sleep(0.001)
+            sleep(0.005)
                 # DFS on the tree to see longest path from the root
         self.clear_tasks()
         return root
@@ -678,7 +678,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             load_start = time()
             self.model.load_checkpoint()
             load_end = time()
-            logger.debug('SharedTree.rollout_{wh}: total {total:.5f}; tree {tree:.5f}; sim {sim:5f}; eval {eval:5f}; backup {backup:5f}; load {load:.5f}.'.format(
+            logger.info('SharedTree.rollout_{wh}: total {total:.5f}; tree {tree:.5f}; sim {sim:5f}; eval {eval:5f}; backup {backup:5f}; load {load:.5f}.'.format(
                 wh=self._local_write_head,
                 total=load_end - times[0],
                 tree=times[1] - times[0] if times[1] is not None else 9.9999,
