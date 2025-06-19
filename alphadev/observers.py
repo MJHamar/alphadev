@@ -150,11 +150,16 @@ class NonZeroRewardObserver(EnvLoopObserver):
     def observe_first(self, env, timestep, action=None):
         self._current_trajectory = [timestep]
         self._should_save = False
+        self._save_correct = False
     
     def observe(self, env, timestep, action=None):
         self._current_trajectory.append(timestep)
-        if timestep.reward[0] != 0:
-            print(f"Non-zero reward observed: {timestep.reward[0]}, program length: {len(env._program)}")
+        if timestep.reward != 0:
+            print(f"Non-zero reward observed: {timestep.reward}, program length: {len(env._program)}")
+            self._should_save = True
+        if timestep.last() and env._is_correct:
+            print(f"Correct program found! length: {len(env._program)}, final reward: {timestep.reward}")
+            self._save_correct = True
             self._should_save = True
     
     def get_metrics(self):
@@ -162,7 +167,7 @@ class NonZeroRewardObserver(EnvLoopObserver):
             # save the trajectory
             save_path = os.path.join(
                 self._trajectory_save_path,
-                f'trajectory_{self._num_saves}.pkl'
+                f'trajectory_{self._num_saves}' + ('_correct' if self._save_correct else '') + '.pkl'
             )
             with open(save_path, 'wb') as f:
                 pickle.dump(self._current_trajectory, f)

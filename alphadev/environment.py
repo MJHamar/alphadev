@@ -782,7 +782,7 @@ class AssemblyGameModel(models.Model):
         return self._environment.step(action)
     
     def get_latency_reward(self) -> float:
-        return self._environment.latency_reward
+        return np.array(self._environment.latency_reward, dtype=np.float32)
 
 class EnvironmentFactory:
     def __init__(self, config: AlphaDevConfig): self._task_spec = config.task_spec

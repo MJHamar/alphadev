@@ -811,7 +811,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         self.inference_server.submit(**{
             'node_offset': offset, 'observation': observation})
         # wait for the result to be ready
-        with self.inference_server.read_ready(max_samples=1, timeout=5.0) as ready:
+        with self.inference_server.read_ready(max_samples=1, timeout=15.0) as ready:
             assert len(ready) == 1, "Expected exactly one ready object. Receive %d. Probably a timeout." % len(ready)
             ready = ready[0]
             assert ready.node_offset == offset, f"The node offset in the ready object {ready.node_offset} does not match the requested node {offset}. The inference server had leftovers."

@@ -286,7 +286,6 @@ task_spec = TaskSpec(
         outputs=test_cases[:,1,:],
         output_mask=np.ones_like(test_cases[:,1,:], dtype=np.int32),
     ),
-    observe_reward_components=False
 )
 
 def test_assembly_game():

@@ -94,9 +94,10 @@ class MCTS(agent.Agent):
             print('WARNING: APV_MCTS cannot be used in single-threaded mode. Support only for testing purposes.')
         
         extra_spec = {
-            'pi':
-                specs.Array(
-                    shape=(environment_spec.actions.num_values,), dtype=np.float32)
+            'pi': 
+                specs.Array(shape=(environment_spec.actions.num_values,), dtype='float32'),
+            'latency_reward':
+                specs.Array(shape=(), dtype='float32'),
         }
         # Create a replay server for storing transitions.
         replay_table = reverb.Table(
