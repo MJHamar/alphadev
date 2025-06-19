@@ -185,7 +185,6 @@ class AlphaDevConfig(object):
             latency_quantile=self.latency_quantile,
             num_latency_simulations=self.num_latency_simulations,
             inputs=self.input_examples,
-            observe_reward_components=self.hparams.categorical_value_loss,
             emulator_mode=self.emulator_mode,
         )
         

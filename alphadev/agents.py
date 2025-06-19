@@ -349,9 +349,10 @@ class DistributedMCTS:
             samples_per_insert=self._samples_per_insert,
             error_buffer=self._batch_size)
         extra_spec = {
-            'pi':
-                specs.Array(
-                    shape=(self._env_spec.actions.num_values,), dtype='float32')
+            'pi': 
+                specs.Array(shape=(self._env_spec.actions.num_values,), dtype='float32'),
+            'latency_reward':
+                specs.Array(shape=(), dtype='float32'),
         }
         signature = adders.NStepTransitionAdder.signature(self._env_spec,
                                                         extra_spec)
@@ -418,9 +419,12 @@ class DistributedMCTS:
         """The actor process."""
 
         # Build environment, model, network.
+        # NOTE: both the model and the environment here are AssemblyGame instances.
+        # we keep the two of them separate because that is what EnvironmentLoop expects.
+        # also, this way it is easier to replace model with a learnt model (mu-zero style).
         environment = self._environment_factory()
         model = self._model_factory(self._env_spec)
-
+        
         mcts_observers = self._mcts_observers(logger)
         
         # Component to add things into replay.
@@ -429,7 +433,7 @@ class DistributedMCTS:
             n_step=self._n_step,
             discount=self._discount,
         )
-
+        
         actor = MCTSActor(
             device_config=self._device_config,
             environment_spec=self._env_spec,
@@ -457,9 +461,9 @@ class DistributedMCTS:
             observers=mcts_observers,
             name=f'actor_{index}'
         )
-
+        
         observers = self._observers(logger)
-
+        
         # Create the loop to connect environment and agent.
         return acme.EnvironmentLoop(
             environment=environment,
@@ -468,7 +472,7 @@ class DistributedMCTS:
             logger=logger,
             label='actor',
             observers=observers)
-
+    
     def evaluator(
         self,
         counter: counting.Counter,
@@ -480,7 +484,7 @@ class DistributedMCTS:
         # Build environment, model, network.
         environment = self._environment_factory()
         model = self._model_factory(self._env_spec)
-
+        
         mcts_observers = self._mcts_observers(logger)
         
         actor = MCTSActor(
@@ -509,25 +513,25 @@ class DistributedMCTS:
             observers=mcts_observers,
             name=f'evaluator'
         )
-
+        
         observers = self._observers(logger)
-
+        
         return acme.EnvironmentLoop(
             environment, actor, counter=counter, logger=logger, observers=observers, label='evaluator')
-
+        
     def build(self, config: AlphaDevConfig):
         """Builds the distributed agent topology."""
         program = Program()
-
+        
         with program.group('replay'):
             replay = program.add_service(ReverbService(
                 priority_tables_fn=self.replay, port=config.replay_server_port))
-
+        
         if self._do_train:
             variable_service = VariableService(config)
         else:
             variable_service = None
-
+        
         with program.group('counter'):
             counter: RPCClient = program.add_service(
                 RPCService(
@@ -536,7 +540,7 @@ class DistributedMCTS:
                     instance_cls=counting.Counter,
                 )
             )
-
+        
         with program.group('logger'):
             logger = program.add_service(
                 RPCService(

@@ -62,6 +62,9 @@ class AZLearner(acme.Learner):
         inputs = next(self._iterator)
         o_t, _, r_t, d_t, o_tp1, extras = inputs.data
         pi_t = extras['pi']
+        # NOTE: this implementation doesn't consider latency predictions.
+        # see `dual_value_az.py`
+        latency_t = extras['latency_reward']
 
         with tf.GradientTape() as tape:
             # Forward the network on the two states in the transition.

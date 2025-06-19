@@ -284,6 +284,8 @@ class MCTSActor(acmeMCTSActor):
         
         # Save the policy probs so that we can add them to replay in `observe()`.
         self._probs = probs.astype(np.float32)
+        # same with the latency reward.
+        self._latency_reward = self._model.get_latency_reward()
         
         for observer in self._observers:
             observer.on_action_selection(
@@ -305,3 +307,10 @@ class MCTSActor(acmeMCTSActor):
         self.mcts.reset()
         self.last_action = None
         return super().observe_first(timestep)
+    
+    def observe(self, action: types.Action, next_timestep: dm_env.TimeStep):
+        """Updates the agent's internal model and adds the transition to replay."""
+        self._model.update(self._prev_timestep, action, next_timestep)
+        self._prev_timestep = next_timestep
+        if self._adder:
+            self._adder.add(action, next_timestep, extras={'pi': self._probs, 'latency_reward': self._model.get_latency_reward()})

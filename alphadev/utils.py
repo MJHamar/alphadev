@@ -26,7 +26,6 @@ class TaskSpec(NamedTuple):
     latency_quantile: float # quantile for latency reward
     num_latency_simulations: int # number of latency simulations to run
     inputs: IOExample # input examples for the task
-    observe_reward_components: bool # whether to return the reward components for the value function (for categorical value loss)
     emulator_mode: Literal['u8', 'i16', 'i32'] = 'u8' # emulator mode for the task, one of ['u8', 'i16', 'i32']
 
 class CPUState(NamedTuple):

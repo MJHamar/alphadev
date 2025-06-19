@@ -36,21 +36,22 @@ class DualValueAZLearner(AZLearner):
         """
 
         inputs = next(self._iterator)
-        # added c_t: correctness, l_t: latency reward terms. r_t = c_t*scale + l_t*scale
-        o_t, _, rcl_t, d_t, o_tp1, extras = inputs.data
-        r_t, c_t, l_t = rcl_t[:,0], rcl_t[:,1], rcl_t[:,2]
+        # observation, actions, reward, discount, 
+        o_t, _, r_t, d_t, o_tp1, extras = inputs.data
         
         pi_t = extras['pi']
-
+        latency_t = extras['latency_reward']
+        
         with tf.GradientTape() as tape:
             # Forward the network on the two states in the transition.
             logits, value, correctness_logits, latency_logits = self._network(o_t)
             _, target_value, _, _ = self._network(o_tp1)
             target_value = tf.stop_gradient(target_value)
 
-            correctness_loss = scalar_loss(correctness_logits, c_t,
+            # optimize for the empirical correctness and latency
+            correctness_loss = scalar_loss(correctness_logits, r_t,
                                            self._network._hparams.value_max, self._network._hparams.value_num_bins)
-            latency_loss = scalar_loss(latency_logits, l_t,
+            latency_loss = scalar_loss(latency_logits, latency_t,
                                        self._network._hparams.value_max, self._network._hparams.value_num_bins)
 
             # Value loss is simply on-policy TD learning.

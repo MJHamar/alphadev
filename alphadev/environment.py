@@ -420,9 +420,7 @@ class AssemblyGame(Environment):
         self._output_mask = task_spec.inputs.output_mask
         self._outputs = task_spec.inputs.outputs
         self._max_num_hits = np.sum(self._output_mask.astype(np.int32))
-        # whether to return the correctness and latency components of the reward
-        # in the TimeSteps
-        self._observe_reward_components = task_spec.observe_reward_components
+        self.latency_reward = 0.0 # latency reward is 0.0 unless the program is correct.
         
         self._emulator = multi_machine(
             mem_size=task_spec.num_mem,
@@ -452,8 +450,8 @@ class AssemblyGame(Environment):
         )
     
     def _eval_output(self, output: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        masked_output = np.multiply(output, self._output_mask)
-        hits = masked_output == self._outputs
+        masked_output = np.multiply(output, self._output_mask) # mask out the parts we don't care about
+        hits = masked_output == self._outputs # check which outputs match the expected outputs
         num_hits = hits.sum()
         all_hits = num_hits == self._max_num_hits
         return all_hits, num_hits
@@ -479,18 +477,16 @@ class AssemblyGame(Environment):
         # NOTE: _is_correct is nonzero only if num_hits == max_num_hits.
         # so in that case, correctness_reward is always positive
         correctness_reward += self._task_spec.correct_reward * self._is_correct
-        
-        # update the previous correct items
-        latency_reward = 0.0
-        if include_latency: # cannot be <0 btw
-            latency_reward = len(self._program) * self._task_spec.latency_reward_weight
-            # latencies = self._eval_latency()
-            # latency_reward = np.quantile(
-            #     latencies, self._task_spec.latency_quantile
-            # ) * self._task_spec.latency_reward_weight
-        reward = max(correctness_reward - latency_reward, 0.0)
+        # update the previous number of correct items.
         self._prev_num_hits = self._num_hits
-        return reward, latency_reward, correctness_reward
+        
+        if include_latency: # cannot be <0 btw
+            latencies = self._eval_latency()
+            self.latency_reward = np.quantile(
+                latencies, self._task_spec.latency_quantile
+            ) * self._task_spec.latency_reward_weight
+        
+        return correctness_reward
     
     def _make_observation(self) -> Dict[str, np.ndarray]:
         # get the current state of the CPU
@@ -520,22 +516,19 @@ class AssemblyGame(Environment):
         # terminality check
         is_terminal = self._is_correct or self._is_invalid
         
-        # we can now compute the reward
-        reward, latency, correctness = self._compute_reward(include_latency=is_terminal)
+        # we can now compute the reward. only calculate latency if the program is correct.
+        # according to the pseudocode and Mankowicz et al. 2023.
+        reward = self._compute_reward(include_latency=self._is_correct)
         
         step_type = StepType.FIRST if len(self._program) == 0 else (
                         StepType.MID if not is_terminal else
                             StepType.LAST)
         ts = TimeStep(
             step_type=step_type,
-            # too many components in acme hard-code the structure of TimeStep, and not
-            # everything supports reward to be a dictionary, so we concatenate
-            # the reward components into a single tensor
-            reward=np.array(reward, dtype=np.float32) if not self._observe_reward_components else 
-                np.asarray([reward, correctness, latency], dtype=np.float32),
+            reward=np.array(reward, dtype=np.float32),
             discount=np.asarray(1.0, dtype=np.float32), # NOTE: not sure what discount here means.
             observation=observation,
-            # skip latency and correctness
+            # NOTE: we add latency reward in the 'extras' field.
         )
         self._last_ts = ts
         return ts
@@ -622,7 +615,7 @@ class AssemblyGame(Environment):
         return legal_actions
     
     def reward_spec(self):
-        return Array(shape=(), dtype=np.float32) if not self._observe_reward_components else Array(shape=(3,), dtype=np.float32)
+        return Array(shape=(), dtype=np.float32)
     def discount_spec(self):
         return Array(shape=(), dtype=np.float32)
     def observation_spec(self):
@@ -655,7 +648,7 @@ class AssemblyGame(Environment):
         new_game._outputs = self._outputs
         new_game._max_num_hits = self._max_num_hits
         new_game._action_space_storage = self._action_space_storage
-        new_game._observe_reward_components = self._observe_reward_components
+        new_game.latency_reward = self.latency_reward
         # copy the two mutable parts of the state
         new_game._emulator = self._emulator.clone()
         # these are also 'immmutable'
@@ -728,7 +721,6 @@ class AssemblyGameModel(models.Model):
     def update(
         self,
         timestep: TimeStep, # prior to executing the action
-        # FIXME: this might be very incorrect.
         action: np.ndarray, # opcode, operands
         next_timestep: TimeStep, # after executing the action
     ) -> TimeStep:
@@ -788,6 +780,9 @@ class AssemblyGameModel(models.Model):
     def step(self, action):
         # logger.debug("AssemblyGameModel: step") 
         return self._environment.step(action)
+    
+    def get_latency_reward(self) -> float:
+        return self._environment.latency_reward
 
 class EnvironmentFactory:
     def __init__(self, config: AlphaDevConfig): self._task_spec = config.task_spec
