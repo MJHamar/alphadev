@@ -65,6 +65,7 @@ def make_agent(config: AlphaDevConfig):
             training_steps=config.training_steps,
             batch_size=config.batch_size,
             prefetch_size=config.prefetch_size,
+            use_target_network=config.use_target_network,
             target_update_period=config.target_update_period,
             samples_per_insert=config.samples_per_insert,
             min_replay_size=config.min_replay_size,
@@ -116,6 +117,8 @@ def make_agent(config: AlphaDevConfig):
             
             training_steps=config.training_steps,
             use_dual_value_network=config.hparams.categorical_value_loss,
+            use_target_network=config.use_target_network,
+            target_update_period=config.target_update_period,
             logger=cfg_logger,
             mcts_observers=config.search_observers,
         )

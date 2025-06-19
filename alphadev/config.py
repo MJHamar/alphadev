@@ -85,8 +85,9 @@ class AlphaDevConfig(object):
     ### Distributed training
     distributed: bool = True # whether to use distributed training
     prefetch_size: int = 4
-    variable_update_period: int = 50 # aka checkpoint interval
-    target_update_period: int = 10 # aka target interval
+    variable_update_period: int = 500 # aka checkpoint interval
+    use_target_network: bool = False # whether to use a separate target network during training.
+    target_update_period: int = 1000 # how often to update the target network
     samples_per_insert: int = 1
     min_replay_size: int = 1000
     max_replay_size: int = 1000000

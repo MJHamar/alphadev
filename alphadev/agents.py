@@ -87,11 +87,15 @@ class MCTS(agent.Agent):
         # Other parameters
         training_steps: Optional[int] = None,
         use_dual_value_network: bool = False,
+        use_target_network: bool = True,
+        target_update_period: Optional[int] = None,
         logger: loggers.Logger = None,
         mcts_observers: Optional[Sequence[MCTSObserver]] = [],
     ):
         if use_apv_mcts:
             print('WARNING: APV_MCTS cannot be used in single-threaded mode. Support only for testing purposes.')
+        assert not use_target_network or target_update_period is not None, \
+            'Target update period must be provided if using target network.'
         
         extra_spec = {
             'pi': 
@@ -146,6 +150,14 @@ class MCTS(agent.Agent):
         # initialize the network we are training
         network = network_factory(make_input_spec(environment_spec.observations))
         tf2_utils.create_variables(network, [environment_spec.observations])
+        if use_target_network:
+            # If we are using a target network, we need to create it.
+            # The target network is used to compute the value targets.
+            target_network = network_factory(make_input_spec(environment_spec.observations))
+            tf2_utils.create_variables(target_network, [environment_spec.observations])
+        else:
+            # If we are not using a target network, we can use the same network.
+            target_network = None
         # we don't care about variable service here.
         
         # Now create the agent components: actor & learner.
@@ -189,6 +201,8 @@ class MCTS(agent.Agent):
                 discount=discount,
                 training_steps=training_steps,
                 variable_service=None,
+                target_network=target_network,
+                target_update_period=target_update_period,
                 logger=self.logger,
                 counter=self.counter,
             )
@@ -200,6 +214,8 @@ class MCTS(agent.Agent):
                 discount=discount,
                 training_steps=training_steps,
                 variable_service=None,
+                target_network=target_network,
+                target_update_period=target_update_period,
                 logger=self.logger,
                 counter=self.counter,
             )
@@ -254,6 +270,7 @@ class DistributedMCTS:
         training_steps: int = 1000,
         batch_size: int = 256,
         prefetch_size: int = 4,
+        use_target_network: bool = False,
         target_update_period: int = 100,
         samples_per_insert: float = 32.0,
         min_replay_size: int = 1000,
@@ -308,6 +325,7 @@ class DistributedMCTS:
         self._training_steps = training_steps
         self._batch_size = batch_size
         self._prefetch_size = prefetch_size
+        self._use_target_network = use_target_network
         self._target_update_period = target_update_period
         self._samples_per_insert = samples_per_insert
         self._min_replay_size = min_replay_size
@@ -372,9 +390,16 @@ class DistributedMCTS:
         """The learning part of the agent."""
         # Create the networks.
         network = self._network_factory(make_input_spec(self._env_spec.observations))
-        print('learner network created')
         tf2_utils.create_variables(network, [self._env_spec.observations])
-        print('learner make dataset server_address:', replay.server_address)
+        if self._use_target_network:
+            # If we are using a target network, we need to create it.
+            # The target network is used to compute the value targets.
+            target_network = self._network_factory(make_input_spec(self._env_spec.observations))
+            tf2_utils.create_variables(target_network, [self._env_spec.observations])
+        else:
+            # If we are not using a target network, we can use the same network.
+            target_network = None
+        
         # The dataset object to learn from.
         dataset = datasets.make_reverb_dataset(
             server_address=replay.server_address,
@@ -393,6 +418,8 @@ class DistributedMCTS:
                 discount=self._discount,
                 variable_service=variable_service,
                 training_steps=self._training_steps,
+                target_network=target_network,
+                target_update_period=self._target_update_period,
                 logger=logger,
                 counter=counter,
             )
@@ -403,6 +430,8 @@ class DistributedMCTS:
                 dataset=dataset,
                 optimizer=optimizer,
                 variable_service=variable_service,
+                target_network=target_network,
+                target_update_period=self._target_update_period,
                 training_steps=self._training_steps,
                 logger=logger,
                 counter=counter,

@@ -27,6 +27,8 @@ class AZLearner(acme.Learner):
         discount: float,
         variable_service: VariableService,
         varibale_update_period: int = 10,
+        target_network: Optional[snn.Module] = None,
+        target_update_period: Optional[int] = None,
         training_steps: Optional[int] = None,
         logger: Optional[loggers.Logger] = None,
         counter: Optional[counting.Counter] = None,
@@ -38,12 +40,23 @@ class AZLearner(acme.Learner):
 
         self._variable_service = variable_service
         self._variable_update_period = varibale_update_period
+        self._target_update_period = target_update_period
 
         # Internalize components.
         # TODO(b/155086959): Fix type stubs and remove.
         self._iterator = iter(dataset)  # pytype: disable=wrong-arg-types
         self._optimizer = optimizer
         self._network = network
+        if target_network is None:
+            # If no target network is provided, use the same network.
+            base_logger.debug("AZLearner: using the same network as target network")
+            self._should_update_target = False
+            target_network = network
+        else:
+            base_logger.debug(f"AZLearner: using a different network as target network: {target_network}")
+            self._should_update_target = True
+            self._target_network = target_network
+        
         self._variables = network.trainable_variables
         self._discount = np.float32(discount)
         
@@ -55,6 +68,14 @@ class AZLearner(acme.Learner):
             base_logger.debug(f"AZLearner: initializing variable service")
             self._variable_service.update(self.get_variables([]))
     
+    def _maybe_update_target_network(self):
+        """Updates the target network if needed."""
+        if self._should_update_target:
+            steps = self._counter.get_counts().get('steps', 0)
+            if steps % self._target_update_period == 0:
+                base_logger.debug(f"AZLearner: updating target network at step {steps}")
+                self._target_network.trainable_variables(self._network.get_weights())
+    
     # @tf.function
     def _step(self) -> tf.Tensor:
         """Do a step of SGD on the loss."""
@@ -65,13 +86,15 @@ class AZLearner(acme.Learner):
         # NOTE: this implementation doesn't consider latency predictions.
         # see `dual_value_az.py`
         latency_t = extras['latency_reward']
-
+        
+        self._maybe_update_target_network()
+        
         with tf.GradientTape() as tape:
             # Forward the network on the two states in the transition.
             logits, value = self._network(o_t)
-            _, target_value = self._network(o_tp1)
+            _, target_value = self._target_network(o_tp1)
             target_value = tf.stop_gradient(target_value)
-
+            
             # Value loss is simply on-policy TD learning.
             value_loss = tf.square(r_t + self._discount * d_t * target_value - value)
 
