@@ -27,7 +27,6 @@ from acme import specs
 from acme.agents.tf.mcts.acting import MCTSActor as acmeMCTSActor
 from acme.agents.tf.mcts import models
 from acme.agents.tf.mcts import types
-from acme.tf import variable_utils as tf2_variable_utils
 
 
 import dm_env

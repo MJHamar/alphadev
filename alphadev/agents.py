@@ -27,7 +27,6 @@ from acme.agents.tf.mcts import models
 from acme.agents.tf.mcts import types
 from acme.agents.tf.mcts import search
 from acme.tf import utils as tf2_utils
-from acme.tf import variable_utils as tf2_variable_utils
 from acme.utils import counting
 from acme.utils import loggers
 import acme.utils
@@ -507,7 +506,8 @@ class DistributedMCTS:
         self,
         counter: counting.Counter,
         logger: loggers.Logger,
-        variable_service: VariableService = None,
+        variable_staging: VariableService = None, # where the network uploads its variables
+        variable_service: VariableService = None, # from where the actors pull new variables.
         inference_client: Optional[AlphaDevInferenceClient] = None,
     ):
         """The evaluation process."""

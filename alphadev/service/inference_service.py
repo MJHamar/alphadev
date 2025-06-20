@@ -5,7 +5,7 @@ import sonnet as snn
 from ..tf_util import tf
 import tree
 
-from acme.tf import variable_utils as tf2_variable_utils
+from .variable_service import VariableClient
 from acme.tf import utils as tf2_utils
 from ..shared_memory.base import BlockLayout, ArrayElement, NestedArrayElement
 from ..shared_memory.buffer import IOBuffer
@@ -119,7 +119,7 @@ class AlphaDevInferenceService(Service, IOBuffer):
         if self._variable_service is None:
             variable_client = None
         else:
-            variable_client = tf2_variable_utils.VariableClient(
+            variable_client = VariableClient(
                 client=self._variable_service,
                 variables={'network': network.trainable_variables},
                 update_period=self._variable_update_period,
@@ -210,7 +210,7 @@ class InferenceNetworkFactory:
         if self._variable_service is None:
             variable_client = None
         else:
-            variable_client = tf2_variable_utils.VariableClient(
+            variable_client = VariableClient(
                 client=self._variable_service,
                 variables={'network': network.trainable_variables},
                 update_period=100,

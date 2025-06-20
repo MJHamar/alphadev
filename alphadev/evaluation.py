@@ -38,6 +38,13 @@ class EvaluationLoop(acme.EnvironmentLoop):
         
         self._echo_parameters()
     
+    def echo_parameters(self):
+        # make sure initial parameters of the model are available to the actors
+        self.current_parameters = self.staging_service.get_variables()
+        self.variable_service.update(self.current_parameters)
+        # NOTE: this is a noop right now but keeping for consistency.
+        self._actor.update(wait=True)
+    
     def run(
         self,
         num_episodes: Optional[int] = None,

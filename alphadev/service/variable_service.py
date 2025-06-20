@@ -8,6 +8,8 @@ import time
 import contextlib
 from uuid import uuid4 as uuid
 
+from acme.tf.variable_utils import VariableClient as acmeVariableClient
+
 from ..config import AlphaDevConfig
 
 import logging
@@ -25,6 +27,7 @@ class VariableService():
     def __init__(self, config: AlphaDevConfig):
         self._config = config
         self._variable_pointer = f'{config.variable_service_name}_{uuid().hex[:8]}'
+        self.current_variable_key = b'' # local pointer to the current variable key. used to avoid fetching unnecessarily.
         self._redis_config = config.distributed_backend_config
         self._checkpoint_dir = config.checkpoint_dir
         self._checkpoint_every = config.checkpoint_every
@@ -92,6 +95,9 @@ class VariableService():
                 raise ValueError("No variables found in variable storage")
         with self.connection() as conn:
             variables_key = conn.get(self._variable_pointer)
+            if variables_key == self.current_variable_key:
+                return None  # No new variables, return None
+            self.current_variable_key = variables_key
             base_logger.debug(f"Fetching variables from key: {variables_key}")
             variables_bin = conn.get(variables_key)
             if variables_bin is None:
@@ -99,3 +105,12 @@ class VariableService():
             else:
                 variables = pickle.loads(variables_bin)
                 return variables
+
+class VariableClient(acmeVariableClient):
+    """Small extension of the acme VariableClient to allow for None variables received from the service."""
+
+    def _copy(self, new_variables):
+        if new_variables is None:
+            # If new_variables is None, we do not update the variables.
+            return 
+        return super()._copy(new_variables)
