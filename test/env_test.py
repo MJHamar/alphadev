@@ -304,6 +304,7 @@ def test_assembly_game():
     outp = game._last_ts.observation['memory']
     
     assert np.array_equal(outp, test_cases[:,1,:]), f"Expected {test_cases[:,1,:]}, got {outp}"
+    assert game._last_ts.last() and game._is_correct, "Game did not end correctly or the output is not correct"
     print("Test case 6 passed")
 
 # test case 7 -- see if the action pruning rules allow the program to be executed.

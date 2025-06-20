@@ -379,12 +379,14 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         worker_handles = []
         # if there is an inference server, the actors we deploy here play controller roles.
         # otherwise, in 'streamlined' mode, they are actors.
-        worker_device_config = device_config.get_config(CONTROLLER if inference_server is not None else ACTOR)
         worker_calls = [functools.partial(self.run_worker, i) for i in range(self.num_workers)]
-        for call in worker_calls:
+        worker_configs = [device_config.get_config(CONTROLLER if inference_server is not None else ACTOR)
+                          for _ in range(self.num_workers)]
+        logger.info('Deploying %d workers with %s device configurations.', self.num_workers, worker_configs)
+        for call, dev_config in (worker_calls, worker_configs):
             handle = service.deploy_service(
                 executable=call,
-                device_config=worker_device_config,
+                device_config=dev_config,
                 label=f'{self.name}_worker',
                 num_instances=1,  # each worker is a separate process
             )

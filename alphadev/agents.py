@@ -445,6 +445,7 @@ class DistributedMCTS:
         logger: loggers.Logger,
         variable_service: Optional[VariableService] = None,
         inference_client: Optional[AlphaDevInferenceClient] = None,
+        device_config: Optional[DeviceConfig] = None,
     ) -> acme.EnvironmentLoop:
         """The actor process."""
 
@@ -465,7 +466,7 @@ class DistributedMCTS:
         )
         
         actor = MCTSActor(
-            device_config=self._device_config,
+            device_config=device_config,
             environment_spec=self._env_spec,
             model=model,
             discount=self._discount,
@@ -510,6 +511,7 @@ class DistributedMCTS:
         variable_staging: VariableService = None, # where the network uploads its variables
         variable_service: VariableService = None, # from where the actors pull new variables.
         inference_client: Optional[AlphaDevInferenceClient] = None,
+        device_config: Optional[DeviceConfig] = None,
     ):
         """The evaluation process."""
         # Build environment, model, network.
@@ -519,7 +521,7 @@ class DistributedMCTS:
         mcts_observers = self._mcts_observers(logger)
         
         actor = MCTSActor(
-            device_config=self._device_config,
+            device_config=device_config,
             environment_spec=self._env_spec,
             model=model,
             discount=self._discount,
@@ -607,6 +609,10 @@ class DistributedMCTS:
             variable_service._checkpoint_every = 1
             with program.group('evaluator'):
                 eval_device_config = self._device_config.get_config(ACTOR)
+                if self._use_apv_mcts:
+                    actor_subconfig = self._device_config.make_subconfig(self._search_num_actors)
+                elif not self._use_apv_mcts or self._use_inference_server:
+                    actor_subconfig = self._device_config.make_subconfig(0) # no new GPU actors will be created in the subprocess
                 if self._use_inference_server:
                     eval_inference_client = program.add_service(
                         AlphaDevInferenceService(
@@ -625,21 +631,29 @@ class DistributedMCTS:
                             conn_config=config.distributed_backend_config,
                             instance_factory=self.evaluator,
                             instance_cls=acme.EnvironmentLoop,
-                            args=(counter, logger, variable_staging, variable_service, eval_inference_client),
-                        ))
+                            args=(counter, logger, variable_staging, variable_service, eval_inference_client,
+                                  actor_subconfig),
+                        ), device_config=self._device_config.get_config(CONTROLLER))
                 else:
                     program.add_service(
                         RPCService(
                             conn_config=config.distributed_backend_config,
                             instance_factory=self.evaluator,
                             instance_cls=acme.EnvironmentLoop,
-                            args=(counter, logger, variable_staging, variable_service, None),
+                            args=(counter, logger, variable_staging, variable_service, None,
+                                  actor_subconfig),
                         ), device_config=eval_device_config)
 
         with program.group('actor'):
             actor_device_config = self._device_config.get_config(ACTOR)
             for idx in range(self._num_actors):
+                if self._use_apv_mcts:
+                    actor_subconfig = self._device_config.make_subconfig(self._search_num_actors)
+                elif not self._use_apv_mcts or self._use_inference_server:
+                    actor_subconfig = self._device_config.make_subconfig(0) # no new GPU actors will be created in the subprocess
                 if self._use_inference_server:
+                    # when there is an inference server, only one GPU process is used per actor.
+                    # no need to make a new device config for the actor.
                     actor_inference_client = program.add_service(
                         AlphaDevInferenceService(
                             num_blocks=self._search_buffer_size, # 2x the number of processes.
@@ -658,15 +672,19 @@ class DistributedMCTS:
                             conn_config=config.distributed_backend_config,
                             instance_factory=self.actor,
                             instance_cls=acme.EnvironmentLoop,
-                            args=(idx, replay, counter, logger, None, actor_inference_client),
-                        ))
+                            args=(idx, replay, counter, logger, None, actor_inference_client,
+                                  actor_subconfig)
+                        ), device_config=self._device_config.get_config(CONTROLLER))
                 else:
+                    # on the other hand, if we are using 'streamlined' APV_MCTS, we need to preallocate search_num_actors
+                    # GPU slots for each actor.
                     program.add_service(
                         RPCService(
                             conn_config=config.distributed_backend_config,
                             instance_factory=self.actor,
                             instance_cls=acme.EnvironmentLoop,
-                            args=(idx, replay, counter, logger, variable_service, None),
+                            args=(idx, replay, counter, logger, variable_service, None,
+                                  actor_subconfig),
                         ), device_config=actor_device_config)
         
         return program

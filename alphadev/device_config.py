@@ -85,9 +85,12 @@ def compute_device_config(ad_config_path: str):
     return config
 
 class DeviceConfig:
-    def __init__(self, path: str):
+    def __init__(self, path: str=None):
         self.num_actors = 0
-        self.config = yaml.safe_load(open(path, 'r'))
+        if path is None:
+            self.config = {}
+        else:
+            self.config = yaml.safe_load(open(path, 'r'))
     
     def get_config(self, process_type: str):
         # TODO: support for multiple devices
@@ -99,6 +102,24 @@ class DeviceConfig:
             self.num_actors += 1
             return cfg
         return dev_cfg
+    
+    def make_subconfig(self, num_actors: int):
+        """
+        Create a sub-configuration for the given number of actors.
+        This is useful for distributed MCTS where each actor spans multiple processes.
+        For safety, the subconfig will only contain actor configurations,
+        and no learner or controller configurations.
+        """
+        subconfig = DeviceConfig()
+        if not isinstance(self.config[ACTOR], list):
+            subconfig.config = self.config.copy() # there is nothing to do really.
+        else:
+            subconfig.config = {
+                CONTROLLER: self.config[CONTROLLER],
+                ACTOR: self.config[ACTOR][self.num_actors:self.num_actors + num_actors]
+            }
+            self.num_actors += num_actors
+        return subconfig
 
 def apply_device_config(local_tf, config = None):
     print("Applying device configuration", config)
