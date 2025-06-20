@@ -12,7 +12,7 @@ from ..config import AlphaDevConfig
 
 import logging
 base_logger = logging.getLogger(__name__)
-base_logger.setLevel(logging.INFO)
+base_logger.setLevel(logging.DEBUG)
 
 class VariableService():
     """Variable service that stores variables in a Redis database.
@@ -24,7 +24,7 @@ class VariableService():
     """
     def __init__(self, config: AlphaDevConfig):
         self._config = config
-        self._variable_key = f'{config.variable_service_name}_{uuid().hex[:8]}'
+        self._variable_pointer = f'{config.variable_service_name}_{uuid().hex[:8]}'
         self._redis_config = config.distributed_backend_config
         self._checkpoint_dir = config.checkpoint_dir
         self._checkpoint_every = config.checkpoint_every
@@ -48,24 +48,33 @@ class VariableService():
     
     def update(self, variables):
         """Update the variable storage with the given variables."""
-        base_logger.info(f"Updating variables in {self._variable_key}")
+        base_logger.info(f"Updating variables in {self._variable_pointer}")
         self._num_updates += 1
         if self._checkpoint_dir is not None and self._num_updates % self._checkpoint_every == 0:
             base_logger.info(f"Checkpointing variables to {self._checkpoint_dir}")
             with open(f"{self._checkpoint_dir}/variables_{self._num_updates}.pkl", "wb") as f:
                 pickle.dump(variables, f)
-        base_logger.debug(f"Storing variables in {self._variable_key}")
+        base_logger.debug(f"Storing variables in {self._variable_pointer}")
         with self.connection() as conn:
             variables_bin = pickle.dumps(variables)
-            conn.set(self._variable_key, variables_bin)
-            return self._variable_key
+            new_variable_key = f"{self._variable_pointer}_{self._num_updates}"
+            # upload the new variables
+            conn.set(new_variable_key, variables_bin)
+            # set the pointer to the latest variables
+            conn.set(self._variable_pointer, new_variable_key)
+            # expire the previous variable key
+            if hasattr(self, 'prev_variable_key'):
+                conn.expire(self.prev_variable_key, self._config.variable_expiration_time)
+            # set the previous variable key to the new one
+            self.prev_variable_key = new_variable_key
+            return self._variable_pointer
     
     def has_variables(self):
         """Check if the variable storage has variables."""
-        base_logger.debug(f"Checking if variables exist in {self._variable_key}")
+        base_logger.debug(f"Checking if variables exist in {self._variable_pointer}")
         with self.connection() as conn:
-            variables_bin = conn.exists(self._variable_key)
-            if variables_bin == 0:
+            variables_exist = conn.exists(self._variable_pointer)
+            if variables_exist == 0:
                 return False
             else:
                 return True
@@ -73,7 +82,7 @@ class VariableService():
     def get_variables(self, keys=None):
         # NOTE: keys is unused because it is also unused in AZLearner.
         """Get the variables from the variable storage."""
-        base_logger.debug(f"Getting variables from {self._variable_key}")
+        base_logger.debug(f"Getting variables from {self._variable_pointer}")
         if not self.has_variables():
             start = time.time()
             while not self.has_variables() and time.time() - start < 90: # wait for variables to be available
@@ -82,7 +91,9 @@ class VariableService():
                 base_logger.error("Variables not found in variable storage after waiting for 90 seconds")
                 raise ValueError("No variables found in variable storage")
         with self.connection() as conn:
-            variables_bin = conn.get(self._variable_key)
+            variables_key = conn.get(self._variable_pointer)
+            base_logger.debug(f"Fetching variables from key: {variables_key}")
+            variables_bin = conn.get(variables_key)
             if variables_bin is None:
                 raise ValueError("No variables found in variable storage")
             else:

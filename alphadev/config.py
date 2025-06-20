@@ -101,6 +101,7 @@ class AlphaDevConfig(object):
     replay_server_port: int = None
     # variable service
     variable_service_name: str = 'variable'
+    variable_expiration_time: int = 180 # 3 minutes
     # search single-threaded or asynchronous
     use_async_search: bool = True # if False, all actors will have their own version of the network
     async_search_processes_per_pool: Union[int, str] = 'auto' # number of processes per pool, 'auto' will distribute all available cores evently
@@ -201,7 +202,7 @@ class AlphaDevConfig(object):
         
         if self.use_async_search:
             if isinstance(self.async_search_processes_per_pool, str) and self.async_search_processes_per_pool == 'auto':
-                self.async_search_processes_per_pool = os.cpu_count() // self.async_search_num_pools
+                self.async_search_processes_per_pool = os.cpu_count() // self.num_actors
             elif not isinstance(self.async_search_processes_per_pool, int):
                 raise ValueError("async_search_processes_per_pool must be 'auto' or an integer.")
         if self.search_use_inference_server:
