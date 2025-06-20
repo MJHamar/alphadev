@@ -42,8 +42,6 @@ class DualValueAZLearner(AZLearner):
         pi_t = extras['pi']
         latency_t = extras['latency_reward']
         
-        self._maybe_update_target_network()
-        
         with tf.GradientTape() as tape:
             # Forward the network on the two states in the transition.
             logits, value, correctness_logits, latency_logits = self._network(o_t)

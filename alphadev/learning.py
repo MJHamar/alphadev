@@ -14,7 +14,7 @@ from .service.variable_service import VariableService
 
 import logging
 base_logger = logging.getLogger(__name__)
-base_logger.setLevel(logging.INFO)
+base_logger.setLevel(logging.DEBUG)
 
 
 class AZLearner(acme.Learner):
@@ -71,10 +71,16 @@ class AZLearner(acme.Learner):
     def _maybe_update_target_network(self):
         """Updates the target network if needed."""
         if self._should_update_target:
-            steps = self._counter.get_counts().get('steps', 0)
+            counts = self._counter.get_counts()
+            base_logger.debug("AZLearner: maybe updating target network with counts %s", counts)
+            steps = counts.get('step', 0)
             if steps % self._target_update_period == 0:
-                base_logger.debug(f"AZLearner: updating target network at step {steps}")
-                self._target_network.trainable_variables(self._network.get_weights())
+                base_logger.debug("AZLearner: updating target network at step %s", steps)
+                tree.map_structure(
+                    lambda t, s: t.assign(s), 
+                    self._target_network.trainable_variables, 
+                    self._network.trainable_variables
+                )
     
     # @tf.function
     def _step(self) -> tf.Tensor:
@@ -86,8 +92,6 @@ class AZLearner(acme.Learner):
         # NOTE: this implementation doesn't consider latency predictions.
         # see `dual_value_az.py`
         latency_t = extras['latency_reward']
-        
-        self._maybe_update_target_network()
         
         with tf.GradientTape() as tape:
             # Forward the network on the two states in the transition.
@@ -119,10 +123,12 @@ class AZLearner(acme.Learner):
 
     def step(self):
         """Does a step of SGD and logs the results."""
+        self._maybe_update_target_network()
+        
         loss = self._step()
         self._logger.write({'loss': loss})
         counts = self._counter.increment(**{'step': 1})
-        base_logger.debug('counts', counts)
+        base_logger.debug('counts %s', counts)
         if self._variable_service is not None:
             base_logger.debug(f"updating variables at step {counts['step']}")
             self._variable_service.update(self.get_variables([]))
