@@ -383,7 +383,7 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
         worker_configs = [device_config.get_config(CONTROLLER if inference_server is not None else ACTOR)
                           for _ in range(self.num_workers)]
         logger.info('Deploying %d workers with %s device configurations.', self.num_workers, worker_configs)
-        for call, dev_config in (worker_calls, worker_configs):
+        for call, dev_config in zip(worker_calls, worker_configs):
             handle = service.deploy_service(
                 executable=call,
                 device_config=dev_config,
