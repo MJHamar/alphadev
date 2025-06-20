@@ -46,7 +46,7 @@ from .device_config import DeviceConfig, ACTOR, CONTROLLER
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class MCTSActor(acmeMCTSActor):

@@ -14,7 +14,7 @@ from ..config import AlphaDevConfig
 
 import logging
 base_logger = logging.getLogger(__name__)
-base_logger.setLevel(logging.DEBUG)
+base_logger.setLevel(logging.INFO)
 
 class VariableService():
     """Variable service that stores variables in a Redis database.
@@ -85,7 +85,6 @@ class VariableService():
     def get_variables(self, keys=None):
         # NOTE: keys is unused because it is also unused in AZLearner.
         """Get the variables from the variable storage."""
-        base_logger.debug(f"Getting variables from {self._variable_pointer}")
         if not self.has_variables():
             start = time.time()
             while not self.has_variables() and time.time() - start < 90: # wait for variables to be available

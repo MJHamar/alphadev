@@ -14,7 +14,7 @@ from .service.variable_service import VariableService
 
 import logging
 base_logger = logging.getLogger(__name__)
-base_logger.setLevel(logging.DEBUG)
+base_logger.setLevel(logging.INFO)
 
 
 class AZLearner(acme.Learner):
