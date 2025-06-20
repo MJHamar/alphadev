@@ -1,10 +1,14 @@
 from typing import Optional
-from time import time
+import time
 import numpy as np
 
 import acme
 
 from .service.variable_service import VariableService
+
+import logging
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 class EvaluationLoop(acme.EnvironmentLoop):
     def __init__(self, 
@@ -13,6 +17,7 @@ class EvaluationLoop(acme.EnvironmentLoop):
         staging_service: VariableService,
         variable_service: VariableService,
         should_update_threshold = 1.0,
+        evaluation_episodes: int = 5,
         counter = None,
         logger = None,
         label = 'environment_loop',
@@ -35,10 +40,14 @@ class EvaluationLoop(acme.EnvironmentLoop):
         self.staging_service = staging_service
         self.variable_service = variable_service
         self.should_update_threshold = should_update_threshold
+        self._evaluation_episodes = evaluation_episodes
+        self.previous_avg_return = 0.0
         
         self._echo_parameters()
     
-    def echo_parameters(self):
+    def _echo_parameters(self):
+        if self.staging_service is None or self.variable_service is None:
+            raise ValueError('Both staging service and variable service needs to be passed. Cannot echo parameters.')
         # make sure initial parameters of the model are available to the actors
         self.current_parameters = self.staging_service.get_variables()
         self.variable_service.update(self.current_parameters)
@@ -95,18 +104,23 @@ class EvaluationLoop(acme.EnvironmentLoop):
             # Log the given episode results.
             self._logger.write(result)
             # append to the returns liist
+            logger.debug(f"EvaluationLoop: Episode {episode_count} completed with return {result['episode_return']}.")
             episode_returns.append(result['episode_return'])
             if len(episode_returns) >= self._evaluation_episodes:
+                logger.debug(f"EvaluationLoop: Evaluating parameters after {len(episode_returns)} episodes.")
                 # calculate the average return
                 avg_return = np.mean(episode_returns)
+                logger.debug(f"EvaluationLoop: Average return: {avg_return}")
                 # reset the returns list
                 episode_returns.clear()
                 # check if we should update the parameters
                 if avg_return - self.previous_avg_return >= self.should_update_threshold:
                     # push the current parameters to the variable service
+                    logger.debug(f"EvaluationLoop: Updating parameters with avg return {avg_return}.")
                     self.variable_service.update(
                         self.current_parameters
                     )
+                self.previous_avg_return = avg_return
                 # pull new parameters
                 self.current_parameters = self.staging_service.get_variables()
                 # update the actor with the new parameters

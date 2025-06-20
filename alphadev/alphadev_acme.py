@@ -61,6 +61,10 @@ def make_agent(config: AlphaDevConfig):
             exploration_fraction=config.root_exploration_fraction,
             search_retain_subtree=config.search_retain_subtree,
             # training parameters
+            do_eval_based_updates=config.do_eval_based_updates,
+            evaluation_update_threshold=config.evaluation_update_threshold,
+            evaluation_episodes=config.evaluation_episodes,
+            
             do_train=config.do_train,
             training_steps=config.training_steps,
             batch_size=config.batch_size,

@@ -35,14 +35,7 @@ import acme.utils.observers.base
 import dm_env
 import reverb
 import sonnet as snt
-from tempfile import TemporaryFile
-import tree
-import yaml
-import sys
-import os
-from uuid import uuid4 as uuid
 
-import numpy as np
 from .dual_value_az import DualValueAZLearner
 from .network import NetworkFactory, make_input_spec
 from .acting import MCTSActor
@@ -52,6 +45,7 @@ from .service.inference_service import AlphaDevInferenceClient, AlphaDevInferenc
 from .config import AlphaDevConfig
 from .device_config import DeviceConfig, ACTOR, LEARNER, CONTROLLER
 from .service.variable_service import VariableService
+from .evaluation import EvaluationLoop
 
 
 class MCTS(agent.Agent):
@@ -266,6 +260,9 @@ class DistributedMCTS:
         search_retain_subtree: bool = True,
         # training
         do_train: bool = True,
+        do_eval_based_updates: bool = True, # whether to use an evaluator process to see if the network should be updated.
+        evaluation_update_threshold: float = 0.55, # if the evaluation cumulative reward is above this threshold, the network is updated.
+        evaluation_episodes: int = 5,
         training_steps: int = 1000,
         batch_size: int = 256,
         prefetch_size: int = 4,
@@ -320,6 +317,10 @@ class DistributedMCTS:
         self._search_batch_size = search_batch_size
         
         # Training parameters
+        self._do_eval_based_updates = do_eval_based_updates
+        self._evaluation_update_threshold = evaluation_update_threshold
+        self._evaluation_episodes = evaluation_episodes
+        
         self._do_train = do_train
         self._training_steps = training_steps
         self._batch_size = batch_size
@@ -546,8 +547,13 @@ class DistributedMCTS:
         
         observers = self._observers(logger)
         
-        return acme.EnvironmentLoop(
-            environment, actor, counter=counter, logger=logger, observers=observers, label='evaluator')
+        return EvaluationLoop(
+            environment, actor,
+            staging_service=variable_staging,
+            variable_service=variable_service,
+            should_update_threshold=self._evaluation_update_threshold,
+            evaluation_episodes=self._evaluation_episodes,
+            counter=counter, logger=logger, observers=observers, label='evaluator')
         
     def build(self, config: AlphaDevConfig):
         """Builds the distributed agent topology."""
@@ -591,36 +597,44 @@ class DistributedMCTS:
                     device_config=learner_device_config,
                     )
 
-        # with program.group('evaluator'):
-        #     eval_device_config = self._device_config.get_config(ACTOR)
-        #     if self._use_inference_server:
-        #         eval_inference_client = program.add_service(
-        #             AlphaDevInferenceService(
-        #                 num_blocks=self._search_buffer_size, # 2x the number of processes.
-        #                 network_factory=self._network_factory,
-        #                 input_spec=self._env_spec.observations,
-        #                 output_spec=self._env_spec.actions.num_values, # num actions
-        #                 batch_size=self._search_batch_size,
-        #                 variable_service=variable_service,
-        #                 variable_update_period=self._variable_update_period,
-        #                 factory_args=([make_input_spec(self._env_spec.observations)],), # for the network factory
-        #                 name='eval_inference_service',
-        #             ), device_config=eval_device_config)
-        #         program.add_service(
-        #             RPCService(
-        #                 conn_config=config.distributed_backend_config,
-        #                 instance_factory=self.evaluator,
-        #                 instance_cls=acme.EnvironmentLoop,
-        #                 args=(counter, logger, None, eval_inference_client),
-        #             ))
-        #     else:
-        #         program.add_service(
-        #             RPCService(
-        #                 conn_config=config.distributed_backend_config,
-        #                 instance_factory=self.evaluator,
-        #                 instance_cls=acme.EnvironmentLoop,
-        #                 args=(counter, logger, variable_service, None),
-        #             ), device_config=eval_device_config)
+        if self._do_eval_based_updates:
+            # the current variable_service becomes the staging service (the network is already parameterized with it)
+            # and we create a new variable service that will be passed to the actors.
+            variable_staging = variable_service
+            variable_service = VariableService(config)
+            # disable checkpointing in the stagging service and set checkpointing to 1 in the new variable service.
+            variable_staging._checkpoint_dir = None
+            variable_service._checkpoint_every = 1
+            with program.group('evaluator'):
+                eval_device_config = self._device_config.get_config(ACTOR)
+                if self._use_inference_server:
+                    eval_inference_client = program.add_service(
+                        AlphaDevInferenceService(
+                            num_blocks=self._search_buffer_size, # 2x the number of processes.
+                            network_factory=self._network_factory,
+                            input_spec=self._env_spec.observations,
+                            output_spec=self._env_spec.actions.num_values, # num actions
+                            batch_size=self._search_batch_size,
+                            variable_service=variable_service,
+                            variable_update_period=self._variable_update_period,
+                            factory_args=([make_input_spec(self._env_spec.observations)],), # for the network factory
+                            name='eval_inference_service',
+                        ), device_config=eval_device_config)
+                    program.add_service(
+                        RPCService(
+                            conn_config=config.distributed_backend_config,
+                            instance_factory=self.evaluator,
+                            instance_cls=acme.EnvironmentLoop,
+                            args=(counter, logger, variable_staging, variable_service, eval_inference_client),
+                        ))
+                else:
+                    program.add_service(
+                        RPCService(
+                            conn_config=config.distributed_backend_config,
+                            instance_factory=self.evaluator,
+                            instance_cls=acme.EnvironmentLoop,
+                            args=(counter, logger, variable_staging, variable_service, None),
+                        ), device_config=eval_device_config)
 
         with program.group('actor'):
             actor_device_config = self._device_config.get_config(ACTOR)

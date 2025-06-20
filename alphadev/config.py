@@ -69,6 +69,10 @@ class AlphaDevConfig(object):
     categorical_value_loss: bool = True # wheether to treat the value functions as a distribution
 
     ### Training
+    do_eval_based_updates: bool = False # whether to use an evaluation process to determine when network parameters should be broadcast
+    evaluation_update_threshold: int = 1 # how much more cumulative reward needs to be observed during evaluation
+    evaluation_episodes: int = 5 # how many episodes to run during evaluation
+    
     do_train: bool = True
     training_steps: int = 1000 #int(1000e3)
     batch_size: int = 8
