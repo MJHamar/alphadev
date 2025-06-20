@@ -51,7 +51,7 @@ class AZLearner(acme.Learner):
             # If no target network is provided, use the same network.
             base_logger.debug("AZLearner: using the same network as target network")
             self._should_update_target = False
-            target_network = network
+            self._target_network = network
         else:
             base_logger.debug(f"AZLearner: using a different network as target network: {target_network}")
             self._should_update_target = True
