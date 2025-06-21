@@ -265,12 +265,7 @@ class logger_factory:
                 wandb_config['run_id'] = self.config.wanbd_run_id
             logger = WandbLogger(wandb_config)
             config_dict = dataclasses.asdict(self.config)
-            config_dict.pop('hparams'); config_dict.pop('task_spec'); config_dict.pop('input_examples')
-            logger.log_config({
-                **config_dict,
-                'hparams': self.config.hparams.to_dict(),
-                'task_spec': self.config.task_spec._asdict(),
-            })
+            logger.log_config(config_dict)
         else:
             print('Creating terminal logger')
             logger = make_default_logger(self.config.experiment_name, time_delta=0.0)
