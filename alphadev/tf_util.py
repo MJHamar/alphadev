@@ -7,6 +7,6 @@ config = get_device_config_from_cli(sys.argv)
 
 import tensorflow as tf
 
-tf = apply_device_config(tf, config)
+# tf = apply_device_config(tf, config)
 
 # Tensorflow can now be imported in all the other modules.

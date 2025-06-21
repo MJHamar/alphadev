@@ -104,7 +104,7 @@ class DeviceConfig:
         if process_type == ACTOR and isinstance(dev_cfg, list):
             # for actor processes, return the first element.
             cfg = dev_cfg[self.num_actors]
-            self.num_actors += 1
+            # self.num_actors += 1
             return cfg
         return dev_cfg
     

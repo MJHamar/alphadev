@@ -645,8 +645,8 @@ class DistributedMCTS:
                         ), device_config=eval_device_config)
 
         with program.group('actor'):
-            actor_device_config = self._device_config.get_config(ACTOR)
             for idx in range(self._num_actors):
+                actor_device_config = self._device_config.get_config(ACTOR)
                 if self._use_apv_mcts:
                     actor_subconfig = self._device_config.make_subconfig(self._search_num_actors)
                 elif not self._use_apv_mcts or self._use_inference_server:
@@ -664,7 +664,7 @@ class DistributedMCTS:
                             variable_service=variable_service,
                             variable_update_period=self._variable_update_period,
                             factory_args=([make_input_spec(self._env_spec.observations)],), # for the network factory
-                            name=f'actorr_{idx}_inference',
+                            name=f'actor_{idx}_inference',
                         ), device_config=actor_device_config
                     )
                     program.add_service(
