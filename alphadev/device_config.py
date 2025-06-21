@@ -52,6 +52,9 @@ def compute_device_config(ad_config_path: str):
     else:
         # 'streamlined' MCTS. every search actor uses the GPU.
         num_gpu_users += ad_config.num_actors * (ad_config.async_search_processes_per_pool + 1)
+    # also, if there is an evaluation process, it also uses the GPU.
+    if ad_config.do_eval_based_updates:
+        num_gpu_users += 1 # for now there is only one.
     # 3. divide the GPUs among the GPU users
     num_gpus = len(gpu_devices)
     if num_gpus == 0:
