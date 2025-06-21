@@ -43,18 +43,20 @@ def compute_device_config(ad_config_path: str):
         "allocation_size": None,
     }
     # 2. find the number of GPU users
+    total_num_actors = ad_config.num_actors
+    # if there is an evaluation process, it also uses the GPU.
+    if ad_config.do_eval_based_updates:
+        total_num_actors += 1
+    
     num_gpu_users = 1  # always one learner
     if not ad_config.use_async_search:
-        num_gpu_users += ad_config.num_actors
+        num_gpu_users += total_num_actors
     elif ad_config.search_use_inference_server:
         # alphadev-style APV MCTS. one GPU user for each actor.
-        num_gpu_users += ad_config.num_actors
+        num_gpu_users += total_num_actors
     else:
         # 'streamlined' MCTS. every search actor uses the GPU.
-        num_gpu_users += ad_config.num_actors * (ad_config.async_search_processes_per_pool + 1)
-    # also, if there is an evaluation process, it also uses the GPU.
-    if ad_config.do_eval_based_updates:
-        num_gpu_users += 1 # for now there is only one.
+        num_gpu_users += total_num_actors * (ad_config.async_search_processes_per_pool + 1)
     # 3. divide the GPUs among the GPU users
     num_gpus = len(gpu_devices)
     if num_gpus == 0:
