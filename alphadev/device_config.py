@@ -123,7 +123,7 @@ class DeviceConfig:
                 CONTROLLER: self.config[CONTROLLER],
                 ACTOR: self.config[ACTOR][self.num_actors:self.num_actors + num_actors]
             }
-            self.num_actors += num_actors
+            # self.num_actors += num_actors
         return subconfig
 
 def apply_device_config(local_tf, config = None):
