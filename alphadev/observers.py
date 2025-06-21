@@ -154,7 +154,7 @@ class NonZeroRewardObserver(EnvLoopObserver):
     
     def observe(self, env, timestep, action=None):
         self._current_trajectory.append(timestep)
-        if timestep.reward != 0:
+        if timestep.reward > 0:
             print(f"Non-zero reward observed: {timestep.reward}, program length: {len(env._program)}")
             self._should_save = True
         if timestep.last() and env._is_correct:
