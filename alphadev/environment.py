@@ -424,7 +424,6 @@ class AssemblyGame(Environment):
         # the cumulative latency penalty for a program of length L is L*latency_reward_weight.
         # instead of adding it to the reward in each step, we add it at the end of the episode,
         # regardless of the correctess.
-        self._penalize_latency = task_spec.penalize_latency
         self.latency_reward = 0.0 # latency reward is 0.0 unless the program is correct.
         
         self._emulator = multi_machine(
@@ -491,11 +490,13 @@ class AssemblyGame(Environment):
                 # since we only consider branchless programs
                 # TODO: for branching programs this will no longer do.
                 self.latency_reward = self._task_spec.latency_reward_weight * len(self._program)
-            else:
+            elif len(self._program) > 0:
                 latencies = self._eval_latency()
                 self.latency_reward = np.quantile(
                     latencies, self._task_spec.latency_quantile
                 ) * self._task_spec.latency_reward_weight
+            else:
+                self.latency_reward = 0.0 # no program, no latency
         
         return correctness_reward
     
@@ -529,7 +530,7 @@ class AssemblyGame(Environment):
         
         # we can now compute the reward. only calculate latency if the program is correct.
         # according to the pseudocode and Mankowicz et al. 2023.
-        reward = self._compute_reward(include_latency=self._is_correct or self._penalize_latency)
+        reward = self._compute_reward(include_latency=self._is_correct or self._task_spec.penalize_latency)
         
         step_type = StepType.FIRST if len(self._program) == 0 else (
                         StepType.MID if not is_terminal else
