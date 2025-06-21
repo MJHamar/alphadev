@@ -9,6 +9,12 @@ class WandbLogger(loggers.Logger):
     def __init__(self, config: dict):
         super().__init__()
         wandb.init(**config)
+    
+    def log_config(self, config: dict):
+        """
+        Log the configuration to Weights and Biases.
+        """
+        wandb.config.update(config)
 
     def write(self, data: dict):
         wandb.log(data)

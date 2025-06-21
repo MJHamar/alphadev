@@ -39,6 +39,8 @@ class AlphaDevConfig(object):
     num_simulations: int = 5
     discount: float = 1.0
     search_retain_subtree: bool = True
+    penalize_latency: bool = False
+    use_actual_latency: bool = False
 
     # Root prior exploration noise.
     root_dirichlet_alpha: float = 0.03
@@ -192,6 +194,8 @@ class AlphaDevConfig(object):
             num_latency_simulations=self.num_latency_simulations,
             inputs=self.input_examples,
             emulator_mode=self.emulator_mode,
+            penalize_latency=self.penalize_latency,
+            use_actual_latency=self.use_actual_latency
         )
         
         self.logger_factory = logger_factory(self)
@@ -260,6 +264,13 @@ class logger_factory:
             if self.config.wanbd_run_id is not None:
                 wandb_config['run_id'] = self.config.wanbd_run_id
             logger = WandbLogger(wandb_config)
+            config_dict = dataclasses.asdict(self.config)
+            config_dict.pop('hparams'); config_dict.pop('task_spec'); config_dict.pop('input_examples')
+            logger.log_config({
+                **config_dict,
+                'hparams': self.config.hparams.to_dict(),
+                'task_spec': self.config.task_spec._asdict(),
+            })
         else:
             print('Creating terminal logger')
             logger = make_default_logger(self.config.experiment_name, time_delta=0.0)

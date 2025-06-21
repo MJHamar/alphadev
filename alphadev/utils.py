@@ -27,6 +27,8 @@ class TaskSpec(NamedTuple):
     num_latency_simulations: int # number of latency simulations to run
     inputs: IOExample # input examples for the task
     emulator_mode: Literal['u8', 'i16', 'i32'] = 'u8' # emulator mode for the task, one of ['u8', 'i16', 'i32']
+    penalize_latency: bool # whether to penalize latency in the reward or only when the program is correct.
+    use_actual_latency: bool # use actual latency for the task, or use the program length as a proxy
 
 class CPUState(NamedTuple):
     registers: tf.Tensor # num_inputs x num_regs array of register values

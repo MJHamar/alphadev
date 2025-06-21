@@ -420,6 +420,11 @@ class AssemblyGame(Environment):
         self._output_mask = task_spec.inputs.output_mask
         self._outputs = task_spec.inputs.outputs
         self._max_num_hits = np.sum(self._output_mask.astype(np.int32))
+        # if this is True, we add a negative reward for latency.
+        # the cumulative latency penalty for a program of length L is L*latency_reward_weight.
+        # instead of adding it to the reward in each step, we add it at the end of the episode,
+        # regardless of the correctess.
+        self._penalize_latency = task_spec.penalize_latency
         self.latency_reward = 0.0 # latency reward is 0.0 unless the program is correct.
         
         self._emulator = multi_machine(
@@ -481,10 +486,16 @@ class AssemblyGame(Environment):
         self._prev_num_hits = self._num_hits
         
         if include_latency: # cannot be <0 btw
-            latencies = self._eval_latency()
-            self.latency_reward = np.quantile(
-                latencies, self._task_spec.latency_quantile
-            ) * self._task_spec.latency_reward_weight
+            if not self._task_spec.use_actual_latency:
+                # this is more efficient and proportional to the original latency calculation
+                # since we only consider branchless programs
+                # TODO: for branching programs this will no longer do.
+                self.latency_reward = self._task_spec.latency_reward_weight * len(self._program)
+            else:
+                latencies = self._eval_latency()
+                self.latency_reward = np.quantile(
+                    latencies, self._task_spec.latency_quantile
+                ) * self._task_spec.latency_reward_weight
         
         return correctness_reward
     
@@ -518,7 +529,7 @@ class AssemblyGame(Environment):
         
         # we can now compute the reward. only calculate latency if the program is correct.
         # according to the pseudocode and Mankowicz et al. 2023.
-        reward = self._compute_reward(include_latency=self._is_correct)
+        reward = self._compute_reward(include_latency=self._is_correct or self._penalize_latency)
         
         step_type = StepType.FIRST if len(self._program) == 0 else (
                         StepType.MID if not is_terminal else
