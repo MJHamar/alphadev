@@ -490,6 +490,7 @@ class AssemblyGame(Environment):
                 # since we only consider branchless programs
                 # TODO: for branching programs this will no longer do.
                 self.latency_reward = self._task_spec.latency_reward_weight * len(self._program)
+                
             elif len(self._program) > 0:
                 latencies = self._eval_latency()
                 self.latency_reward = np.quantile(
@@ -497,8 +498,11 @@ class AssemblyGame(Environment):
                 ) * self._task_spec.latency_reward_weight
             else:
                 self.latency_reward = 0.0 # no program, no latency
-        
-        return correctness_reward
+            # add the latency reward to the correctness reward
+            reward = correctness_reward - self._task_spec.latency_reward_weight
+        else:
+            reward = correctness_reward
+        return reward
     
     def _make_observation(self) -> Dict[str, np.ndarray]:
         # get the current state of the CPU
