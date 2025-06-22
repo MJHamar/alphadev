@@ -51,7 +51,7 @@ class VariableService():
     
     def update(self, variables):
         """Update the variable storage with the given variables."""
-        base_logger.info(f"Updating variables in {self._variable_pointer}")
+        base_logger.debug(f"Updating variables in {self._variable_pointer}")
         self._num_updates += 1
         if self._checkpoint_dir is not None and self._num_updates % self._checkpoint_every == 0:
             base_logger.info(f"Checkpointing variables to {self._checkpoint_dir}")

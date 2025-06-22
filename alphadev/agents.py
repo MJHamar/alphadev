@@ -46,7 +46,7 @@ from .config import AlphaDevConfig
 from .device_config import DeviceConfig, ACTOR, LEARNER, CONTROLLER
 from .service.variable_service import VariableService
 from .evaluation import EvaluationLoop
-
+from .utils import reward_priority_fn
 
 class MCTS(agent.Agent):
     """A single-process MCTS agent."""
@@ -271,7 +271,7 @@ class DistributedMCTS:
         samples_per_insert: float = 32.0,
         min_replay_size: int = 1000,
         max_replay_size: int = 1000000,
-        importance_sampling_exponent: float = 0.2,
+        use_prioritized_replay: bool = True,
         priority_exponent: float = 0.6,
         n_step: int = 5,
         learning_rate: float = 1e-3,
@@ -330,7 +330,7 @@ class DistributedMCTS:
         self._samples_per_insert = samples_per_insert
         self._min_replay_size = min_replay_size
         self._max_replay_size = max_replay_size
-        self._importance_sampling_exponent = importance_sampling_exponent
+        self._use_prioritized_replay = use_prioritized_replay
         self._priority_exponent = priority_exponent
         self._n_step = n_step
         self._learning_rate = learning_rate
@@ -345,10 +345,17 @@ class DistributedMCTS:
             # self._inference_factory = 0
             self._search_num_actors = apv_processes_per_pool
             self._search_virual_loss_const = virtual_loss_const
-        # If using inference server, we need to provide the inference factory.
-        # if use_inference_server:
-            # assert inference_factory is not None, 'Inference factory must be provided when using inference server.'
-            # self._inference_factory = inference_factory
+        
+        if use_prioritized_replay:
+            # If we are using prioritized replay, we need to set up the priority functions.
+            self.priortiy_fns: Dict[str, Callable[[types.Transition], float]] = {
+                adders.DEFAULT_PRIORITY_TABLE: reward_priority_fn,
+            }
+        else:
+            # If we are not using prioritized replay, we can use a uniform priority function.
+            self.priortiy_fns = {
+                adders.DEFAULT_PRIORITY_TABLE: None,
+            }
         
         self._use_dual_value_network = use_dual_value_network
         # set up logging
@@ -377,7 +384,7 @@ class DistributedMCTS:
                                                         extra_spec)
         replay_table = reverb.Table(
             name=adders.DEFAULT_PRIORITY_TABLE,
-            sampler=reverb.selectors.Uniform(),
+            sampler=reverb.selectors.Prioritized(self._priority_exponent),
             remover=reverb.selectors.Fifo(),
             max_size=self._max_replay_size,
             rate_limiter=limiter,
@@ -463,6 +470,7 @@ class DistributedMCTS:
             client=replay,
             n_step=self._n_step,
             discount=self._discount,
+            priority_fns=self.priortiy_fns
         )
         
         actor = MCTSActor(

@@ -3,6 +3,9 @@ import itertools
 import numpy as np
 from .tf_util import tf
 
+from acme.adders import reverb as adders
+import tree
+
 # #################
 # Type definitions
 # #################
@@ -241,3 +244,16 @@ def x86_enumerate_actions(max_reg: int, max_mem: int) -> Dict[int, Tuple[str, Tu
     actions = {i: action for i, action in enumerate(actions)}
     #   logger.debug("Enumerated %d actions", len(actions))
     return actions
+
+def reward_priority_fn(transition: adders.PriorityFnInput) -> float:
+    """
+    Priority function for the Reverb adder that returns a priority based on the reward.
+    This is used to prioritize transitions with higher rewards.
+    """
+    # Use the reward as the priority, or 0 if not available
+    if hasattr(transition, 'rewards') and transition.rewards is not None:
+        return np.float32(np.sum(tree.flatten(transition.rewards)))
+    elif hasattr(transition, 'reward') and transition.reward is not None:
+        return np.float32(transition.reward)
+    else:
+        return np.float32(0.0)

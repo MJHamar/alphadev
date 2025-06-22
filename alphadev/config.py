@@ -97,7 +97,7 @@ class AlphaDevConfig(object):
     samples_per_insert: int = 1
     min_replay_size: int = 1000
     max_replay_size: int = 1000000
-    importance_sampling_exponent: float = 0.2
+    use_prioritized_replay: bool = True # whether to use prioritized replay
     priority_exponent: float = 0.6
     # Distributed communication backend
     redis_host: str = 'localhost'

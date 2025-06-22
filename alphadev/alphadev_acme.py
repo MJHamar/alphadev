@@ -74,7 +74,7 @@ def make_agent(config: AlphaDevConfig):
             samples_per_insert=config.samples_per_insert,
             min_replay_size=config.min_replay_size,
             max_replay_size=config.max_replay_size,
-            importance_sampling_exponent=config.importance_sampling_exponent,
+            use_prioritized_replay=config.use_prioritized_replay,
             priority_exponent=config.priority_exponent,
             n_step=config.n_step,
             learning_rate=config.lr_init,
