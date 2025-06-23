@@ -14,7 +14,7 @@ from ..config import AlphaDevConfig
 
 import logging
 base_logger = logging.getLogger(__name__)
-base_logger.setLevel(logging.INFO)
+base_logger.setLevel(logging.DEBUG)
 
 class VariableService():
     """Variable service that stores variables in a Redis database.
