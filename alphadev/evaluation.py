@@ -43,7 +43,7 @@ class EvaluationLoop(acme.EnvironmentLoop):
         self.variable_service = variable_service
         self.should_update_threshold = should_update_threshold
         self._evaluation_episodes = evaluation_episodes
-        self.previous_avg_return = 0.0
+        self.previous_avg_return = None
         
         self._echo_parameters()
     
@@ -117,7 +117,7 @@ class EvaluationLoop(acme.EnvironmentLoop):
                 # reset the returns list
                 episode_returns.clear()
                 # check if we should update the parameters
-                if avg_return - self.previous_avg_return >= self.should_update_threshold:
+                if self.previous_avg_return is None or avg_return - self.previous_avg_return >= self.should_update_threshold:
                     # push the current parameters to the variable service
                     logger.debug(f"EvaluationLoop: Updating parameters with avg return {avg_return}.")
                     self.variable_service.update(
