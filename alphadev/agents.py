@@ -516,7 +516,8 @@ class DistributedMCTS:
         self,
         counter: counting.Counter,
         logger: loggers.Logger,
-        variable_staging: VariableService = None, # where the network uploads its variables
+        variable_source: VariableService = None, # where the network uploads its variables
+        variable_staging: VariableService = None, # where evaluator actors pull variables from.
         variable_service: VariableService = None, # from where the actors pull new variables.
         inference_client: Optional[AlphaDevInferenceClient] = None,
         device_config: Optional[DeviceConfig] = None,
@@ -543,8 +544,8 @@ class DistributedMCTS:
             use_apv_mcts=self._use_apv_mcts,
             # single-threaded mode
             network_factory=self._network_factory,
-            variable_service=variable_service, # can be None
-            variable_update_period=self._variable_update_period,
+            variable_service=variable_staging, # can be None
+            variable_update_period=1, # update instantly
             # APV MCTS mode
             inference_service=inference_client, # can be None
             apv_processes_per_pool=self._search_num_actors,
@@ -559,6 +560,7 @@ class DistributedMCTS:
         
         return EvaluationLoop(
             environment, actor,
+            source_service=variable_source,
             staging_service=variable_staging,
             variable_service=variable_service,
             should_update_threshold=self._evaluation_update_threshold,
@@ -610,9 +612,13 @@ class DistributedMCTS:
         if self._do_eval_based_updates:
             # the current variable_service becomes the staging service (the network is already parameterized with it)
             # and we create a new variable service that will be passed to the actors.
-            variable_staging = variable_service
+            variable_source = variable_service
+            # create a staging service (where we load latest parameters for evaluation)
+            variable_staging = VariableService(config)
+            # and a new variable service where we push variables that performed better than the threshold.
             variable_service = VariableService(config)
-            # disable checkpointing in the stagging service and set checkpointing to 1 in the new variable service.
+            # disable checkpointing in the stagging and source services and set checkpointing to 1 in the new variable service.
+            variable_source._checkpoint_dir = None
             variable_staging._checkpoint_dir = None
             variable_service._checkpoint_every = 1
             with program.group('evaluator'):
@@ -639,8 +645,9 @@ class DistributedMCTS:
                             conn_config=config.distributed_backend_config,
                             instance_factory=self.evaluator,
                             instance_cls=acme.EnvironmentLoop,
-                            args=(counter, logger, variable_staging, variable_service, eval_inference_client,
-                                  actor_subconfig),
+                            args=(counter, logger, 
+                                  variable_source, variable_staging, variable_service,
+                                  eval_inference_client, actor_subconfig),
                         ), device_config=self._device_config.get_config(CONTROLLER))
                 else:
                     program.add_service(
@@ -648,10 +655,11 @@ class DistributedMCTS:
                             conn_config=config.distributed_backend_config,
                             instance_factory=self.evaluator,
                             instance_cls=acme.EnvironmentLoop,
-                            args=(counter, logger, variable_staging, variable_service, None,
-                                  actor_subconfig),
+                            args=(counter, logger,
+                                  variable_source, variable_staging, variable_service,
+                                  None, actor_subconfig),
                         ), device_config=eval_device_config)
-
+        
         with program.group('actor'):
             for idx in range(self._num_actors):
                 actor_device_config = self._device_config.get_config(ACTOR)

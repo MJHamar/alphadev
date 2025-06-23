@@ -14,6 +14,7 @@ class EvaluationLoop(acme.EnvironmentLoop):
     def __init__(self, 
         environment,
         actor,
+        source_service: VariableService,
         staging_service: VariableService,
         variable_service: VariableService,
         should_update_threshold = 1.0,
@@ -38,6 +39,7 @@ class EvaluationLoop(acme.EnvironmentLoop):
             label=label, observers=observers)
         
         self.staging_service = staging_service
+        self.source_service = source_service
         self.variable_service = variable_service
         self.should_update_threshold = should_update_threshold
         self._evaluation_episodes = evaluation_episodes
@@ -46,10 +48,11 @@ class EvaluationLoop(acme.EnvironmentLoop):
         self._echo_parameters()
     
     def _echo_parameters(self):
-        if self.staging_service is None or self.variable_service is None:
-            raise ValueError('Both staging service and variable service needs to be passed. Cannot echo parameters.')
+        if self.staging_service is None or self.variable_service is None or self.source_service is None:
+            raise ValueError('Both staging service and variable and source service needs to be passed. Cannot echo parameters.')
         # make sure initial parameters of the model are available to the actors
-        self.current_parameters = self.staging_service.get_variables()
+        self.current_parameters = self.source_service.get_variables()
+        self.staging_service.update(self.current_parameters)
         self.variable_service.update(self.current_parameters)
         # NOTE: this is a noop right now but keeping for consistency.
         self._actor.update(wait=True)
@@ -120,9 +123,12 @@ class EvaluationLoop(acme.EnvironmentLoop):
                     self.variable_service.update(
                         self.current_parameters
                     )
-                self.previous_avg_return = avg_return
+                    self.previous_avg_return = avg_return
                 # pull new parameters
-                self.current_parameters = self.staging_service.get_variables()
+                if episode_count % self._evaluation_episodes == 0:
+                    logger.debug(f"EvaluationLoop: Pulling new parameters from source service for evaluation.")
+                    self.current_parameters = self.source_service.get_variables()
+                    self.staging_service.update(self.current_parameters)
                 # update the actor with the new parameters
                 # NOTE: in the current implementation this is a noop and the VariableService takes care of it.
                 self._actor.update(wait=True)
