@@ -181,3 +181,23 @@ class NonZeroRewardObserver(EnvLoopObserver):
             return {
                 'trajectory_saved': False,
             }
+
+class TotalRewardObserver(EnvLoopObserver):
+    """
+    Observer that logs the total reward.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self._total_reward = 0.0
+    
+    def observe_first(self, env, timestep, action=None):
+        pass
+    
+    def observe(self, env, timestep, action=None):
+        self._total_reward += timestep.reward
+    
+    def get_metrics(self):
+        return {
+            'total_reward': self._total_reward,
+        }
