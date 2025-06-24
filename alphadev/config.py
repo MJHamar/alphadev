@@ -291,7 +291,7 @@ class env_observer_factory:
             )
         if self.config.save_non_zero_reward_trajectories:
             observers.append(
-                NonZeroRewardObserver()
+                NonZeroRewardObserver(self.config.experiment_name)
             )
         if self.config.observe_total_reward:
             observers.append(

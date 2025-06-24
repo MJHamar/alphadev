@@ -136,11 +136,11 @@ class NonZeroRewardObserver(EnvLoopObserver):
     """
     Observer that catches and saves non-zero rewards.
     """
-    def __init__(self):
+    def __init__(self, experiment_name):
         super().__init__()
         self._trajectory_save_path = os.path.join(
             os.getcwd(),
-            'saved_trajectories_' + time.strftime("%Y%m%d-%H%M%S", time.localtime() ),
+            'saved_trajectories_' + experiment_name + time.strftime("%Y%m%d", time.localtime() ),
         )
         os.makedirs(self._trajectory_save_path, exist_ok=True)
         self._num_saves = 0
