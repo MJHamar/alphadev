@@ -3,7 +3,7 @@ import time
 import numpy as np
 import pickle
 from acme.agents.tf.mcts.search import Node
-
+from acme.utils.counting import Counter
 
 class MCTSObserver:
     """
@@ -187,17 +187,19 @@ class TotalRewardObserver(EnvLoopObserver):
     Observer that logs the total reward.
     """
     
-    def __init__(self):
+    def __init__(self, counter:Counter):
         super().__init__()
-        self._total_reward = 0.0
+        self._episode_reward = 0.0
+        self._counter = counter
     
     def observe_first(self, env, timestep, action=None):
-        pass
+        self._episode_reward = 0.0
     
     def observe(self, env, timestep, action=None):
-        self._total_reward += timestep.reward
+        self._episode_reward += timestep.reward
     
     def get_metrics(self):
+        counts = self._counter.increment(total_reward=self._episode_reward)
         return {
-            'total_reward': self._total_reward,
+            'total_reward': counts.get('total_reward', 0.0),
         }

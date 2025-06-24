@@ -501,7 +501,7 @@ class DistributedMCTS:
             name=f'actor_{index}'
         )
         
-        observers = self._observers(logger)
+        observers = self._observers(logger, counter)
         
         # Create the loop to connect environment and agent.
         return acme.EnvironmentLoop(
@@ -556,7 +556,7 @@ class DistributedMCTS:
             name=f'evaluator'
         )
         
-        observers = self._observers(logger)
+        observers = self._observers(logger, counter)
         
         return EvaluationLoop(
             environment, actor,

@@ -10,6 +10,7 @@ import portpicker
 from datetime import datetime
 
 from acme.utils.loggers import make_default_logger, Logger
+from acme.utils.counting import Counter
 
 
 from .utils import IOExample, TaskSpec, generate_sort_inputs, x86_opcode2int
@@ -283,7 +284,7 @@ class env_observer_factory:
     def __init__(self, config: AlphaDevConfig):
         self.config = config
     
-    def __call__(self, logger: Logger):
+    def __call__(self, logger: Logger, counter: Counter):
         observers = []
         if self.config.observe_program_correctness:
             observers.append(
@@ -295,7 +296,7 @@ class env_observer_factory:
             )
         if self.config.observe_total_reward:
             observers.append(
-                TotalRewardObserver()
+                TotalRewardObserver(counter)
             )
         return observers
 
