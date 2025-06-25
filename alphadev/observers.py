@@ -4,7 +4,7 @@ import numpy as np
 import pickle
 from acme.agents.tf.mcts.search import Node
 from acme.utils.counting import Counter
-from .search.mcts import MCTSBase
+from .search.apv_mcts import APV_MCTS
 
 class MCTSObserver:
     """
@@ -79,7 +79,7 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
         super().__init__(epsilon=epsilon)
         self._logger = logger
     
-    def _on_action_selection(self, node: Node, probs: np.ndarray, action:int, training_steps: int, temperature: float, mcts:MCTSBase):
+    def _on_action_selection(self, node: Node, probs: np.ndarray, action:int, training_steps: int, temperature: float, mcts:APV_MCTS):
         """
         Called when an action is selected.
         """
@@ -90,8 +90,12 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
             # 'expanded': np.asarray([(c.children is not None) for c in node.children.elements()]),
             'values': node.children_values,
             'temperature': temperature,
-            'mcts': pickle.dumps(mcts, protocol=pickle.HIGHEST_PROTOCOL),
         })
+        if isinstance(mcts, APV_MCTS):
+            with open(mcts.name + 'saved_tree' + time.strftime("%Y%m%d-%H%M%S", time.localtime()) + '.pkl', 'wb') as f:
+                pickle.dump({'data':mcts._data_shm.buf, 'header': mcts._header_shm.buf}, protocol=pickle.HIGHEST_PROTOCOL, file=f),
+                print(f"Saved MCTS tree to {f.name}")
+
 # #############
 # EnvironmentObservers
 # #############
