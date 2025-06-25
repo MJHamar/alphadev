@@ -12,7 +12,7 @@ class MCTSObserver:
     """
     def _should_log(self):
         return True
-    
+
     def _on_search(self, node):
         pass
     def _on_backpropagation(self, node):
@@ -21,10 +21,10 @@ class MCTSObserver:
         pass
     def _on_search_end(self, node):
         pass
-    
+
     def _noop(self, *args, **kwargs):
         pass
-    
+
     def on_search(self, node):
         """
         Called when a search is performed.
@@ -40,13 +40,13 @@ class MCTSObserver:
         if self._should_log():
             return self._on_backpropagation(node)
         return self._noop(node)
-    
+
     def on_action_selection(self, node: Node, probs: np.ndarray, action:int, training_steps: int, temperature: float):
         """
         Called when an action is selected.
         """
         if self._should_log():
-            print(f"Action selected: {action}, probs: ({type(probs)}) {probs.shape}")
+            # print(f"Action selected: {action}, probs: ({type(probs)}) {probs.shape}")
             return self._on_action_selection(node, probs, action, training_steps, temperature)
         return self._noop(node)
 
@@ -78,7 +78,7 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
     def __init__(self, logger, epsilon=0.1):
         super().__init__(epsilon=epsilon)
         self._logger = logger
-    
+
     def _on_action_selection(self, node: Node, probs: np.ndarray, action:int, training_steps: int, temperature: float, mcts:APV_MCTS):
         """
         Called when an action is selected.
@@ -105,11 +105,11 @@ class CorrectProgramObserver(EnvLoopObserver):
     """
     Observer that logs the correctness of the program.
     """
-    
+
     def __init__(self):
         super().__init__()
         self._metrics = {}
-    
+
     def observe_first(self, env, timestep, action=None):
         self._metrics = {
             'is_correct': False,
@@ -118,7 +118,7 @@ class CorrectProgramObserver(EnvLoopObserver):
             'max_num_hits': 0,
             'num_hits': 0,
         }
-    
+
     def observe(self, env, timestep, action=None):
         if timestep.last():
             self._metrics['is_correct'] = env._is_correct
@@ -132,7 +132,7 @@ class CorrectProgramObserver(EnvLoopObserver):
             self._metrics['max_num_hits'] = max(self._metrics['max_num_hits'], env._num_hits)
         else:
             self._metrics['max_num_hits'] = max(self._metrics['max_num_hits'], env._num_hits)
-    
+
     def get_metrics(self):
         return self._metrics
 
@@ -150,12 +150,12 @@ class NonZeroRewardObserver(EnvLoopObserver):
         self._num_saves = 0
         self._current_trajectory = []
         self._should_save = False
-    
+
     def observe_first(self, env, timestep, action=None):
         self._current_trajectory = [timestep]
         self._should_save = False
         self._save_correct = False
-    
+
     def observe(self, env, timestep, action=None):
         self._current_trajectory.append(timestep)
         if timestep.reward > 0:
@@ -165,7 +165,7 @@ class NonZeroRewardObserver(EnvLoopObserver):
             print(f"Correct program found! length: {len(env._program)}, final reward: {timestep.reward}")
             self._save_correct = True
             self._should_save = True
-    
+
     def get_metrics(self):
         if self._should_save:
             # save the trajectory
@@ -190,18 +190,18 @@ class TotalRewardObserver(EnvLoopObserver):
     """
     Observer that logs the total reward.
     """
-    
+
     def __init__(self, counter:Counter):
         super().__init__()
         self._episode_reward = 0.0
         self._counter = counter
-    
+
     def observe_first(self, env, timestep, action=None):
         self._episode_reward = 0.0
-    
+
     def observe(self, env, timestep, action=None):
         self._episode_reward += timestep.reward
-    
+
     def get_metrics(self):
         counts = self._counter.increment(total_reward=self._episode_reward)
         return {
