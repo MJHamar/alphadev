@@ -289,7 +289,7 @@ class MCTSActor(acmeMCTSActor):
         for observer in self._observers:
             observer.on_action_selection(
                 node=root, probs=probs, action=action,
-                training_steps=training_steps, temperature=temperature)
+                training_steps=training_steps, temperature=temperature, mcts=self.mcts)
         
         if self._retain_subtree:
             self.last_action = action
