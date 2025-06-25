@@ -147,7 +147,7 @@ class NonZeroRewardObserver(EnvLoopObserver):
             'saved_trajectories_' + experiment_name + time.strftime("%Y%m%d", time.localtime() ),
         )
         os.makedirs(self._trajectory_save_path, exist_ok=True)
-        self._num_saves = 0
+        self._num_episodes = 0
         self._actor_id = 0 # avoid collisions.
         self._current_trajectory = []
         self._should_save = False
@@ -168,23 +168,23 @@ class NonZeroRewardObserver(EnvLoopObserver):
             self._should_save = True
 
     def get_metrics(self):
+        self._num_episodes += 1
         if self._should_save:
             # save the trajectory
             save_path = os.path.join(
                 self._trajectory_save_path,
-                f'trajectory_{self._num_saves}_{self._actor_id}' + ('_correct' if self._save_correct else '') + '.pkl'
+                f'trajectory_{self._num_episodes}_{self._actor_id}' + ('_correct' if self._save_correct else '') + '.pkl'
             )
             while os.path.exists(save_path):
                 # NOTE: this won't be called too many times. the different actors will agree on an arrangement.
                 self._actor_id += 1
                 save_path = os.path.join(
                     self._trajectory_save_path,
-                    f'trajectory_{self._num_saves}_{self._actor_id}' + ('_correct' if self._save_correct else '') + '.pkl'
+                    f'trajectory_{self._num_episodes}_{self._actor_id}' + ('_correct' if self._save_correct else '') + '.pkl'
                 )
             with open(save_path, 'wb') as f:
                 pickle.dump(self._current_trajectory, f)
             print(f"Saved trajectory to {save_path}")
-            self._num_saves += 1
             # return the number of saves
             return {
                 'trajectory_saved': True,
