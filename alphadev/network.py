@@ -20,7 +20,7 @@ from .distribution import DistributionSupport
 
 import logging
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 import numpy as np
 
@@ -658,12 +658,12 @@ class PredictionNet(snn.Module):
         #     logger.debug("PredictionNet.distr_check: policy min %s, max %s mean %s std %s", policy_min, policy_max, policy_mean, policy_std)
         
         output = NetworkOutput(
-            value=correctness_value['mean'] + latency_value['mean'] if not self.use_negative_latency else -latency_value['mean'],
+            value=correctness_value['mean'] + (latency_value['mean'] if not self.use_negative_latency else latency_value['mean'] * -1),
             correctness_value_logits=correctness_value['logits'],
             latency_value_logits=latency_value['logits'],
             policy_logits=policy,
         )
-        # logger.debug("PredictionNet: output %s", str({k: v.shape for k, v in output._asdict().items() if isinstance(v, jnp.ndarray)}))
+        logger.debug("PredictionNet: output value: %s", output.value)
         return output
 
 
