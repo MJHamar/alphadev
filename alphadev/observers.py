@@ -148,6 +148,7 @@ class NonZeroRewardObserver(EnvLoopObserver):
         )
         os.makedirs(self._trajectory_save_path, exist_ok=True)
         self._num_saves = 0
+        self._actor_id = 0 # avoid collisions.
         self._current_trajectory = []
         self._should_save = False
 
@@ -171,8 +172,15 @@ class NonZeroRewardObserver(EnvLoopObserver):
             # save the trajectory
             save_path = os.path.join(
                 self._trajectory_save_path,
-                f'trajectory_{self._num_saves}' + ('_correct' if self._save_correct else '') + '.pkl'
+                f'trajectory_{self._num_saves}_{self._actor_id}' + ('_correct' if self._save_correct else '') + '.pkl'
             )
+            while os.path.exists(save_path):
+                # NOTE: this won't be called too many times. the different actors will agree on an arrangement.
+                self._actor_id += 1
+                save_path = os.path.join(
+                    self._trajectory_save_path,
+                    f'trajectory_{self._num_saves}_{self._actor_id}' + ('_correct' if self._save_correct else '') + '.pkl'
+                )
             with open(save_path, 'wb') as f:
                 pickle.dump(self._current_trajectory, f)
             print(f"Saved trajectory to {save_path}")
