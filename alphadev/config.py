@@ -72,6 +72,7 @@ class AlphaDevConfig(object):
     value_max: float = 3.0  # These two parameters are task / reward-
     value_num_bins: int = 301  # dependent and need to be adjusted.
     categorical_value_loss: bool = True # wheether to treat the value functions as a distribution
+    prediction_use_negative_latency: bool = False # whether to use -latency prediction in the value head
 
     ### Training
     do_eval_based_updates: bool = False # whether to use an evaluation process to determine when network parameters should be broadcast
@@ -174,6 +175,7 @@ class AlphaDevConfig(object):
         self.hparams.value_max = self.value_max
         self.hparams.value_num_bins = self.value_num_bins
         self.hparams.categorical_value_loss = self.categorical_value_loss
+        self.hparams.use_negative_latency = self.prediction_use_negative_latency
         
         self.temperature_fn = self.visit_softmax_temperature_fn
         

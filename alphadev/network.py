@@ -609,6 +609,7 @@ class PredictionNet(snn.Module):
         value_max: float,
         value_num_bins: int,
         embedding_dim: int,
+        use_negative_latency: bool = False,
         name: str = 'prediction',
     ):
         super().__init__(name=name)
@@ -617,6 +618,7 @@ class PredictionNet(snn.Module):
         self.value_num_bins = value_num_bins
         self.support = DistributionSupport(self.value_max, self.value_num_bins)
         self.embedding_dim = embedding_dim
+        self.use_negative_latency = use_negative_latency
         
         self.policy_head = make_head_network(
             self.embedding_dim, self.task_spec.num_actions
@@ -656,7 +658,7 @@ class PredictionNet(snn.Module):
         #     logger.debug("PredictionNet.distr_check: policy min %s, max %s mean %s std %s", policy_min, policy_max, policy_mean, policy_std)
         
         output = NetworkOutput(
-            value=correctness_value['mean'] + latency_value['mean'],
+            value=correctness_value['mean'] + latency_value['mean'] if not self.use_negative_latency else -latency_value['mean'],
             correctness_value_logits=correctness_value['logits'],
             latency_value_logits=latency_value['logits'],
             policy_logits=policy,
@@ -695,6 +697,7 @@ class AlphaDevNetwork(snn.Module):
             value_max=hparams.value_max,
             value_num_bins=hparams.value_num_bins,
             embedding_dim=hparams.embedding_dim,
+            use_negative_latency=hparams.use_negative_latency,
             name=f'{name}_prediction_net',
         )
         self._representation_net = self.representation_net(
