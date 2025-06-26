@@ -16,7 +16,7 @@ class MCTSObserver:
         pass
     def _on_backpropagation(self, node):
         pass
-    def _on_action_selection(self, node: Node, probs: np.ndarray, action:int, training_steps: int, temperature: float):
+    def _on_action_selection(self, node: Node, probs: np.ndarray, action:int, training_steps: int, temperature: float, mcts):
         pass
     def _on_search_end(self, node):
         pass
@@ -40,7 +40,7 @@ class MCTSObserver:
             return self._on_backpropagation(node)
         return self._noop(node)
 
-    def on_action_selection(self, node: Node, probs: np.ndarray, action:int, training_steps: int, temperature: float):
+    def on_action_selection(self, node: Node, probs: np.ndarray, action:int, training_steps: int, temperature: float, mcts):
         """
         Called when an action is selected.
         """
