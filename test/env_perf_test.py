@@ -188,7 +188,7 @@ if __name__ == '__main__':
     env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
     env_end = time()
     
-    env_loop_stats.dump_stats(f'{prof_out_dir}/env_loop_profile.prof')
+    env_loop_stats.dump_stats(f'{env_prof_out_dir}/env_loop_profile.prof')
     subprocess.run(['flameprof', '-i', f'{env_prof_out_dir}/env_loop_profile.prof', '-o', f'{env_prof_out_dir}/env_loop_flamegraph.svg'])
     
     print("Profiling complete.")

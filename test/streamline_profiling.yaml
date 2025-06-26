@@ -73,7 +73,7 @@ checkpoint_every: 500
 episode_accumulation_period: 2 # not applicable
 
 # Distributed training
-distributed: True # only way
+distributed: False # only way
 prefetch_size: 50 # don't start immediately. no information provided. 
 variable_update_period: 2 # not applicable.
 samples_per_insert: 2 # no information provided.

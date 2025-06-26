@@ -682,8 +682,8 @@ class APV_MCTS(MCTSBase, BaseMemoryManager):
             load_start = time()
             self.model.load_checkpoint()
             load_end = time()
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug('SharedTree.rollout_{wh}: total {total:.5f}; tree {tree:.5f}; sim {sim:5f}; eval {eval:5f}; backup {backup:5f}; load {load:.5f}.'.format(
+            if logger.isEnabledFor(logging.INFO):
+                logger.info('SharedTree.rollout_{wh}: total {total:.5f}; tree {tree:.5f}; sim {sim:5f}; eval {eval:5f}; backup {backup:5f}; load {load:.5f}.'.format(
                     wh=self._local_write_head,
                     total=load_end - times[0],
                     tree=times[1] - times[0] if times[1] is not None else 9.9999,
