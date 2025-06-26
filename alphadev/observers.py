@@ -95,7 +95,8 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
             save_path = os.path.join(os.path.abspath(os.getcwd()), mcts.name + 'saved_tree' + time.strftime("%Y%m%d-%H%M%S", time.localtime()) + '.pkl')
             print(f"Saving MCTS tree to {save_path}")
             with open(save_path, 'wb') as f:
-                pickle.dump({'data':mcts._data_shm.buf, 'header': mcts._header_shm.buf}, protocol=pickle.HIGHEST_PROTOCOL, file=f),
+                # Convert memoryview objects to bytes before pickling
+                pickle.dump({'data': bytes(mcts._data_shm.buf), 'header': bytes(mcts._header_shm.buf)}, protocol=pickle.HIGHEST_PROTOCOL, file=f)
                 print(f"Saved MCTS tree to {f.name}")
 
 # #############
