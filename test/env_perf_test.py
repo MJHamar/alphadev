@@ -23,7 +23,7 @@ from alphadev.alphadev_acme import make_agent
 from acme.specs import make_environment_spec
 from acme.environment_loop import EnvironmentLoop
 
-CFG_PATH = f'{os.path.dirname(__file__)}/apv_mcts_config.yaml'
+CFG_PATH = f'{os.path.dirname(__file__)}/streamline_profiling.yaml'
 
 # 10 actions and 10 inputs
 def make_ts(num_inputs):
@@ -159,11 +159,10 @@ if __name__ == '__main__':
     
     num_steps = 100
     num_episodes = 1 # x100
-
     
-    os.makedirs(select_prof_out_dir, exist_ok=True)
-    os.environ['PROFILER_OUTPUT_DIR'] = select_prof_out_dir
-    print(f"Profiler output directory: {select_prof_out_dir}")
+    # os.makedirs(select_prof_out_dir, exist_ok=True)
+    # os.environ['PROFILER_OUTPUT_DIR'] = select_prof_out_dir
+    # print(f"Profiler output directory: {select_prof_out_dir}")
     
     # agent, env_loop = actor_env_from_config(sys.argv[2])
     
@@ -177,7 +176,6 @@ if __name__ == '__main__':
     # select_action_stats.dump_stats(f'{select_prof_out_dir}/select_action_profile.prof')
     # subprocess.run(['flameprof', '-i', f'{select_prof_out_dir}/select_action_profile.prof', '-o', f'{select_prof_out_dir}/select_action_flamegraph.svg'])
     
-    
     os.makedirs(env_prof_out_dir, exist_ok=True)
     os.environ['PROFILER_OUTPUT_DIR'] = env_prof_out_dir
     print(f"Profiler output directory: {env_prof_out_dir}")
@@ -189,7 +187,7 @@ if __name__ == '__main__':
     env_start = time()
     env_loop_stats = profile_prepared_env_loop(env_loop, num_episodes)
     env_end = time()
-
+    
     env_loop_stats.dump_stats(f'{prof_out_dir}/env_loop_profile.prof')
     subprocess.run(['flameprof', '-i', f'{env_prof_out_dir}/env_loop_profile.prof', '-o', f'{env_prof_out_dir}/env_loop_flamegraph.svg'])
     

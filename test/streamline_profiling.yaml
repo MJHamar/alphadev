@@ -1,0 +1,104 @@
+experiment_name: streamline_profiling
+
+# Environment
+num_inputs: 17 # based on pseudocode
+num_mem: 3 # minimum number of memory locations for the three inputs
+num_regs: 6 # X0 (RISC-V hard-wired 0), X1 (flag register), X2-X5 minimum number needed for sorting 3 items
+items_to_sort: 3
+correct_reward: 1.0
+correctness_reward_weight: 2.0
+latency_reward_weight: 0.5
+latency_quantile: 0.0
+num_latency_simulations: 1 # 1 is enough-- the emulator is in numpy and we don't expect much variance
+emulator_mode: 'i32'
+penalize_latency: False # the pseudocode and the paper disagree on this.
+use_actual_latency: True # reported in the paper.
+
+# Self-Play
+num_actors: 1 # they use 512 but we don't have the resources for that.
+max_moves: 50 # they use 100 but this way it is faster
+num_simulations: 200 # 800 originally, pruned for efficiency
+discount: 1.0 # no discounting
+root_dirichlet_alpha: 0.03 # according to pseudocode
+root_exploration_fraction: 0.25 # according to pseudocode
+search_retain_subtree: True # not explicit, but we assume it is the case
+use_async_search: True # otherwise we never get results
+async_search_processes_per_pool: 1 # pretty fast; alltogether 64 search processes
+async_seach_virtual_loss: -1.0 # according to AlphaGo, but there there is a +- reward.
+search_use_inference_server: False
+search_batch_size: 'auto' # == processes_per_pool.
+search_buffer_size: 'auto' # == processes_per_pool
+
+# UCB formula
+pb_c_base: 19652 # according to pseudocode
+pb_c_init: 1.25 # according to pseudocode
+temperature_fn: visit_softmax_temperature_fn # according to pseudocode
+
+# Network architecture
+embedding_dim: 512 # reported hyperparameter
+representation_use_program: True  # according to pseudocode
+representation_use_locations: True # according to pseudocode
+representation_use_locations_binary: False # according to pseudocode
+representation_use_permutation_embedding: False # according to pseudocode
+representation_repr_net_res_blocks: 8 # according to pseudocode; no information about it in the paper.
+representation_attention_head_depth: 128 # reported hyperparameter
+representation_attention_num_heads: 4 # reported hyperparameter
+representation_attention_attention_dropout: False # according to pseudocode
+representation_attention_position_encoding: absolute # according to pseudocode
+representation_attention_num_layers: 6 # reported hyperparameter
+value_max: 30.0 # according to pseudocode; 
+value_num_bins: 301 # according to pseudocode
+categorical_value_loss: True # yes.
+
+# Training
+do_train: True
+training_steps: 1000000
+batch_size: 128 # reported is 1024 but we don't have the capacity.
+n_step: 5 # according to pseudocode
+lr_init: 0.0002 # according to pseudocode
+momentum: 0.9 # according to pseudocode
+grad_clip_norm: 10.0 # added for stability
+
+do_eval_based_updates: False # unclear from the paper. not evident in the pseudocode.
+evaluation_update_threshold: 0 # not applicable
+evaluation_episodes: 5 # not applicable
+
+use_target_network: True # according to pseudocode
+target_update_period: 100 # according to pseudocode
+
+checkpoint_dir: './checkpoints'
+checkpoint_every: 500
+
+# single threaded training
+episode_accumulation_period: 2 # not applicable
+
+# Distributed training
+distributed: True # only way
+prefetch_size: 50 # don't start immediately. no information provided. 
+variable_update_period: 2 # not applicable.
+samples_per_insert: 2 # no information provided.
+min_replay_size: 500 # don't start immediately. no information provided.
+max_replay_size: 1000000 # wondow_size in pseudocode
+use_prioritized_replay: False
+priority_exponent: 0.6 # not used
+redis_host: 'localhost' # for the variable service, counter, logger etc. (low-frequency services).
+redis_port: 6379
+redis_db: 0
+variable_service_name: 'variable'
+device_config_path: './device_config.yaml'
+
+# Logging
+use_wandb: False
+wandb_project: alphadev
+wandb_entity: hamar_m
+wandb_tags: []
+wandb_notes: "APV-MCTS performance experiment with 4 actors and 8 workers in Alphago mode."
+wandb_mode: online
+wanbd_run_id: null
+
+# Observers
+observe_mcts_policy: False
+mcts_observer_ratio: 0.1
+observe_program_correctness: True
+save_non_zero_reward_trajectories: True
+observe_total_reward: True
