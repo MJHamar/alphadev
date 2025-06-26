@@ -46,7 +46,7 @@ class MCTSObserver:
         """
         if self._should_log():
             # print(f"Action selected: {action}, probs: ({type(probs)}) {probs.shape}")
-            return self._on_action_selection(node, probs, action, training_steps, temperature)
+            return self._on_action_selection(node, probs, action, training_steps, temperature, mcts)
         return self._noop(node)
 
     def on_search_end(self, node):
