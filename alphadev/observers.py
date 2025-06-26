@@ -92,7 +92,9 @@ class MCTSPolicyObserver(ProbabilisticObserverMixin, MCTSObserver):
         })
         from .search.apv_mcts import APV_MCTS # avoid circular import
         if isinstance(mcts, APV_MCTS):
-            with open(mcts.name + 'saved_tree' + time.strftime("%Y%m%d-%H%M%S", time.localtime()) + '.pkl', 'wb') as f:
+            save_path = os.path.join(os.path.abspath(os.getcwd()), mcts.name + 'saved_tree' + time.strftime("%Y%m%d-%H%M%S", time.localtime()) + '.pkl')
+            print(f"Saving MCTS tree to {save_path}")
+            with open(save_path, 'wb') as f:
                 pickle.dump({'data':mcts._data_shm.buf, 'header': mcts._header_shm.buf}, protocol=pickle.HIGHEST_PROTOCOL, file=f),
                 print(f"Saved MCTS tree to {f.name}")
 
